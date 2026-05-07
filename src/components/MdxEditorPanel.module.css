@@ -406,7 +406,7 @@
 /* DiffSourceToggleWrapper 的 SegmentedControl：sticky 钉死右侧。
    不加 background/box-shadow —— light 模式下父级 toolbar 已是白底，
    再加灰底/渐变会形成可见的灰条；让它直接透明压在右上角即可。 */
-.container :global([class*='_diffSourceToggleWrapper']) {
+.container :global([class*='_toolbarRoot']) :global([class*='_diffSourceToggleWrapper']) {
   margin-left: auto;
   display: inline-flex;
   align-items: center;
@@ -414,6 +414,7 @@
   right: 0;
   flex-shrink: 0;
   z-index: 1;
+  border: 0px;
 }
 
 .container :global([class*='_diffSourceToggle']) {

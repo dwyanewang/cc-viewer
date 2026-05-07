@@ -79,6 +79,22 @@ function getEffectiveModel(request) {
   return request?.response?.body?.model || request?.body?.model || null;
 }
 
+const CALIBRATION_TOKEN_MAP = {
+  '1m': 1000000,
+  '200k': 200000,
+};
+
+function resolveCalibrationTokens(calibrationModel, lastMainAgent) {
+  const direct = CALIBRATION_TOKEN_MAP[calibrationModel];
+  if (direct) return direct;
+  const raw = lastMainAgent ? getEffectiveModel(lastMainAgent) : null;
+  if (typeof raw !== 'string' || !raw) return 1000000;
+  const m = raw.toLowerCase();
+  if (m.includes('opus-4-7') || m.includes('opus-4.7') || m.includes('opus 4.7')) return 1000000;
+  if (m.includes('1m')) return 1000000;
+  return 200000;
+}
+
 function getModelInfo(modelName) {
   if (!modelName) return null;
   return {
@@ -356,6 +372,36 @@ describe('helpers', () => {
     it('returns 16000 for gpt-3', () => { assert.equal(getModelMaxTokens('gpt-3.5-turbo'), 16000); });
     it('returns 200000 for null', () => { assert.equal(getModelMaxTokens(null), 200000); });
     it('returns 200000 for unknown model', () => { assert.equal(getModelMaxTokens('llama-3'), 200000); });
+  });
+
+  describe('resolveCalibrationTokens', () => {
+    const reqWith = (model) => ({ response: { body: { model } } });
+    it('returns 1M for explicit "1m"', () => {
+      assert.equal(resolveCalibrationTokens('1m', null), 1000000);
+    });
+    it('returns 200K for explicit "200k"', () => {
+      assert.equal(resolveCalibrationTokens('200k', null), 200000);
+    });
+    it('auto + null lastMainAgent → 1M (cold-start default)', () => {
+      assert.equal(resolveCalibrationTokens('auto', null), 1000000);
+    });
+    it('auto + opus-4-7 model → 1M', () => {
+      assert.equal(resolveCalibrationTokens('auto', reqWith('claude-opus-4-7-20250514')), 1000000);
+    });
+    it('auto + uppercase opus-4.7 → 1M (case-insensitive)', () => {
+      assert.equal(resolveCalibrationTokens('auto', reqWith('CLAUDE-OPUS-4.7')), 1000000);
+    });
+    it('auto + 1m substring (deepseek-v3-1m) → 1M', () => {
+      assert.equal(resolveCalibrationTokens('auto', reqWith('deepseek-v3-1m')), 1000000);
+    });
+    it('auto + sonnet-4-6 → 200K (no opus, no 1m)', () => {
+      assert.equal(resolveCalibrationTokens('auto', reqWith('claude-sonnet-4-6')), 200000);
+    });
+    it('legacy value (opus-4.7-1m) + null lastMainAgent → 1M (cold-start fallback via auto path)', () => {
+      // 老用户 localStorage 残留值；AppHeader.jsx 验证逻辑会先把它兜底为 'auto'，
+      // 但即使直接传进来这里，也会走 auto 路径 + 冷启动默认 1M，行为可接受。
+      assert.equal(resolveCalibrationTokens('opus-4.7-1m', null), 1000000);
+    });
   });
 
   describe('getEffectiveModel', () => {

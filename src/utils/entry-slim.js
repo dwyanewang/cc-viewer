@@ -4,14 +4,260 @@
  * 老格式日志每条 MainAgent entry 包含累积的完整 messages，
  * 480MB 文件 JSON.parse 后在浏览器中膨胀到 ~1.2GB → OOM。
  *
- * 核心机制：同 session 内只保留最新一条 MainAgent 的完整 messages，
+ * 核心机制：同 session 内只保留最新一条 MainAgent 的完整 messages 与 body 大字段，
  * 前一条立即释放。被剪枝的 entry 记录 _fullEntryIndex 供按需还原。
+ *
+ * v2: 除 messages 外，body.tools / body.system / body.metadata / body.tool_choice 也参与 slim。
+ *     - body.tools: 每个 tool 仅保留 name（删除 description 与 input_schema）
+ *     - body.system: 每个 text block 仅保留前 SYSTEM_TEXT_KEEP_PREFIX 字符
+ *     - body.metadata: 仅保留 user_id（slim session boundary 检测依赖）
+ *     - body.tool_choice: 直接删除
+ *   兼顾：保留 isMainAgent / isNativeTeammate / classifyRequest 等 read path 所需的 shape。
+ *   单条 MainAgent entry 节省 ~250–300KB，全 session 累计节省 ~50% 渲染进程堆内存。
  *
  * 导出：
  * - createEntrySlimmer(isMainAgentFn): 批量剪枝器（历史日志加载，process + finalize）
- * - createIncrementalSlimmer(isMainAgentFn): 增量剪枝器（实时 SSE，无需 finalize）
+ * - createIncrementalSlimmer(isMainAgentFn): 增量剪枝器（实时 SSE,无需 finalize）
  * - restoreSlimmedEntry(entry, requests): 按需还原被剪枝的 entry
  */
+
+// system text 每个 block 保留的前缀长度（字符数）。
+// 必须足够覆盖现有的 system text 检测关键词（contentFilter.js / teammateDetector.js）：
+//   - "You are Claude Code"        ~50 字符内
+//   - "You are a Claude agent"     ~50 字符内
+//   - SUBAGENT_SYSTEM_RE: "command execution specialist | file search specialist
+//     | planning specialist | general-purpose agent"
+//   - cc_version=X.Y.Z (extractCcVersion)
+// 假设：所有上述检测器消费的关键词都在 system block 前 2KB 内。新增依赖 system text
+// 更长前缀的检测器时，同步上调此常数。2048 字符相对原始 ~50KB 节省 ~96%。
+export const SYSTEM_TEXT_KEEP_PREFIX = 2048;
+
+// ─── intern pools (v3) ──────────────────────────────────────────────────────
+// 1.6.237 实测：每个 session 的"最后一条" MainAgent 仍保留完整 body.tools（fullEntry
+// 不被 slim），678 个 fullEntry 各持一份 ~250KB tools 描述 ≈ 170MB 浪费。
+// v3 修正：所有 entry（含 fullEntry）的 body.tools / body.system 走 module-level pool
+// 共享同一引用。signature 命中时直接替换为 pool ref，pool 内是完整原始数据。
+// pool 容量上限防御异常输入；正常 cc-viewer session 内 tools/system 配置稳定，
+// pool 实测 size 通常 < 5。FIFO eviction 见 _internOrAdd。
+const _MAX_INTERN_POOL_SIZE = 200;
+const _toolsPool = new Map();   // sig → tools array (full, shared)
+const _systemPool = new Map();  // sig → system array (full, shared)
+
+// v5: messages 内 tool_result block.content 走 readResultPool 同一池化逻辑。
+// SubAgent / Teammate entry 不被 slim，body.messages 中 inline 嵌入的 Read/Bash 等
+// tool_result 跨多个 SubAgent run 是同一份内容重复。v4 已 dedup 派生层（toolResultMap.resultText），
+// v5 补 raw payload（req.body.messages[*].content[*].content）这一关键缺口。
+// internToolResultIfPooled 的命中信号是 lazy-clone 决策的关键：JS string === 是值比较，
+// 普通 internToolResult 返回的 ref 无法用于 ref-不变性判断。
+import { internToolResultIfPooled } from './readResultPool.js';
+
+function _toolsSig(tools) {
+  if (!Array.isArray(tools) || tools.length === 0) return '';
+  // 't:' 前缀让 tools / system / readResult 三套 sig 命名空间正交，
+  // 避免未来如果共用同一个 pool 时碰撞。
+  let sig = 't:' + tools.length;
+  for (const t of tools) {
+    sig += '|' + (t?.name || '') + ':' + (t?.description?.length || 0);
+  }
+  return sig;
+}
+
+function _systemSig(system) {
+  if (Array.isArray(system)) {
+    if (system.length === 0) return 'a:0';
+    let sig = 'a:' + system.length;
+    for (const b of system) {
+      const text = b?.text || '';
+      // 边界增强（CR P1 defensive）：cc-viewer 场景中 system block 跨 entry 通常同模板，
+      // 仅前缀检测在长 text 后段差异时不足。加中段 50 字符显著降低误共享概率。
+      const mid = text.length > 100 ? Math.floor(text.length / 2) : 0;
+      sig += '|' + (b?.type || '') + ':' + text.length + ':' + text.slice(0, 50) + ':' + text.slice(mid, mid + 50);
+    }
+    return sig;
+  }
+  if (typeof system === 'string') {
+    const mid = system.length > 100 ? Math.floor(system.length / 2) : 0;
+    return 's:' + system.length + ':' + system.slice(0, 50) + ':' + system.slice(mid, mid + 50);
+  }
+  return '';
+}
+
+function _internOrAdd(pool, sig, value) {
+  let pooled = pool.get(sig);
+  if (pooled) return pooled;
+  if (pool.size >= _MAX_INTERN_POOL_SIZE) {
+    // FIFO eviction — 早期插入的优先丢；cc-viewer 场景 tools/system 配置稳定，pool
+    // 实测命中率极高（典型 size <5），FIFO/LRU 等价；远期升级 LRU 时再换。
+    pool.delete(pool.keys().next().value);
+  }
+  // 浅冻结 pool entries（CR P1 defensive）：防止 caller 拿到 ref 后 push/splice 污染
+  // 所有共享该 ref 的 entry。Object.freeze 是浅层（数组顶层不可变，元素对象不冻结
+  // 以避免影响 React 渲染期可能 mutate 内部字段——cc-viewer 实际不发生但保留余地）。
+  if (Array.isArray(value)) Object.freeze(value);
+  pool.set(sig, value);
+  return value;
+}
+
+/**
+ * 把 messages[*].content[*] 中的 tool_result block.content 字符串替换为 readResultPool
+ * 共享引用。仅处理 string 形态的 content（minority array/object 形态原样透传）。
+ *
+ * 设计要点：
+ * - lazy clone：只在至少有一个 block 命中 pool 替换时才 clone messages / content / block。
+ *   未命中场景零开销，原数组直接返回。
+ * - 浅 clone（{...block}）保留 _timestamp 等顶层字段；不冻结 messages 数组——
+ *   AppBase.jsx:1170-1175 mutate `messages[i]._timestamp` 仍可工作。
+ * - tool_result.content 字符串本身不可变（JS string primitive），多个 entry 共享 pool ref
+ *   完全安全。
+ *
+ * @param {Array} messages
+ * @returns {Array} 原数组（无变化）或浅 clone 后的新数组
+ */
+export function internMessagesToolResultBlocks(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages;
+
+  let newMessages = null;
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    const content = msg?.content;
+    if (!Array.isArray(content) || content.length === 0) continue;
+
+    let newContent = null;
+    for (let j = 0; j < content.length; j++) {
+      const block = content[j];
+      if (!block || block.type !== 'tool_result') continue;
+      const c = block.content;
+      // 仅 dedup string 形态。array 形态（含 text/image blocks）少见且结构复杂，留待后续。
+      if (typeof c !== 'string') continue;
+      // pooled = null 时为未命中（已注册到 pool 但调用方无需替换 ref——block 已持原始 ref，
+      // 且原始 ref 也是 pool 持有的 ref，零浪费）；pooled 非 null 时是命中，原始 c 是独立分配
+      // 副本，必须替换为 pool ref 才能让原副本可被 GC 回收。
+      const pooled = internToolResultIfPooled(c);
+      if (pooled !== null) {
+        if (newContent === null) newContent = content.slice();
+        newContent[j] = { ...block, content: pooled };
+      }
+    }
+
+    if (newContent !== null) {
+      if (newMessages === null) newMessages = messages.slice();
+      newMessages[i] = { ...msg, content: newContent };
+    }
+  }
+
+  return newMessages || messages;
+}
+
+/**
+ * 把 entry.body.tools / body.system / body.messages 替换为 module-level pool 中的共享引用。
+ * 在 entry 进入 state.requests 之前调用，所有路径（SSE flush / batch load /
+ * IndexedDB cached restore）都应过一遍此函数。
+ *
+ * 返回新 entry 对象（如果 body 字段被替换）或原 entry（无变化时）。
+ *
+ * @param {object} entry
+ * @returns {object}
+ */
+export function internEntryBigFields(entry) {
+  if (!entry?.body) return entry;
+  const body = entry.body;
+  let newTools = body.tools;
+  let newSystem = body.system;
+  let newMessages = body.messages;
+  let dirty = false;
+
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    const sig = _toolsSig(body.tools);
+    const pooled = _internOrAdd(_toolsPool, sig, body.tools);
+    if (pooled !== body.tools) {
+      newTools = pooled;
+      dirty = true;
+    }
+  }
+
+  if ((Array.isArray(body.system) && body.system.length > 0) || typeof body.system === 'string') {
+    const sig = _systemSig(body.system);
+    if (sig) {
+      const pooled = _internOrAdd(_systemPool, sig, body.system);
+      if (pooled !== body.system) {
+        newSystem = pooled;
+        dirty = true;
+      }
+    }
+  }
+
+  // v5: walk messages 内的 tool_result block.content 走通用 pool。
+  // SubAgent / Teammate 不被 slim 路径，这是 raw payload 唯一的 dedup 入口。
+  if (Array.isArray(body.messages) && body.messages.length > 0) {
+    const interned = internMessagesToolResultBlocks(body.messages);
+    if (interned !== body.messages) {
+      newMessages = interned;
+      dirty = true;
+    }
+  }
+
+  if (dirty) {
+    return {
+      ...entry,
+      body: { ...entry.body, tools: newTools, system: newSystem, messages: newMessages },
+    };
+  }
+  return entry;
+}
+
+/**
+ * 测试辅助：清空 intern pools。仅用于单元测试隔离。
+ */
+export function _resetInternPoolsForTest() {
+  _toolsPool.clear();
+  _systemPool.clear();
+}
+
+/**
+ * 测试辅助：观察 pool 当前状态（仅 size）。
+ */
+export function _getInternPoolStatsForTest() {
+  return { toolsPoolSize: _toolsPool.size, systemPoolSize: _systemPool.size };
+}
+
+/**
+ * 把一个 body 的大字段降级为占位 shape，返回**新 body 对象**（不 mutate 原 body）。
+ * 调用方拿到新 body 后需自行赋值给 entry，例如 `entry.body = slimBodyBigFields(entry.body)`
+ * （批量路径）或在 clone 中嵌入（增量路径，避免 React 渲染中间态）。
+ * Export 仅用于单元测试；运行时调用方应使用 createEntrySlimmer / createIncrementalSlimmer。
+ *
+ * @param {object} body
+ * @returns {object} 新 body 对象
+ */
+export function slimBodyBigFields(body) {
+  if (!body) return body;
+  const next = { ...body, messages: [] };
+
+  if (Array.isArray(body.tools)) {
+    next.tools = body.tools.map(t => ({ name: (t && t.name) || null }));
+  }
+
+  if (Array.isArray(body.system)) {
+    next.system = body.system.map(blk => {
+      if (!blk || typeof blk !== 'object') return blk;
+      if (blk.type === 'text' && typeof blk.text === 'string' && blk.text.length > SYSTEM_TEXT_KEEP_PREFIX) {
+        const slimBlock = { ...blk, text: blk.text.slice(0, SYSTEM_TEXT_KEEP_PREFIX) };
+        return slimBlock;
+      }
+      return blk;
+    });
+  } else if (typeof body.system === 'string' && body.system.length > SYSTEM_TEXT_KEEP_PREFIX) {
+    next.system = body.system.slice(0, SYSTEM_TEXT_KEEP_PREFIX);
+  }
+
+  if (body.metadata && typeof body.metadata === 'object') {
+    next.metadata = body.metadata.user_id ? { user_id: body.metadata.user_id } : {};
+  }
+
+  if ('tool_choice' in next) delete next.tool_choice;
+
+  return next;
+}
 
 /**
  * 创建流式剪枝器。
@@ -62,7 +308,7 @@ export function createEntrySlimmer(isMainAgentFn) {
         return entry;
       }
 
-      // 同 session：剪枝前一条 MainAgent 的 messages
+      // 同 session：剪枝前一条 MainAgent 的 messages 与 body 大字段
       if (prevMainIdx >= 0 && prevMainIdx < entries.length) {
         const prev = entries[prevMainIdx];
         if (prev.body?.messages?.length > 0) {
@@ -74,7 +320,10 @@ export function createEntrySlimmer(isMainAgentFn) {
           prev._messageCount = pCount;
           prev._messagesIndex = idxArr;
           prev._slimmed = true;
-          prev.body.messages = [];
+          // 批量路径：原代码就是 in-place mutate prev.body.messages = []，
+          // 这里同样 in-place 替换 body 各大字段。entries 数组在 _batchSlim 阶段
+          // 还未传给 React，无渲染中间态风险。
+          prev.body = slimBodyBigFields(prev.body);
         }
       }
 
@@ -154,15 +403,21 @@ export function restoreSlimmedEntry(entry, requests) {
   const fullEntry = requests[entry._fullEntryIndex];
   if (!fullEntry?.body?.messages) return entry;
   if (fullEntry.body.messages.length < entry._messageCount) return entry;
+  // 从 fullEntry 还原所有被 slim 掉/降级的大字段（messages/tools/system/metadata/tool_choice）。
+  // entry.body 自身的非 big-field（model、max_tokens、stream 等）保留。
+  const fullBody = fullEntry.body;
   return {
     ...entry,
     _slimmed: false,
     _fullEntryIndex: undefined,
     body: {
       ...entry.body,
-      messages: fullEntry.body.messages.slice(0, entry._messageCount),
-      system: fullEntry.body.system,
-    }
+      messages: fullBody.messages.slice(0, entry._messageCount),
+      tools: fullBody.tools,
+      system: fullBody.system,
+      metadata: fullBody.metadata,
+      tool_choice: fullBody.tool_choice,
+    },
   };
 }
 
@@ -220,15 +475,20 @@ export function createIncrementalSlimmer(isMainAgentFn) {
         return entry;
       }
 
-      // 前向 slim：剪枝上一条 MainAgent
+      // 前向 slim：剪枝上一条 MainAgent 的 messages 与 body 大字段
       // 注意：必须 clone entry 再修改，不能 in-place mutate。
       // requests 数组是 [...prev.requests] 浅拷贝，元素仍与 React 上一次 state 共享引用，
       // 直接 mutate 会导致 React 渲染中途看到 messages=[] 的中间态，引起对话闪烁。
       if (prevMainIdx >= 0 && prevMainIdx < requests.length) {
         const orig = requests[prevMainIdx];
         if (orig.body?.messages?.length > 0) {
-          const cloned = { ...orig, body: { ...orig.body }, _messageCount: orig.body.messages.length, _slimmed: true, _fullEntryIndex: currentIdx };
-          cloned.body.messages = [];
+          const cloned = {
+            ...orig,
+            body: slimBodyBigFields(orig.body),
+            _messageCount: orig.body.messages.length,
+            _slimmed: true,
+            _fullEntryIndex: currentIdx,
+          };
           requests[prevMainIdx] = cloned;
           sessionSlimmedIndices.add(prevMainIdx);
         }

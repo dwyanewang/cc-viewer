@@ -1,4 +1,5 @@
 import React from 'react';
+import ReactDOM from 'react-dom';
 import { Collapse, Typography, Radio, Checkbox, Input, Button, Tooltip, Popover, message } from 'antd';
 import { escapeHtml, truncateText, getSvgAvatar } from '../utils/helpers';
 import MarkdownBlock from './MarkdownBlock';
@@ -7,6 +8,8 @@ import { renderAssistantText } from '../utils/systemTags';
 import { apiUrl } from '../utils/apiUrl';
 import { isMobile, isIOS, isPad } from '../env';
 import AskQuestionForm from './AskQuestionForm';
+import { ApprovalPortalContext } from './ApprovalPortalContext';
+import { SettingsContext } from '../contexts/SettingsContext';
 import { t } from '../i18n';
 import { tc } from '../utils/tClaude';
 import { isPlanApprovalPrompt } from '../utils/promptClassifier';
@@ -19,6 +22,14 @@ import defaultModelAvatarUrl from '../img/default-model-avatar.svg';
 import styles from './ChatMessage.module.css';
 
 const { Text } = Typography;
+
+function ViewRequestIcon() {
+  return (
+    <svg viewBox="0 0 1024 1024" width="12" height="12" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path fill="currentColor" d="M738.133333 580.266667c-17.066667-8.533333-38.4 0-38.4 21.333333v85.333333H268.8c-123.733333 0-200.533333-42.666667-200.533333-42.666666s21.333333 170.666667 200.533333 170.666666h430.933333v85.333334c0 21.333333 21.333333 34.133333 38.4 21.333333l204.8-149.333333c17.066667-8.533333 17.066667-34.133333 0-42.666667l-204.8-149.333333zM285.866667 443.733333c17.066667 8.533333 38.4 0 38.4-21.333333v-85.333333h430.933333c123.733333 0 200.533333 42.666667 200.533333 42.666666s-21.333333-170.666667-200.533333-170.666666H324.266667v-85.333334c0-21.333333-21.333333-34.133333-38.4-21.333333L81.066667 251.733333c-17.066667 8.533333-17.066667 34.133333 0 42.666667l204.8 149.333333z" />
+    </svg>
+  );
+}
 
 function ChatImage({ src, alt, fallbackText }) {
   const [failed, setFailed] = React.useState(false);
@@ -65,17 +76,49 @@ const ModelAvatar = React.memo(function ModelAvatar({ modelInfo, streaming }) {
   return <img src={defaultModelAvatarUrl} className={styles.avatarImg} alt={modelInfo?.name || 'Agent'} />;
 });
 
-const AssistantLabel = React.memo(function AssistantLabel({ name, extra, timeStr, requestIndex, onViewRequest }) {
+// 上下文 token 总量格式化：始终带 K 单位（与全站 formatTokenCount 行为不同：后者 0/<1000 不带 K）。
+// 用户需求：在 assistant 时间戳旁显示一个稳定的 "X.XK" 标记。
+function formatCacheK(n) {
+  if (n == null) return '';
+  if (!Number.isFinite(n)) return '';
+  if (n === 0) return '0K';
+  if (n >= 1000000) return (n / 1000).toFixed(0) + 'K';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+  return (n / 1000).toFixed(2) + 'K';
+}
+
+const AssistantLabel = React.memo(function AssistantLabel({ name, extra, timeStr, requestIndex, onViewRequest, cacheTotalTokens, showFullToolContent }) {
+  const useIcon = !showFullToolContent;
   const viewBtn = (requestIndex != null && onViewRequest) ? (
-    <span className={styles.viewRequestBtn} onClick={(e) => { e.stopPropagation(); onViewRequest(requestIndex); }}>
-      {t('ui.viewRequest')}
-    </span>
+    useIcon ? (
+      <span
+        className={styles.viewRequestIcon}
+        title={t('ui.viewRequest')}
+        onClick={(e) => { e.stopPropagation(); onViewRequest(requestIndex); }}
+      >
+        <ViewRequestIcon />
+      </span>
+    ) : (
+      <span className={styles.viewRequestBtn} onClick={(e) => { e.stopPropagation(); onViewRequest(requestIndex); }}>
+        {t('ui.viewRequest')}
+      </span>
+    )
   ) : null;
+  const showCache = showFullToolContent && cacheTotalTokens != null;
+  const cacheStr = showCache ? formatCacheK(cacheTotalTokens) : '';
   return (
     <div className={styles.labelRow}>
       <Text type="secondary" className={styles.labelText}>{name}{extra || ''}</Text>
       <span className={styles.labelRight}>
         {viewBtn}
+        {showCache && (
+          <Text
+            className={styles.cacheContextText}
+            title={t('ui.cacheContextTooltip', { value: cacheStr })}
+          >
+            {`[${cacheStr}]`}
+          </Text>
+        )}
         {timeStr && <Text className={styles.timeText}>{timeStr}</Text>}
       </span>
     </div>
@@ -84,6 +127,8 @@ const AssistantLabel = React.memo(function AssistantLabel({ name, extra, timeStr
 
 
 class ChatMessage extends React.Component {
+  static contextType = SettingsContext;
+
   constructor(props) {
     super(props);
     this.state = {
@@ -109,7 +154,9 @@ class ChatMessage extends React.Component {
       p.ptyPrompt !== n.ptyPrompt || p.cliMode !== n.cliMode ||
       p.lastPendingAskId !== n.lastPendingAskId || p.lastPendingPlanId !== n.lastPendingPlanId ||
       p.activePlanPrompt !== n.activePlanPrompt || p.activeDangerousPrompt !== n.activeDangerousPrompt ||
-      p.requestIndex !== n.requestIndex || p.label !== n.label || p.isTeammate !== n.isTeammate ||
+      p.activePtyPlanId !== n.activePtyPlanId ||
+      p.requestIndex !== n.requestIndex || p.cacheTotalTokens !== n.cacheTotalTokens || p.label !== n.label || p.isTeammate !== n.isTeammate ||
+      p.isHistoryLog !== n.isHistoryLog ||
       p.userProfile !== n.userProfile || p.modelInfo !== n.modelInfo ||
       p.resultText !== n.resultText || p.toolName !== n.toolName ||
       p.onViewRequest !== n.onViewRequest || p.onOpenFile !== n.onOpenFile ||
@@ -138,13 +185,28 @@ class ChatMessage extends React.Component {
     try {
       const d = new Date(ts);
       const pad = n => String(n).padStart(2, '0');
-      return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+      const { showFullToolContent, isHistoryLog } = this.props;
+      const compact = !showFullToolContent && !isHistoryLog;
+      const hms = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+      if (compact) return hms;
+      return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hms}`;
     } catch { return null; }
   }
 
   renderViewRequestBtn() {
-    const { requestIndex, onViewRequest } = this.props;
+    const { requestIndex, onViewRequest, showFullToolContent } = this.props;
     if (requestIndex == null || !onViewRequest) return null;
+    if (!showFullToolContent) {
+      return (
+        <span
+          className={styles.viewRequestIcon}
+          title={t('ui.viewRequest')}
+          onClick={(e) => { e.stopPropagation(); onViewRequest(requestIndex); }}
+        >
+          <ViewRequestIcon />
+        </span>
+      );
+    }
     return (
       <span className={styles.viewRequestBtn} onClick={(e) => { e.stopPropagation(); onViewRequest(requestIndex); }}>
         {t('ui.viewRequest')}
@@ -385,7 +447,7 @@ class ChatMessage extends React.Component {
       }
 
       const checkSvg = (
-        <svg className={styles.askCheckSvg} width="16" height="16" viewBox="0 0 16 16" fill="none">
+        <svg className={styles.askCheckSvg} width="1em" height="1em" viewBox="0 0 16 16" fill="none">
           <path d="M3 8.5L6.5 12L13 4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
         </svg>
       );
@@ -412,14 +474,20 @@ class ChatMessage extends React.Component {
                     const selected = isOptionMatch(opt.label);
                     return (
                       <div key={oi} className={`${styles.askOptionItem}${selected ? ' ' + styles.askOptionSelected : ''}`}>
-                        {selected ? checkSvg : '○'} {opt.label}
-                        {opt.description && <span className={styles.optionDesc}>— {opt.description}</span>}
+                        <span className={styles.askRadioDot}>{selected ? checkSvg : '○'}</span>
+                        <span className={styles.askOptionBody}>
+                          <span className={styles.askOptionLabel}>{opt.label}</span>
+                          {opt.description && <span className={styles.askOptionDesc}>{opt.description}</span>}
+                        </span>
                       </div>
                     );
                   })}
                   {isOtherAnswer && (
                     <div className={`${styles.askOptionItem} ${styles.askOptionSelected}`}>
-                      {checkSvg} {answer}
+                      <span className={styles.askRadioDot}>{checkSvg}</span>
+                      <span className={styles.askOptionBody}>
+                        <span className={styles.askOptionLabel}>{answer}</span>
+                      </span>
                     </div>
                   )}
                 </div>
@@ -447,13 +515,22 @@ class ChatMessage extends React.Component {
       const isPending = approval.status === 'pending';
       const isInteractive = isPending && this.props.cliMode && tu.id === this.props.lastPendingPlanId;
 
-      // pending 状态下提取 plan 内容：
-      // 1. 优先从跨消息追踪的 latestPlanContent（Write 到 .claude/plans/ 的内容，可能在前 1-2 个请求中）
-      // 2. 回退到同一 response 中 Write 工具的内容
-      // 3. 最后回退到 ExitPlanMode 之前的 text blocks
+      // pending 状态下提取 plan 内容（优先级从高到低）：
+      // 1. tool_use.input.plan（Claude Code 2.x ExitPlanModeV2Tool 的 normalizeToolInput 注入）
+      // 2. tool_use.input.planFilePath → 异步 fetch 缓存（multi-agent-room 等场景关键）
+      // 3. 跨消息追踪的 latestPlanContent（Write 到 .claude/plans/ 的内容）
+      // 4. 同一 response 中 Write 工具的内容
+      // 5. ExitPlanMode 之前的 text blocks
       let planTextContent = null;
       if (isPending) {
-        planTextContent = this.props.latestPlanContent || null;
+        if (typeof inp.plan === 'string' && inp.plan.trim()) {
+          planTextContent = inp.plan;
+        }
+        if (!planTextContent && typeof inp.planFilePath === 'string' && inp.planFilePath
+          && this.props.planFileContents && this.props.planFileContents[inp.planFilePath]) {
+          planTextContent = this.props.planFileContents[inp.planFilePath];
+        }
+        if (!planTextContent) planTextContent = this.props.latestPlanContent || null;
         if (!planTextContent && Array.isArray(this.props.content)) {
           for (const b of this.props.content) {
             if (b === tu) break;
@@ -475,12 +552,19 @@ class ChatMessage extends React.Component {
       }
 
       // 已批准且有计划内容 → 渲染为蓝色边框的 plan 视图
-      if (approval.status === 'approved' && approval.planContent) {
-        return (
-          <div key={tu.id} className={styles.bubblePlan}>
-            <MarkdownBlock text={approval.planContent} />
-          </div>
-        );
+      // approval.planContent 可能为空（V2 tool_result 文本不含 ## Approved Plan: 区块时），用 inp.plan / planFilePath 兜底
+      if (approval.status === 'approved') {
+        const approvedText = approval.planContent
+          || (typeof inp.plan === 'string' && inp.plan.trim() ? inp.plan : '')
+          || (typeof inp.planFilePath === 'string' && inp.planFilePath && this.props.planFileContents
+            ? (this.props.planFileContents[inp.planFilePath] || '') : '');
+        if (approvedText) {
+          return (
+            <div key={tu.id} className={styles.bubblePlan}>
+              <MarkdownBlock text={approvedText} />
+            </div>
+          );
+        }
       }
 
       // plan 审批选项：优先用 ptyPrompt 检测到的，否则用内置默认选项
@@ -503,7 +587,7 @@ class ChatMessage extends React.Component {
       const statusKey = approval.status === 'approved' ? 'ui.planApproved'
         : approval.status === 'rejected' ? 'ui.planRejected'
         : approval.status === 'ultraplan' ? 'ui.planUltraplan' : 'ui.planPending';
-      return (
+      const planModeBoxNode = (
         <div key={tu.id} className={`${styles.planModeBox} ${statusClass}`}>
           {isInteractive && (
             <svg className={`${styles.borderSvg} ${styles.borderSvgInset}`} preserveAspectRatio="none">
@@ -603,6 +687,24 @@ class ChatMessage extends React.Component {
           )}
         </div>
       );
+      // PTY plan portal: when the global modal is showing the same active plan id,
+      // ReactDOM.createPortal moves this entire planModeBox subtree (including the feedback
+      // textarea state) into the modal slot WITHOUT unmounting — local state survives.
+      // Inline rendering resumes when modal is dismissed or the prompt resolves.
+      // Only interactive cards qualify (resolved/historical cards never portal).
+      // ptyPlanCardId 用 tu.id（ExitPlanMode tool_use id）作权威源，与 ChatView pendingPtyPlan.id（=lastPendingPlanId）同源。
+      const ptyPlanCardId = isInteractive ? String(tu.id) : '';
+      return (
+        <ApprovalPortalContext.Consumer key={tu.id}>
+          {(ctx) => {
+            const match = !!(ctx?.ptyPlanSlot
+              && ctx?.activePtyPlanId != null
+              && ptyPlanCardId !== ''
+              && String(ctx.activePtyPlanId) === ptyPlanCardId);
+            return match ? ReactDOM.createPortal(planModeBoxNode, ctx.ptyPlanSlot) : planModeBoxNode;
+          }}
+        </ApprovalPortalContext.Consumer>
+      );
     }
 
     // SendMessage → render message content directly (no tool shell)
@@ -681,7 +783,7 @@ class ChatMessage extends React.Component {
   }
 
   renderAskQuestionInteractive(toolId, questions) {
-    return (
+    const node = (
       <AskQuestionForm
         key={toolId}
         questions={questions}
@@ -691,6 +793,30 @@ class ChatMessage extends React.Component {
           }
         }}
       />
+    );
+    // The form keeps a single React instance regardless of which DOM mount it lands in.
+    // When the global modal claims this toolId, portal into its slot — the inline parent
+    // sees an empty placeholder so the chat layout stays stable. Otherwise render inline.
+    return (
+      <ApprovalPortalContext.Consumer>
+        {(ctx) => {
+          // Portal 命中两个分支：
+          //   1) SDK 真实 toolId 模式：activeAskId === toolId 严格匹配
+          //   2) PTY-hook 模式：activeAskId='__ask__'，但只允许 owner ChatMessage 通配命中
+          //      —— 即必须同时满足 lastPendingAskId===toolId（owner-idx 已保证唯一性），
+          //         否则历史所有真实 toolId 都会被通配误命中，重现旧的双份 portal bug。
+          //      这条分支替代了 ApprovalModal 自渲染 fallback：让 inline 卡片唯一实例 portal
+          //      到 askSlot，状态完全互通（modal 与 inline 是同一 React 实例）。
+          if (!ctx || !ctx.askSlot || ctx.activeAskId == null) return node;
+          const isStrictMatch = String(ctx.activeAskId) === String(toolId);
+          const isPtyOwnerMatch = ctx.activeAskId === '__ask__'
+            && this.props.lastPendingAskId === toolId;
+          if (isStrictMatch || isPtyOwnerMatch) {
+            return ReactDOM.createPortal(node, ctx.askSlot);
+          }
+          return node;
+        }}
+      </ApprovalPortalContext.Consumer>
     );
   }
 
@@ -855,18 +981,13 @@ class ChatMessage extends React.Component {
                       type="primary"
                       ghost
                       className={styles.enableThinkingBtn}
-                      onClick={async (e) => {
+                      onClick={(e) => {
                         e.stopPropagation();
-                        try {
-                          const res = await fetch(apiUrl('/api/claude-settings'), {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ showThinkingSummaries: true }),
+                        this.context.updateClaudeSettings({ showThinkingSummaries: true })
+                          .then(data => {
+                            if (data) message.success(tc('ui.enableThinkingSummariesTip'));
+                            else message.error('Failed to save setting');
                           });
-                          if (res.ok) {
-                            message.success(tc('ui.enableThinkingSummariesTip'));
-                          }
-                        } catch { message.error('Failed to save setting'); }
                       }}
                     >
                       {t('ui.enableThinkingSummaries')}
@@ -988,7 +1109,7 @@ class ChatMessage extends React.Component {
   }
 
   renderAssistantMessage() {
-    const { content, toolResultMap = {}, modelInfo, timestamp, requestIndex, onViewRequest, showTrailingCursor } = this.props;
+    const { content, toolResultMap = {}, modelInfo, timestamp, requestIndex, onViewRequest, showTrailingCursor, cacheTotalTokens, showFullToolContent } = this.props;
     const innerContent = this.renderAssistantContent(content, toolResultMap);
 
     if (innerContent.length === 0) return null;
@@ -1002,6 +1123,8 @@ class ChatMessage extends React.Component {
             timeStr={this.formatTime(timestamp)}
             requestIndex={requestIndex}
             onViewRequest={onViewRequest}
+            cacheTotalTokens={cacheTotalTokens}
+            showFullToolContent={showFullToolContent}
           />
           {this.renderHighlightBubble(styles.bubbleAssistant, innerContent)}
         </div>
@@ -1020,15 +1143,25 @@ class ChatMessage extends React.Component {
   }
 
   renderSubAgentChatMessage() {
-    const { content, toolResultMap = {}, label } = this.props;
+    const { content, toolResultMap = {}, label, cacheTotalTokens, showFullToolContent } = this.props;
     const innerContent = this.renderAssistantContent(content, toolResultMap);
 
     if (innerContent.length === 0) return null;
+    const showCache = showFullToolContent && cacheTotalTokens != null;
+    const cacheStr = showCache ? formatCacheK(cacheTotalTokens) : '';
 
     return (
       <div className={styles.messageRowEnd}>
         <div className={styles.contentColLimited}>
           <div className={styles.labelRowEnd}>
+            {showCache && (
+              <Text
+                className={styles.cacheContextText}
+                title={t('ui.cacheContextTooltip', { value: cacheStr })}
+              >
+                {`[${cacheStr}]`}
+              </Text>
+            )}
             {this.formatTime(this.props.timestamp) && <Text className={styles.timeText}>{this.formatTime(this.props.timestamp)}</Text>}
             {this.renderViewRequestBtn()}
             <Text type="secondary" className={styles.labelTextRight}>{label || 'SubAgent'}</Text>

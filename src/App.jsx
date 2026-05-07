@@ -8,6 +8,8 @@ import AppHeader from './components/AppHeader';
 import RequestList from './components/RequestList';
 import DetailPanel from './components/DetailPanel';
 import ChatView from './components/ChatView';
+import ApprovalModal from './components/ApprovalModal';
+import { TerminalWsProvider } from './components/TerminalWsContext';
 import PanelResizer from './components/PanelResizer';
 import OpenFolderIcon from './components/OpenFolderIcon';
 import CountryFlag from './components/CountryFlag';
@@ -26,10 +28,20 @@ class App extends AppBase {
       terminalVisible: true,
       currentTab: 'context',
       pendingCacheHighlight: null,
+      contextBarSlot: null, // TerminalPanel 工具栏 / ChatInputBar 底部按钮区注册的 DOM slot；AppHeader 通过 createPortal 把血条渲染过去
     });
     this.appHeaderRef = React.createRef();
     this._getTokenStatsContent = () => this.appHeaderRef.current?.renderTokenStats?.() ?? null;
   }
+
+  // 子组件（TerminalPanel / ChatInputBar）通过 ref callback 注册血条 slot DOM；
+  // 切换 terminalVisible 时旧 slot 先 ref(null) → 新 slot ref(el)，AppHeader 接住 prop 变化触发 portal 重定位。
+  // 守卫：1) 跳过已脱离 DOM 的节点（防御 transient race）；2) 引用相同时不重复 setState（避免 render loop）。
+  setContextBarSlot = (el) => {
+    if (el && !el.isConnected) return;
+    if (el === this.state.contextBarSlot) return;
+    this.setState({ contextBarSlot: el });
+  };
 
   componentDidMount() {
     super.componentDidMount();
@@ -298,8 +310,24 @@ class App extends AppBase {
       return this.renderWorkspaceMode();
     }
 
+    // 单条 /ws/terminal 的开启条件:非本地日志查看且非 SDK 模式即开。
+    // (历史:合并前 ChatView 的 _inputWs 始终连;v1.6.226 一度绑到 cliMode || terminalVisible,
+    // 在 mobile 隐藏终端 / web-only 浏览等场景下 hook bridge / PTY 提交全失败,触发"请求未送达"toast。
+    // 回退到与合并前 _inputWs 始终连等价的语义。SDK 模式 ws 缺失是 latent issue,本次不处理。)
+    const wsOpen = !this._isLocalLog && !this.state.sdkMode;
+
     return (
       <ConfigProvider theme={this.themeConfig}>
+        <TerminalWsProvider open={wsOpen}>
+        <ApprovalModal
+          enabled={this.state.approvalPrefs.modalEnabled}
+          soundEnabled={this.state.approvalPrefs.soundEnabled}
+          approvalGlobal={this.state.approvalGlobal}
+          dismissedIds={this.state.approvalDismissedIds}
+          onDismiss={this.handleApprovalDismiss}
+          onJumpTab={this.handleApprovalJumpTab}
+          otherTabs={this.state.approvalOtherTabs}
+        >
         {fileLoading && (
           <div className={styles.loadingOverlay}>
             <div className={styles.loadingText}>Loading...({fileLoadingCount})</div>
@@ -358,10 +386,17 @@ class App extends AppBase {
               onThemeColorChange={this.handleThemeColorChange}
               autoApproveSeconds={this.state.autoApproveSeconds}
               onAutoApproveChange={this.handleAutoApproveChange}
+              approvalPrefs={this.state.approvalPrefs}
+              onApprovalPrefsChange={this.handleApprovalPrefsChange}
+              approvalGlobal={this.state.approvalGlobal}
+              approvalDismissedIds={this.state.approvalDismissedIds}
+              approvalOwnPending={this.state.approvalOwnPending}
+              onApprovalReopen={this.handleApprovalReopen}
               proxyProfiles={this.state.proxyProfiles}
               activeProxyId={this.state.activeProxyId}
               defaultConfig={this.state.defaultConfig}
               onProxyProfileChange={this.handleProxyProfileChange}
+              contextBarSlot={this.state.contextBarSlot}
             />
           </Layout.Header>
           {this.state.claudeMissing && (
@@ -447,7 +482,7 @@ class App extends AppBase {
               )
             )}
             <div className={styles.chatViewWrapper} style={{ display: viewMode === 'chat' ? 'flex' : 'none' }}>
-              <ChatView getTokenStatsContent={this._getTokenStatsContent} requests={filteredRequests} mainAgentSessions={mainAgentSessions} streamingLatest={this.state.streamingLatest} userProfile={this.state.userProfile} collapseToolResults={this.state.collapseToolResults} expandThinking={this.state.expandThinking} showFullToolContent={this.state.showFullToolContent} showThinkingSummaries={this.state.showThinkingSummaries} onViewRequest={this.handleViewRequest} scrollToTimestamp={this.state.chatScrollToTs} onScrollTsDone={this.handleScrollTsDone} cliMode={this._isLocalLog ? false : this.state.cliMode} sdkMode={this._isLocalLog ? false : this.state.sdkMode} terminalVisible={this._isLocalLog ? false : (this.state.sdkMode ? false : this.state.terminalVisible)} onToggleTerminal={() => this.setState(prev => ({ terminalVisible: !prev.terminalVisible }))} pendingUploadPaths={this.state.pendingUploadPaths} onUploadPathsConsumed={this.handleUploadPathsConsumed} fileLoading={this.state.fileLoading} isStreaming={this.state.isStreaming} hasMoreHistory={this.state.hasMoreHistory} loadingMore={this.state.loadingMore} onLoadMoreHistory={() => this.loadMoreHistory()} loadingSessionId={this.state.loadingSessionId} onLoadSession={(sid) => this.loadSession(sid)} lang={this.state.lang} autoApproveSeconds={this.state.autoApproveSeconds} onAutoApproveChange={this.handleAutoApproveChange} onClearContextOptimistic={this.handleClearContextOptimistic} />
+              <ChatView {...this._settingsProps()} getTokenStatsContent={this._getTokenStatsContent} requests={filteredRequests} mainAgentSessions={mainAgentSessions} streamingLatest={this.state.streamingLatest} userProfile={this.state.userProfile} collapseToolResults={this.state.collapseToolResults} expandThinking={this.state.expandThinking} showFullToolContent={this.state.showFullToolContent} showThinkingSummaries={this.state.showThinkingSummaries} onViewRequest={this.handleViewRequest} scrollToTimestamp={this.state.chatScrollToTs} onScrollTsDone={this.handleScrollTsDone} cliMode={this._isLocalLog ? false : this.state.cliMode} sdkMode={this._isLocalLog ? false : this.state.sdkMode} terminalVisible={this._isLocalLog ? false : (this.state.sdkMode ? false : this.state.terminalVisible)} onToggleTerminal={() => this.setState(prev => ({ terminalVisible: !prev.terminalVisible }))} pendingUploadPaths={this.state.pendingUploadPaths} onUploadPathsConsumed={this.handleUploadPathsConsumed} fileLoading={this.state.fileLoading} isStreaming={this.state.isStreaming} hasMoreHistory={this.state.hasMoreHistory} loadingMore={this.state.loadingMore} onLoadMoreHistory={() => this.loadMoreHistory()} loadingSessionId={this.state.loadingSessionId} onLoadSession={(sid) => this.loadSession(sid)} lang={this.state.lang} autoApproveSeconds={this.state.autoApproveSeconds} onAutoApproveChange={this.handleAutoApproveChange} onClearContextOptimistic={this.handleClearContextOptimistic} onPendingAsk={this.handleApprovalAsk} onPendingPtyPlan={this.handleApprovalPtyPlan} ownTabId={this.state.ownTabId} projectName={this.state.projectName} setContextBarSlot={this.setContextBarSlot} />
             </div>
           </Layout.Content>
           <div className={styles.footer}>
@@ -589,6 +624,8 @@ class App extends AppBase {
             );
           })()}
         </Modal>
+        </ApprovalModal>
+        </TerminalWsProvider>
       </ConfigProvider>
     );
   }

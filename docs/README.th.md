@@ -20,8 +20,18 @@
 
 ### ติดตั้ง ccv
 
+#### ติดตั้งผ่าน npm
+
 ```bash
 npm install -g cc-viewer --registry=https://registry.npmjs.org
+```
+
+#### ติดตั้งผ่าน Homebrew (แนะนำสำหรับ macOS / Linux)
+
+```bash
+brew tap weiesky/cc-viewer
+brew install cc-viewer
+brew upgrade cc-viewer   # สำหรับอัปเดต — ห้ามใช้ npm install -g สำหรับการติดตั้ง brew
 ```
 
 ### การเปิดใช้งาน

@@ -206,3 +206,20 @@ export function buildChunksForAnswer(answer, prompt, isMultiQuestion = false) {
   }
   return buildSingleSelectChunks(answer, prompt, isMultiQuestion);
 }
+
+/**
+ * settleMs after a bracket-paste-end chunk. Ink TUI needs ~1 frame to settle
+ * paste→normal state; if \r arrives in the same PTY write it gets swallowed.
+ */
+export const BRACKET_PASTE_SUBMIT_SETTLE_MS = 250;
+
+/**
+ * Wrap content in bracket paste mode and append Enter as a separate chunk,
+ * so the consumer can space them with settleMs.
+ * @param {string} content - non-empty string to paste-and-submit
+ * @returns {string[]} [pasteBlock, '\r']; [] if content is falsy or non-string
+ */
+export function buildBracketPasteSubmitChunks(content) {
+  if (typeof content !== 'string' || content.length === 0) return [];
+  return [`\x1b[200~${content}\x1b[201~`, ENTER];
+}

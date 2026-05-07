@@ -20,8 +20,18 @@ Uygulamalı geliştirme deneyiminden damıtılmış, Claude Code üzerine inşa 
 
 ### ccv'yi Yükleme
 
+#### npm ile kurulum
+
 ```bash
 npm install -g cc-viewer --registry=https://registry.npmjs.org
+```
+
+#### Homebrew ile kurulum (macOS / Linux için önerilir)
+
+```bash
+brew tap weiesky/cc-viewer
+brew install cc-viewer
+brew upgrade cc-viewer   # güncellemeler için — brew kurulumlarında npm install -g KULLANMAYIN
 ```
 
 ### Başlatma

@@ -108,6 +108,12 @@ function ToolApprovalPanel({ toolName, toolInput, requestId, onAllow, onAllowSes
         return toolInput.file_path || toolInput.description || '';
       case 'NotebookEdit':
         return toolInput.notebook_path || toolInput.description || '';
+      case 'ExitPlanMode': {
+        // ExitPlanMode V2: input.plan 是 normalizeToolInput 注入的完整 markdown plan
+        // 优先展示 plan 正文（multi-agent-room 等场景下 plan 仅来自 input，避免 default 分支把 27k JSON 截到 500 字）
+        const txt = (typeof toolInput.plan === 'string' && toolInput.plan.trim()) ? toolInput.plan : '';
+        return txt || (toolInput.planFilePath ? `(plan @ ${toolInput.planFilePath})` : (toolInput.description || ''));
+      }
       default:
         if (toolInput.description) return toolInput.description;
         return JSON.stringify(toolInput, null, 2).slice(0, 500);

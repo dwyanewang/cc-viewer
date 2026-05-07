@@ -1,6 +1,6 @@
 {
   "name": "cc-viewer",
-  "version": "1.6.217",
+  "version": "1.6.246",
   "description": "Claude Code Logger visualization management tool",
   "license": "MIT",
   "main": "server.js",
@@ -17,6 +17,7 @@
   "scripts": {
     "dev": "vite",
     "build": "node build.js",
+    "build:sourcemap": "CCV_SOURCEMAP=1 node build.js",
     "start": "node server.js",
     "test": "CCV_LOG_DIR=tmp node --test",
     "test:coverage": "CCV_LOG_DIR=tmp node --test --experimental-test-coverage --test-coverage-include='lib/*.js' --test-coverage-include='*.js'",
@@ -48,6 +49,7 @@
   },
   "files": [
     "dist/",
+    "!dist/**/*.map",
     "server.js",
     "cli.js",
     "proxy.js",
@@ -57,6 +59,7 @@
     "lib/",
     "plugins/",
     "pty-manager.js",
+    "scratch-pty-manager.js",
     "workspace-registry.js",
     "concepts/"
   ],
@@ -90,6 +93,7 @@
     "electron-builder": "^26.0.12",
     "highlight.js": "^11.11.1",
     "html2canvas": "^1.4.1",
+    "jszip": "^3.10.1",
     "marked": "^17.0.2",
     "mermaid": "^11.13.0",
     "qrcode.react": "^4.2.0",
@@ -101,6 +105,7 @@
     "vite": "^6.3.5"
   },
   "dependencies": {
+    "adm-zip": "^0.5.17",
     "dompurify": "^3.3.3",
     "node-pty": "^1.1.0",
     "undici": "^7.22.0",

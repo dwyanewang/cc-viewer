@@ -171,17 +171,6 @@
   background: var(--bg-surface);
 }
 
-.contextWarning {
-  margin: 0 16px 10px;
-  padding: 8px 12px;
-  font-size: 13px;
-  line-height: 1.5;
-  color: var(--warning-text, #b45309);
-  background: var(--warning-bg, #fef3c7);
-  border: 1px solid var(--warning-border, #fde68a);
-  border-radius: 6px;
-}
-
 .fileList {
   display: flex;
   flex-wrap: wrap;

@@ -25,7 +25,9 @@
      fallback 200px 是 zoom:0.6 下多行+pending图片时输入栏视觉高度的安全上限，保证即使
      CSS 变量还没来得及写也绝不覆盖输入栏（宁可留大间隙也不遮挡）。 */
   position: fixed;
-  bottom: calc(var(--chat-input-bar-height, 200px) + 12px);
+  /* max() 兜底：var 写入异常 0 时（zoom polyfill 下 rect.top ≥ vh），至少给输入栏留 56px 视觉
+     空间——单行无附件的最矮输入栏；正常 var 都比 56 大，max 不影响紧贴效果。 */
+  bottom: max(calc(var(--chat-input-bar-height, 200px) + 12px), 56px);
   left: 10px;
   right: 10px;
   z-index: 99999;

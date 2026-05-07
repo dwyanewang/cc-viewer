@@ -9,7 +9,7 @@ import modelKimiUrl from '../img/model-kimi.svg';
 import modelGlmUrl from '../img/model-glm.svg';
 import modelMinimaxUrl from '../img/model-minimax.svg';
 import modelDeepseekUrl from '../img/model-deepseek.svg';
-import modelClaudeAnimatedSvg from '../img/model-claude-animated.svg?raw';
+import modelClaudeAnimatedSvg from '../img/claude/writing.svg?raw';
 
 const MODEL_CONTEXT_SIZES = [
   // Explicit 1M context annotation: [1m] suffix in model descriptor
@@ -42,6 +42,41 @@ export function getModelMaxTokens(modelName) {
  */
 export function getEffectiveModel(request) {
   return request?.response?.body?.model || request?.body?.model || null;
+}
+
+// auto-compact 在 ~83.5% 触发，扣 16.5% buffer；usable = max * 0.835，display % = used / 83.5 * 100
+export const AUTO_COMPACT_USABLE_RATIO = 0.835;
+
+// 校准尺寸 → token 数集中映射。
+// 注意：扩档（如加 500K）必须同步改 src/config.json 的 calibrationModels（label/value）
+// 与 i18n 文案；只改这里 UI 不会出现新选项。
+const CALIBRATION_TOKEN_MAP = {
+  '1m': 1000000,
+  '200k': 200000,
+};
+
+/**
+ * 把用户在 popover 里选的"上下文窗口尺寸"换算成 token 数。
+ *  - calibrationModel === '1m' / '200k'：直接查表
+ *  - 其它（含 'auto' 与所有兜底情况）：按 lastMainAgent 的 model 名判定
+ *      · model 包含 opus-4-7 / opus-4.7 / opus 4.7（大小写不敏感）→ 1M
+ *      · model 含 1m 子串（如 deepseek-v3-1m）→ 1M
+ *      · 冷启动（lastMainAgent 缺失或 getEffectiveModel 返回非字符串）→ 1M（用户规约）
+ *      · 否则 → 200K
+ *  注：model="opus-4-7-1m" 同时命中前两条规则；opus 规则先触发，结果 1M（语义一致，无冲突）。
+ *
+ * 不变量：永远返回 1000000 或 200000；调用方可放心当真值用。
+ */
+export function resolveCalibrationTokens(calibrationModel, lastMainAgent) {
+  const direct = CALIBRATION_TOKEN_MAP[calibrationModel];
+  if (direct) return direct;
+  const raw = lastMainAgent ? getEffectiveModel(lastMainAgent) : null;
+  // proxy 异常返回 number/object 时 .toLowerCase 会抛错；非字符串一律按冷启动 1M 处理
+  if (typeof raw !== 'string' || !raw) return 1000000;
+  const m = raw.toLowerCase();
+  if (m.includes('opus-4-7') || m.includes('opus-4.7') || m.includes('opus 4.7')) return 1000000;
+  if (m.includes('1m')) return 1000000;
+  return 200000;
 }
 
 /**

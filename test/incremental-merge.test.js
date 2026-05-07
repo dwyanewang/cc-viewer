@@ -422,6 +422,101 @@ describe('transient boundary: exactly 5 messages', () => {
   });
 });
 
+// ─── 8.5 Plan Mode CLI 上下文压缩窗口（messageFingerprint 内容感知合并） ─────────────────
+// 真实场景：ExitPlanMode 审批前后，CLI 把累积历史压缩成 [latest assistant, latest tool_result]
+// 两条 sliding window 重复发起请求。原 sessionMerge 仅看长度无法区分流式 vs 新片段。
+
+describe('Plan Mode compression: exact-length but different content', () => {
+  it('appends new conversation fragment when newLen===currentLen but content differs', () => {
+    // 模拟 jsonl 真实时序：01:45:42 entry messages=[Write tool_use, Write tool_result]
+    // 紧接 01:45:57 entry messages=[ExitPlanMode tool_use, ExitPlanMode tool_result]，长度同样为 2 但内容完全不同。
+    const writeTu = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_write', name: 'Write' }] };
+    const writeTr = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_write', content: 'ok' }] };
+    const session = makeSession([writeTu, writeTr], { userId: 'u1' });
+
+    const planTu = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_plan', name: 'ExitPlanMode' }] };
+    const planTr = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_plan', content: 'User has approved your plan.\n## Approved Plan:\n# X' }] };
+    const entry = makeEntry([planTu, planTr], { userId: 'u1' });
+
+    const result = mergeMainAgentSessions([session], entry);
+    assert.equal(result[0].messages.length, 4, 'should append to 4 messages');
+    assert.equal(result[0].messages[2].content[0].id, 'tu_plan', 'ExitPlanMode tool_use appended');
+    assert.equal(result[0].messages[3].content[0].tool_use_id, 'tu_plan', 'tool_result appended');
+  });
+
+  it('skips overlapping prefix when newLen===currentLen and first K fingerprints match tail', () => {
+    // CLI 偶发场景：新窗口前 K 条与历史末尾 K 条重复（前缀重叠），末尾不同
+    // 修复后应只 push newMessages[K..]，不重复 push 重叠部分
+    const a = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_a', name: 'Read' }] };
+    const b = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_a', content: 'r' }] };
+    const c = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_c', name: 'Bash' }] };
+    const d = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_c', content: 'r2' }] };
+    const session = makeSession([a, b, c, d], { userId: 'u1' });
+
+    // newMessages: 前 2 条 fp 与末尾 2 条相同，后 2 条全新
+    const c2 = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_c', name: 'Bash' }] };
+    const d2 = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_c', content: 'r2' }] };
+    const e = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_e', name: 'Edit' }] };
+    const f = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_e', content: 'r3' }] };
+    const entry = makeEntry([c2, d2, e, f], { userId: 'u1' });
+
+    const result = mergeMainAgentSessions([session], entry);
+    assert.equal(result[0].messages.length, 6, 'should be 4 + 2 (only non-overlap part appended)');
+    assert.equal(result[0].messages[4].content[0].id, 'tu_e', 'tu_e appended');
+    assert.equal(result[0].messages[5].content[0].tool_use_id, 'tu_e', 'tu_e tool_result appended');
+  });
+
+  it('keeps stable reference when newLen===currentLen and content matches (streaming)', () => {
+    // 同 entry 流式更新：messages 内容完全一致、仅 response 增量。原行为必须保留。
+    const tu = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_x', name: 'Read' }] };
+    const tr = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_x', content: 'ok' }] };
+    const session = makeSession([tu, tr], { userId: 'u1' });
+    const ref = session.messages;
+
+    const tu2 = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_x', name: 'Read' }] };
+    const tr2 = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_x', content: 'ok' }] };
+    const entry = makeEntry([tu2, tr2], { userId: 'u1' });
+
+    const result = mergeMainAgentSessions([session], entry);
+    assert.equal(result[0].messages.length, 2, 'no append');
+    assert.strictEqual(result[0].messages, ref, 'reference stable');
+  });
+});
+
+describe('Plan Mode compression: newLen<currentLen but is suffix subset', () => {
+  it('preserves history when newMessages is suffix of lastSession.messages', () => {
+    // 模拟 currentLen=148 末尾两条 = [EnterPlanMode tu, tr]，CLI 下一轮发的窗口也是同样 [EnterPlanMode tu, tr]。
+    // 原代码会触发 newLen<currentLen → 重建路径，把累积 148 条历史抹掉。修复后应识别为压缩窗口、保留。
+    const enterTu = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_enter', name: 'EnterPlanMode' }] };
+    const enterTr = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_enter', content: 'ok' }] };
+    const head = Array.from({ length: 146 }, (_, i) => makeMsg('user', `q${i}`));
+    const fullMsgs = [...head, enterTu, enterTr];
+    const session = makeSession(fullMsgs, { userId: 'u1' });
+    const ref = session.messages;
+
+    const entry = makeEntry([
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_enter', name: 'EnterPlanMode' }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_enter', content: 'ok' }] },
+    ], { userId: 'u1' });
+
+    const result = mergeMainAgentSessions([session], entry);
+    assert.equal(result[0].messages.length, 148, 'history preserved');
+    assert.strictEqual(result[0].messages, ref, 'reference stable, no rebuild');
+  });
+
+  it('rebuilds when newLen<currentLen and content does NOT match (real /compact)', () => {
+    // /compact summary 替换：messages 缩短且内容是新 summary。fingerprint 跟原历史末尾不匹配 → 走重建（保持原行为）。
+    const oldMsgs = Array.from({ length: 20 }, (_, i) => makeMsg('user', `old${i}`));
+    const session = makeSession(oldMsgs, { userId: 'u1' });
+    const newMsgs = Array.from({ length: 6 }, (_, i) => makeMsg('user', `summary${i}`));
+    const entry = makeEntry(newMsgs, { userId: 'u1' });
+
+    const result = mergeMainAgentSessions([session], entry);
+    assert.equal(result[0].messages.length, 6, 'rebuilt to new length');
+    assert.strictEqual(result[0].messages, newMsgs, 'reference replaced with new');
+  });
+});
+
 // ─── 9. /clear checkpoint detection (regression for 16:12:11 → 16:15:11 misplacement) ──
 
 describe('post-/clear checkpoint creates new session entry', () => {

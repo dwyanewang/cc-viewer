@@ -23,6 +23,10 @@ process.env.CCV_WORKSPACE_MODE = '1';
 process.env.CCV_START_PORT = process.env.CCV_START_PORT || '7048';
 process.env.CCV_MAX_PORT = process.env.CCV_MAX_PORT || '7099';
 
+// 等首条 claude PTY 数据落入 outputBuffer 的兜底超时——超过仍 send ready 让前端开始加载。
+// claude TUI 启动通常 200-400ms 出首帧；600ms 留足空间又不至于让用户感受到明显延迟。
+const CLAUDE_STARTUP_TIMEOUT_MS = 600;
+
 // Receive launch command from parent
 process.on('message', async (msg) => {
   if (msg.type === 'launch') {
@@ -85,18 +89,11 @@ async function launch({ path: projectPath, extraArgs = [], claudePath, isNpmVers
   // 7c. Start log watcher, stats worker, streaming status (mirrors /api/workspaces/launch logic)
   serverMod.initPostLaunch();
 
-  // 8. Notify parent FIRST — let the view load while Claude spawns
-  const token = serverMod.getAccessToken();
-  console.log('[worker] sending ready:', port, result.projectName);
-  process.send({
-    type: 'ready',
-    port,
-    token,
-    projectName: result.projectName,
-  });
-
-  // 9. Spawn Claude PTY (after ready, so view is already loading)
-  const { spawnClaude, killPty, onPtyExit } = await importAbs(join(rootDir, 'pty-manager.js'));
+  // 8. Spawn Claude PTY FIRST so its initial TUI lands in outputBuffer
+  // 之前是先 send ready 再 spawnClaude；那种顺序下前端 ws 可能在 PTY 启动前就连上，
+  // outputBuffer 为空 + claude 等待输入不再重绘 → 主 TerminalPanel 黑屏。
+  // 现在等 spawnClaude 完成且首条 PTY 数据落地（或 600ms 兜底超时）后再 send ready。
+  const { spawnClaude, killPty, onPtyExit, onPtyData } = await importAbs(join(rootDir, 'pty-manager.js'));
   killPtyFn = killPty;
 
   onPtyExit((code) => {
@@ -107,10 +104,30 @@ async function launch({ path: projectPath, extraArgs = [], claudePath, isNpmVers
     try {
       console.log('[worker] spawnClaude proxyPort:', proxyPort, 'serverPort:', port, 'path:', projectPath);
       await spawnClaude(proxyPort, projectPath, extraArgs, claudePath, isNpmVersion, port);
+      // 等首条 PTY 数据 或 超时兜底（claude TUI 启动通常 200-400ms 内首帧）
+      await new Promise((resolve) => {
+        let done = false;
+        const finish = () => { if (done) return; done = true; clearTimeout(timer); remove(); resolve(); };
+        const timer = setTimeout(finish, CLAUDE_STARTUP_TIMEOUT_MS);
+        const remove = onPtyData(() => finish());
+      });
     } catch (err) {
       try { process.send({ type: 'pty-error', message: err.message }); } catch {}
+      // spawnClaude 失败时不再 send 'ready'：让 main.js 30s timeout 自动标 tab error，
+      // 避免前端激活一个无 PTY 的 tab 出现"看似可用但黑屏"的体验。
+      return;
     }
   }
+
+  // 9. Notify parent — view will load with outputBuffer already populated
+  const token = serverMod.getAccessToken();
+  console.log('[worker] sending ready:', port, result.projectName);
+  process.send({
+    type: 'ready',
+    port,
+    token,
+    projectName: result.projectName,
+  });
 }
 
 async function shutdown() {

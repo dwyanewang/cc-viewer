@@ -17,6 +17,10 @@ Every built-in expert (Code Expert / Research Expert) is essentially a `<system-
 interactions. Once the task is complete, these instructions should be gradually
 deprioritized and no longer influence subsequent interactions.
 
+Pre-requisite: Use `AskUserQuestion` to clarify the research scope, target
+audience, and deliverable format whenever the user's intent is ambiguous. Skip
+only if the intent is unambiguous.
+
 Leverage a multi-agent exploration mechanism to formulate an exceptionally
 detailed implementation plan.
 

@@ -33,7 +33,7 @@ import {
 import './MdxEditorPanel.base.css';
 import styles from './MdxEditorPanel.module.css';
 import { compressImageToDataURL } from '../utils/imageCompress';
-import { mdxZhTranslation } from '../i18n/mdxZh';
+import { mdxTranslation } from '../i18n/mdxTranslations';
 import { t as i18n, getLang } from '../i18n';
 
 function getDocTheme() {
@@ -105,12 +105,14 @@ const MdxEditorPanel = forwardRef(function MdxEditorPanel(
     focus: () => editorRef.current?.focus?.(),
   }), []);
 
-  // (d) translation 注入：中文走自定义覆盖；其他语言用 MDXEditor 默认英文
-  const translation = lang === 'zh' || lang === 'zh-TW' ? mdxZhTranslation : undefined;
-
+  // (d) translation 注入：所有语言都走 mdxTranslation（未覆盖 key 由它自动 fall back 到 defaultValue 英文）
+  // key={lang} 强制 React 在切语言时重挂载 MDXEditor，保证 toolbar tooltip 立即生效（lib 内部 t() 在
+  // init 时一次性读取，无 subscribe 机制）。代价：编辑光标 + undo/redo history 在切语言时丢失，
+  // 用户切语言频率极低，可接受；initialMarkdown 回填保证内容不丢。
   return (
     <div className={`${styles.container} ${theme === 'dark' ? `dark-theme ${styles.dark}` : styles.light}`}>
       <MDXEditor
+        key={lang}
         ref={editorRef}
         markdown={initialMarkdown ?? ''}
         onChange={onChange}
@@ -123,7 +125,7 @@ const MdxEditorPanel = forwardRef(function MdxEditorPanel(
             try { onParseError(payload); } catch { /* swallow — fallback 路径不能再抛 */ }
           }
         }}
-        translation={translation}
+        translation={mdxTranslation}
         contentEditableClassName={styles.contentEditable}
         plugins={[
           headingsPlugin(),

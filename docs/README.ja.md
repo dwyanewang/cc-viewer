@@ -20,8 +20,18 @@ Claude Code をベースに、自身の開発経験を蒸留・蓄積した Vibe
 
 ### ccv のインストール
 
+#### npm でインストール
+
 ```bash
 npm install -g cc-viewer --registry=https://registry.npmjs.org
+```
+
+#### Homebrew でインストール (macOS / Linux 推奨)
+
+```bash
+brew tap weiesky/cc-viewer
+brew install cc-viewer
+brew upgrade cc-viewer   # アップデート用 — brew インストールでは npm install -g を使わないでください
 ```
 
 ### 起動方法

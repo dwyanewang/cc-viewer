@@ -518,6 +518,22 @@ export default function FileContentView({ filePath, onClose, editorSession, scro
 
   saveRef.current = doSave;
 
+  // MdxEditor 模式下补 Ctrl+S/Cmd+S 快捷键。
+  // CodeMirror 模式有自己的 keymap（L636-639 走 saveRef），不走这里；
+  // useMdxEditor 守卫避免双触发。MdxEditor contenteditable 不拦 Ctrl+S（已 grep 确认 lib 无内置 handler），
+  // document bubble 阶段监听足够；preventDefault 阻止浏览器原生「另存为」对话框。
+  useEffect(() => {
+    if (!useMdxEditor) return;
+    const onKeyDown = (e) => {
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault();
+        saveRef.current?.();  // 内部已有 isDirty 守卫，不脏不发请求
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [useMdxEditor]);
+
   // 纵向滚动同步：CodeMirror 滚动时同步行号栏
   const scrollSyncExtension = useMemo(() =>
     EditorView.updateListener.of((update) => {
@@ -562,9 +578,17 @@ export default function FileContentView({ filePath, onClose, editorSession, scro
           return r
             .json()
             .then((err) => {
-              throw new Error(err.error || 'Failed to load');
+              // 服务端 file-access-policy 现在统一返回 {error, reason, allowedRoots?}
+              // reason 取值见 lib/file-access-policy.js:isReadAllowed,前端解析后展示具体原因
+              const reasonMsg = err.reason
+                ? (i18n(`ui.fileLoadError.reason.${err.reason}`) || err.error)
+                : (err.error || 'Failed to load');
+              const e = new Error(reasonMsg);
+              if (err.allowedRoots) e.allowedRoots = err.allowedRoots;
+              throw e;
             })
-            .catch(() => {
+            .catch((parsedErr) => {
+              if (parsedErr && parsedErr.message) throw parsedErr;
               throw new Error(`HTTP ${r.status}`);
             });
         }

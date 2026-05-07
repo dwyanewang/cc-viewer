@@ -1,20 +1,18 @@
 import React, { useState } from 'react';
 import { t } from '../i18n';
 import { apiUrl } from '../utils/apiUrl';
-import { getModelMaxTokens } from '../utils/helpers';
 import ImageLightbox from './ImageLightbox';
 import ConfirmRemoveButton from './ConfirmRemoveButton';
 import styles from './UltraPlanModal.module.css';
 
 export default function UltraPlanModal({
-  open, variant, prompt, files, modelName, agentTeamEnabled, customExperts,
+  open, variant, prompt, files, agentTeamEnabled, customExperts,
   onClose, onVariantChange, onPromptChange, onSend, onUpload, onPaste, onRemoveFile, onOpenCustomEditor,
 }) {
   const [lightbox, setLightbox] = useState(null);
   if (!open) return null;
 
   const hasContent = (prompt || '').trim() || files.length > 0;
-  const lowContext = !modelName || getModelMaxTokens(modelName) < 1000000;
   const experts = Array.isArray(customExperts) ? customExperts : [];
 
   return (
@@ -88,10 +86,6 @@ export default function UltraPlanModal({
                 </button>
               )}
             </div>
-
-            {lowContext && (
-              <div className={styles.contextWarning}>{t('ui.ultraplan.contextWarning')}</div>
-            )}
 
             {files.length > 0 && (
               <div className={styles.fileList}>

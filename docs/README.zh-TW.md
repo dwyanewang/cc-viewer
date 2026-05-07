@@ -20,8 +20,18 @@
 
 ### 安裝 ccv
 
+#### 透過 npm 安裝
+
 ```bash
 npm install -g cc-viewer --registry=https://registry.npmjs.org
+```
+
+#### 透過 Homebrew 安裝（macOS / Linux 推薦）
+
+```bash
+brew tap weiesky/cc-viewer
+brew install cc-viewer
+brew upgrade cc-viewer   # 升級用這個，brew 安裝的 ccv 不要用 npm install -g 升級
 ```
 
 ### 啟動方式

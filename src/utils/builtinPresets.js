@@ -7,7 +7,6 @@
 export const BUILTIN_PRESETS = [
   {
     builtinId: 'codereview-5',
-    version: 1,
     teamName: 'ui.preset.codeReview5.name',
     description: 'ui.preset.codeReview5.desc',
   },

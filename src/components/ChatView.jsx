@@ -17,15 +17,17 @@ import { buildChunksForAnswer } from '../utils/ptyChunkBuilder';
 import { isPlanApprovalPrompt, isDangerousOperationPrompt, parseToolInfoFromBuffer } from '../utils/promptClassifier';
 import { isImageFile, isMutatingCommand } from '../utils/commandValidator';
 import { createEmptyToolState, appendToolResultMap, cachedBuildToolResultMap, getToolResultCache, setToolResultCache } from '../utils/toolResultBuilder';
+import { refreshPlanApprovalOnCachedItems } from '../utils/refreshPlanApprovalCache';
+import { refreshAskAnswerOnCachedItems } from '../utils/refreshAskAnswerCache';
 import { TeamButton, TeamModal } from './TeamSessionPanel';
 import SnapLineOverlay from './SnapLineOverlay';
 import RoleFilterBar from './RoleFilterBar';
 import ChatInputBar from './ChatInputBar';
 import PresetModal from './PresetModal';
 import UltraPlanModal from './UltraPlanModal';
+import { TerminalWsContext } from './TerminalWsContext';
 import CustomUltraplanEditModal from './CustomUltraplanEditModal';
 import { buildLocalUltraplan } from '../utils/ultraplanTemplates';
-import { getModelMaxTokens } from '../utils/helpers';
 import { Virtuoso } from 'react-virtuoso';
 import { isMobile, isIOS, isPad } from '../env';
 import { t } from '../i18n';
@@ -34,6 +36,11 @@ import { tryOpenWithSystem } from '../utils/fileOpen';
 import { BUILTIN_PRESETS } from '../utils/builtinPresets';
 import defaultAvatarUrl from '../img/default-avatar.svg';
 import loadingPetUrl from '../img/loading-pet.gif';
+// 用 <object type="image/svg+xml"> 替代 <img>：WeChat / Android WebView 在 <img> 的 image 路径
+// 下经常把 SMIL <animate> 当 raster 处理只渲染第 0 帧；<object> 走 SVG document 路径，所有 WebView
+// 正确播放，且不依赖 dangerouslySetInnerHTML。
+import shimmerUrl from '../img/claude/shimmer.svg';
+import orbitingUrl from '../img/claude/orbiting.svg';
 import styles from './ChatView.module.css';
 
 const { Text } = Typography;
@@ -59,6 +66,26 @@ function randomInterval() {
 }
 
 class ChatView extends React.Component {
+  // 通过 Context 共享 App 层的单条 /ws/terminal,this.context = { send, isOpen, addMessageHandler, addStateListener }
+  static contextType = TerminalWsContext;
+
+  // 兼容 stub:历史代码大量使用 `this._inputWs.send(JSON.stringify(...))` 和
+  // `this._inputWs.readyState === WebSocket.OPEN`。getter 返回一个轻量对象映射到 context API,
+  // 这样现有发送/状态检查代码无需逐处替换(只删掉 connectInputWs/onclose/close 路径)。
+  // ws 实例由 Provider 持有,readyState 仅区分 OPEN(1) / CLOSED(3),不暴露 CONNECTING/CLOSING 中间态。
+  get _inputWs() {
+    const ctx = this.context;
+    if (!ctx || typeof ctx.send !== 'function') return null;
+    return {
+      get readyState() { return ctx.isOpen && ctx.isOpen() ? WebSocket.OPEN : WebSocket.CLOSED; },
+      send: (s) => {
+        let obj;
+        try { obj = JSON.parse(s); } catch { return false; }
+        return ctx.send(obj);
+      },
+    };
+  }
+
   constructor(props) {
     super(props);
     this.containerRef = React.createRef();
@@ -89,7 +116,7 @@ class ChatView extends React.Component {
     //
     // ── SubAgent/Teammate 渲染入口 ──
     //   subAgentEntries      : 非 MainAgent 的 Sub/Teammate 消息渲染数据（时序插入到主列表里）
-    this._reqScanCache = { tsToIndex: {}, modelName: null, completedModelName: null, modelNameByReqIdx: [], subAgentEntries: [], processedCount: 0 };
+    this._reqScanCache = { tsToIndex: {}, modelName: null, completedModelName: null, modelNameByReqIdx: [], subAgentEntries: [], processedCount: 0, requestCacheTokenMap: new Map() };
 
     // buildAllItems session 级缓存
     // 每项: { session, msgsLen, subCount, items, tsEntries, lastPendingAskId, lastPendingPlanId }
@@ -146,6 +173,8 @@ class ChatView extends React.Component {
       pendingPermission: null, // { id, toolName, input } — active permission approval request
       permissionQueue: [], // queued permission requests when one is already active
       pendingPlanApproval: null, // { id, input } — active ExitPlanMode approval in SDK mode
+      pendingAsk: null, // { id, questions } — mirrored React state for global modal. _askHookQuestions / _sdkAskId 仍是提交路径权威源（handleAskQuestionSubmit 用于路由 SDK / hook bridge / PTY 三条提交路径）。
+      pendingPtyPlan: null, // { id, prompt } — active plan approval. id 与 ExitPlanMode tool_use id (lastPendingPlanId) 同源，由 componentDidUpdate 从 _currentLastPendingPlanId 派生（cliMode 守卫 + _resolvedPlanIds 短暂窗口守卫）。
       pendingImages: [], // [{ path, source }] — images uploaded/pasted, shown as previews in chat input
       agentTeamEnabled: false,
       ultraplanModalOpen: false,
@@ -155,6 +184,8 @@ class ChatView extends React.Component {
       customUltraplanExperts: [],
       customUltraplanEditOpen: false,
       customUltraplanEditing: null,
+      // ExitPlanMode V2 input.planFilePath 异步读盘缓存：{ [planFilePath]: content }
+      planFileContents: {},
     };
     this._processedToolIds = new Set();
     this._projectDirCache = null; // 缓存项目目录绝对路径
@@ -167,7 +198,9 @@ class ChatView extends React.Component {
     this._scrollFadeTimer = null;
     this._resizing = false;
     this._dragTarget = null; // 'terminal' | 'sidebar'
-    this._inputWs = null;
+    // _inputWs 现在是 getter(挂在原型),不在 constructor 上设字段,避免覆盖 getter
+    this._unsubWsHandler = null;
+    this._unsubWsState = null;
     this._inputRef = React.createRef();
     this._ptyBuffer = '';
     this._ptyDataSeq = 0; // increments on every PTY output event
@@ -181,6 +214,18 @@ class ChatView extends React.Component {
     this._mobileExtraItems = 0;
     this._mobileSliceOffset = 0;
     this._totalItemCount = 0;
+    // PTY plan modal 触发：用 lastPendingPlanId（ExitPlanMode tool_use id）作权威信号源（与 inline 卡片同源）。
+    // _currentLastPendingPlanId 由 buildAllItems 末尾镜像；componentDidUpdate 派生 pendingPtyPlan。
+    // _resolvedPlanIds 守卫用户已操作但 JSONL 还没回写 planApprovalMap 的短暂窗口（防 modal 闪回）。
+    this._currentLastPendingPlanId = null;
+    this._resolvedPlanIds = new Set();
+    this._lastObservedLpid = null;
+    // Plan V2 文件型 plan 的异步内容缓存（input.planFilePath → 文件正文）
+    this._planFileFetches = new Set();
+    this._streamSpinnerUrl = props.isStreaming
+      ? (Math.random() < 0.5 ? orbitingUrl : shimmerUrl)
+      : null;
+    this._unmounted = false;
   }
 
   _setFileExplorerOpen(open) {
@@ -278,8 +323,13 @@ class ChatView extends React.Component {
 
   componentDidMount() {
     this.startRender();
-    if (this.props.cliMode) {
-      this.connectInputWs();
+    // 注册 ws 消息 handler。Provider 本身根据 cliMode/terminalVisible 决定何时建立 ws,
+    // ChatView 不再自己 connect/close;handler 在 ws 重连后会自动继续收到新消息。
+    if (this.context && this.context.addMessageHandler) {
+      this._unsubWsHandler = this.context.addMessageHandler(this._onTerminalWsMessage);
+    }
+    if (this.context && this.context.addStateListener) {
+      this._unsubWsState = this.context.addStateListener(this._onTerminalWsState);
     }
     // 检测项目是否有 git（优先多仓库 API，回退旧 API）
     fetch(apiUrl('/api/git-repos')).then(r => r.ok ? r.json() : Promise.reject()).then(data => {
@@ -289,21 +339,27 @@ class ChatView extends React.Component {
         if (!r.ok) this.setState({ hasGit: false, gitChangesOpen: false });
       }).catch(() => this.setState({ hasGit: false, gitChangesOpen: false }));
     });
-    // 检测 Agent Team 是否启用（UltraPlan 依赖）
-    fetch(apiUrl('/api/claude-settings')).then(r => r.ok ? r.json() : null).then(data => {
-      if (data?.env?.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === '1') {
-        this.setState({ agentTeamEnabled: true });
-      }
-    }).catch(() => {});
+    // Agent Team 启用状态从 props.claudeSettings 派生(由 SettingsContext 集中 fetch);
+    // mount 时若 settings 已 ready 立即同步,否则等 componentDidUpdate 接力。
+    if (this.props.claudeSettings?.env?.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === '1') {
+      this.setState({ agentTeamEnabled: true });
+    }
     if (!useVirtuoso) this._bindStickyScroll();
+    // touch 守卫：用户手指在屏上时（含 momentum 前的握持），不让 RO 触发的 scrollTop 写入打断
+    this._userTouching = false;
+    this._onTouchStart = () => { this._userTouching = true; };
+    this._onTouchEnd = () => { this._userTouching = false; };
+    document.addEventListener('touchstart', this._onTouchStart, { passive: true });
+    document.addEventListener('touchend', this._onTouchEnd, { passive: true });
+    document.addEventListener('touchcancel', this._onTouchEnd, { passive: true });
     // 初始化时吸附到 60cols
     if (this.state.needsInitialSnap && this.props.cliMode && this.props.terminalVisible) {
       this._snapToInitialPosition();
     }
-    // 加载 Agent Team 预置项
+    // 加载 Agent Team 预置项 (props.preferences 已 ready 时立即加载,
+    // 否则 componentDidUpdate 接力。preset 写入由 SettingsContext.updatePreferences
+    // setState 触发 props 变化,无需 window event)
     this._loadPresets();
-    this._onPresetsChanged = () => this._loadPresets();
-    window.addEventListener('ccv-presets-changed', this._onPresetsChanged);
   }
 
   shouldComponentUpdate(nextProps, nextState) {
@@ -326,11 +382,82 @@ class ChatView extends React.Component {
       nextProps.lang !== this.props.lang ||
       nextProps.showThinkingSummaries !== this.props.showThinkingSummaries ||
       nextProps.fileLoading !== this.props.fileLoading ||
+      nextProps.claudeSettings !== this.props.claudeSettings ||
+      nextProps.preferences !== this.props.preferences ||
       nextState !== this.state
     );
   }
 
   componentDidUpdate(prevProps, prevState) {
+    if (prevProps.isStreaming !== this.props.isStreaming) {
+      this._streamSpinnerUrl = this.props.isStreaming
+        ? (Math.random() < 0.5 ? orbitingUrl : shimmerUrl)
+        : null;
+    }
+    // SettingsContext 异步 fetch 完成后,props.claudeSettings / props.preferences 才到达;
+    // 同步派生的 agentTeamEnabled 与 _loadPresets 都需在这里接力。
+    if (prevProps.claudeSettings !== this.props.claudeSettings) {
+      const enabled = this.props.claudeSettings?.env?.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === '1';
+      if (enabled !== this.state.agentTeamEnabled) {
+        this.setState({ agentTeamEnabled: enabled });
+      }
+      this._loadPresets();
+    }
+    if (prevProps.preferences !== this.props.preferences) {
+      this._loadPresets();
+    }
+    // 扫描 messages 中所有 ExitPlanMode tool_use 的 input.planFilePath，按需异步拉取磁盘内容
+    // 仅在 messages 引用变化时遍历（O(N) 低频），fetch 去重 + _unmounted 守卫
+    if (prevProps.messages !== this.props.messages) {
+      const messages = this.props.messages || [];
+      const cache = this.state.planFileContents || {};
+      for (const msg of messages) {
+        if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
+        for (const blk of msg.content) {
+          if (!blk || blk.type !== 'tool_use' || blk.name !== 'ExitPlanMode') continue;
+          const inp = blk.input || {};
+          // 已有内联 plan 不需要读盘（input.plan 是首选）
+          if (typeof inp.plan === 'string' && inp.plan.trim()) continue;
+          const fp = inp.planFilePath;
+          if (typeof fp !== 'string' || !fp) continue;
+          if (cache[fp] !== undefined) continue;
+          if (this._planFileFetches.has(fp)) continue;
+          this._planFileFetches.add(fp);
+          fetch(apiUrl(`/api/plan-file?path=${encodeURIComponent(fp)}`))
+            .then(r => r.ok ? r.json() : null)
+            .then(j => {
+              if (this._unmounted) return;
+              if (j && j.ok && typeof j.content === 'string') {
+                this.setState(s => ({ planFileContents: { ...(s.planFileContents || {}), [fp]: j.content } }));
+              }
+            })
+            .catch(() => { /* 文件不存在/拒绝 → 静默回退到其他源 */ });
+        }
+      }
+    }
+    // 派生 pendingPtyPlan from _currentLastPendingPlanId（与 inline 卡片同源）。
+    // _currentLastPendingPlanId 由 buildAllItems 末尾镜像；只在 cliMode 下生效（红线 2：sdkMode 走 inline-only）。
+    // _resolvedPlanIds 守用户已操作但 JSONL 还没回写 planApprovalMap 的短暂窗口（提交后到 tool_result 落盘之间），
+    // 防 CDU 把 modal 重弹；过期项在 lpid 变化时（即旧 plan 真正 resolve）下面分支自动清出。
+    {
+      const lpid = this._currentLastPendingPlanId || null;
+      const curPtyPlan = this.state.pendingPtyPlan;
+      const skipped = lpid && this._resolvedPlanIds.has(lpid);
+      if (this.props.cliMode && lpid && !skipped) {
+        if (!curPtyPlan || curPtyPlan.id !== lpid) {
+          this.setState({ pendingPtyPlan: { id: lpid, prompt: null } });
+        }
+      } else if (curPtyPlan) {
+        this.setState({ pendingPtyPlan: null });
+      }
+      // lpid 变化才更新 _lastObservedLpid + 清出过期项；不变时 no-op 节省每帧无谓写
+      if (this._lastObservedLpid !== lpid) {
+        if (this._lastObservedLpid) {
+          this._resolvedPlanIds.delete(this._lastObservedLpid);
+        }
+        this._lastObservedLpid = lpid;
+      }
+    }
     // 通知父组件权限审批状态变化（用于移动端全局浮层）
     if (prevState.pendingPermission !== this.state.pendingPermission && this.props.onPendingPermission) {
       if (this.state.pendingPermission) {
@@ -356,6 +483,63 @@ class ChatView extends React.Component {
       } else {
         this.props.onPendingPlanApproval(null);
       }
+    }
+    if (prevState.pendingAsk !== this.state.pendingAsk) {
+      if (this.props.onPendingAsk) {
+        if (this.state.pendingAsk) {
+          this.props.onPendingAsk({
+            ask: this.state.pendingAsk,
+            handlers: { submit: this.handleAskQuestionSubmit },
+          });
+        } else {
+          this.props.onPendingAsk(null);
+        }
+      }
+      // ask transition-to-null 时显式通知 main 清聚合状态。
+      // 正常 resolve 路径 server 已 process.send 过，这里是 no-op；WS 断连 / unmount 路径靠这条兜底。
+      try {
+        if (typeof window !== 'undefined' && window.tabBridge?.notifyAskResolved
+            && this.state.pendingAsk == null && prevState.pendingAsk) {
+          window.tabBridge.notifyAskResolved({
+            id: prevState.pendingAsk.id,
+            tabId: this.props.ownTabId ?? null,
+          });
+        }
+      } catch {}
+    }
+    // PTY plan transitions — bubble up so the global modal can render, AND notify the Electron main
+    // process via tabBridge so it can flashFrame / setBadgeCount / fire OS Notification (parallel to
+    // the server.js -> tab-worker process.send route used for ask).
+    if (prevState.pendingPtyPlan !== this.state.pendingPtyPlan) {
+      if (this.props.onPendingPtyPlan) {
+        if (this.state.pendingPtyPlan) {
+          this.props.onPendingPtyPlan({
+            ptyPlan: this.state.pendingPtyPlan,
+            handlers: {
+              approve: this.handlePromptOptionClick,
+              feedbackSubmit: this.handlePlanFeedbackSubmit,
+            },
+          });
+        } else {
+          this.props.onPendingPtyPlan(null);
+        }
+      }
+      try {
+        if (typeof window !== 'undefined' && window.tabBridge) {
+          if (this.state.pendingPtyPlan) {
+            window.tabBridge.notifyPtyPlanPending?.({
+              id: this.state.pendingPtyPlan.id,
+              payload: { projectName: this.props.projectName || '' },
+              tabId: this.props.ownTabId ?? null,
+            });
+          } else if (prevState.pendingPtyPlan) {
+            window.tabBridge.notifyPtyPlanResolved?.({
+              id: prevState.pendingPtyPlan.id,
+              tabId: this.props.ownTabId ?? null,
+            });
+          }
+        }
+      } catch {}
     }
     // Last Response 出现/消失时，Footer 高度变化会导致 Virtuoso atBottom 误判，需要重新吸底
     if (useVirtuoso && prevState.lastResponseItems !== this.state.lastResponseItems && this.state.stickyBottom) {
@@ -399,7 +583,7 @@ class ChatView extends React.Component {
           this._incToolState = null;
           this._incToolProcessedCount = 0;
           this._incToolSessionIdx = -1;
-          this._reqScanCache = { tsToIndex: {}, modelName: null, completedModelName: null, modelNameByReqIdx: [], subAgentEntries: [], processedCount: 0, subAgentProcessedCount: 0 };
+          this._reqScanCache = { tsToIndex: {}, modelName: null, completedModelName: null, modelNameByReqIdx: [], subAgentEntries: [], processedCount: 0, subAgentProcessedCount: 0, requestCacheTokenMap: new Map() };
           this._sessionItemCache = [];
         }
         this._prevSessions = this.props.mainAgentSessions;
@@ -421,6 +605,7 @@ class ChatView extends React.Component {
       this._reqScanCache.processedCount = 0;
       this._reqScanCache.subAgentEntries = [];
       this._reqScanCache.subAgentProcessedCount = 0;
+      this._reqScanCache.requestCacheTokenMap = new Map();
       this.startRender();
     } else if (prevProps.collapseToolResults !== this.props.collapseToolResults || prevProps.expandThinking !== this.props.expandThinking) {
       const rawItems = this.buildAllItems();
@@ -467,19 +652,31 @@ class ChatView extends React.Component {
         }
       });
     }
-    // cliMode 异步生效后建立 WebSocket 连接
-    if (!prevProps.cliMode && this.props.cliMode) {
-      this.connectInputWs();
-    }
+    // 不再在此建立 ws — Provider 通过 props.open 派生(cliMode || terminalVisible)集中管理
     if (!useVirtuoso) this._rebindStickyEl();
   }
 
   componentWillUnmount() {
     this._unmounted = true;
-    window.removeEventListener('ccv-presets-changed', this._onPresetsChanged);
-    // 清理全局权限通知
+    // 清理全局审批/通知 — 切 session/关 tab 时让 modal 同步消失，main 进程 badge 归零
     if (this.props.onPendingPermission) this.props.onPendingPermission(null);
     if (this.props.onPendingPlanApproval) this.props.onPendingPlanApproval(null);
+    if (this.props.onPendingAsk) this.props.onPendingAsk(null);
+    if (this.props.onPendingPtyPlan) this.props.onPendingPtyPlan(null);
+    try {
+      if (this.state.pendingPtyPlan && typeof window !== 'undefined' && window.tabBridge?.notifyPtyPlanResolved) {
+        window.tabBridge.notifyPtyPlanResolved({
+          id: this.state.pendingPtyPlan.id,
+          tabId: this.props.ownTabId ?? null,
+        });
+      }
+      if (this.state.pendingAsk && typeof window !== 'undefined' && window.tabBridge?.notifyAskResolved) {
+        window.tabBridge.notifyAskResolved({
+          id: this.state.pendingAsk.id,
+          tabId: this.props.ownTabId ?? null,
+        });
+      }
+    } catch {}
     if (this._queueTimer) clearTimeout(this._queueTimer);
     if (this._fadeClearTimer) clearTimeout(this._fadeClearTimer);
     if (this._ptyDebounceTimer) clearTimeout(this._ptyDebounceTimer);
@@ -494,15 +691,24 @@ class ChatView extends React.Component {
     if (this._hookWaitTimer) clearTimeout(this._hookWaitTimer);
     this._pendingHookAnswers = null;
     this._unbindScrollFade();
+    if (this._onTouchStart) {
+      document.removeEventListener('touchstart', this._onTouchStart);
+      document.removeEventListener('touchend', this._onTouchEnd);
+      document.removeEventListener('touchcancel', this._onTouchEnd);
+      this._onTouchStart = this._onTouchEnd = null;
+    }
     if (!useVirtuoso) this._unbindStickyScroll();
+    if (this._virtuosoResizeObserver) {
+      try { this._virtuosoResizeObserver.disconnect(); } catch {}
+      this._virtuosoResizeObserver = null;
+      this._virtuosoBoundEl = null;
+    }
     if (this._smoothFollowRafId) {
       cancelAnimationFrame(this._smoothFollowRafId);
       this._smoothFollowRafId = null;
     }
-    if (this._inputWs) {
-      this._inputWs.close();
-      this._inputWs = null;
-    }
+    if (this._unsubWsHandler) { try { this._unsubWsHandler(); } catch {} this._unsubWsHandler = null; }
+    if (this._unsubWsState) { try { this._unsubWsState(); } catch {} this._unsubWsState = null; }
   }
 
   startRender() {
@@ -594,8 +800,60 @@ class ChatView extends React.Component {
     }
   }
 
+  // 缓存 scrollHeight - clientHeight（贴底缓动的目标 scrollTop）。
+  // step (60fps rAF) + scroll handler 共用此缓存，每帧只读 scrollTop 一次，避免 forced layout。
+  // 失效点：_startSmoothStickyFollow 入口（流式 chunk 抵达，DOM 已增长）/ container ResizeObserver
+  // （window resize / 容器尺寸变化）/ 初次 _rebindStickyEl 绑定。
+  // 流式之外 DOM 不增长（用户滚动不会改 scrollHeight），缓存值期间始终有效。
+  _refreshFollowTarget = (scroller) => {
+    if (!scroller) return;
+    this._followTarget = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+  };
+
+  // 容器尺寸驱动的吸底：只看 .container（或 Virtuoso scroller）尺寸变化，与 props 解耦——
+  // 任何让内容长高的事件（teammate / sub-agent / plan 文件异步到达 / 字体加载完）都会自动跟。
+  // 锁期间不做：startRender 自己会管 scrollToBottom；stickyBottom=false 时不做：尊重用户主动滚走。
+  _followToTargetIfSticky = (scroller) => {
+    if (!scroller) return;
+    if (this._stickyScrollLock) return;
+    if (!this.state.stickyBottom) return;
+    if (this._userTouching) return;
+    if (typeof scroller.scrollTop === 'number') {
+      // 镜像 _startSmoothStickyFollow 的 lock 模式：阻止 RO 触发的强制 scrollTop 写入引起
+      // _onStickyScroll 翻转 stickyBottom，也避免与 Virtuoso 的 atBottomStateChange 防抖打架。
+      this._stickyScrollLock = true;
+      scroller.scrollTop = this._followTarget;
+      requestAnimationFrame(() => { this._stickyScrollLock = false; });
+    }
+  };
+
+  // 共享 RO 回调：尺寸变 → 刷新 _followTarget 缓存 → 必要时拉到底。
+  _onScrollerResize = (el) => {
+    this._refreshFollowTarget(el);
+    this._followToTargetIfSticky(el);
+  };
+
+  // Virtuoso 模式下也对 scroller 接 ResizeObserver。修复:移动端键盘弹起 / 横竖屏切换 /
+  // window resize 后 _followTarget 缓存失准（原本只在 _startSmoothStickyFollow 入口刷一次）。
+  // scrollerRef 会被 Virtuoso 多次回调（mount=el / unmount=null），需对应切换。
+  _bindVirtuosoResizeObserver = (el) => {
+    if (el === this._virtuosoBoundEl) return;
+    if (this._virtuosoResizeObserver) {
+      try { this._virtuosoResizeObserver.disconnect(); } catch {}
+      this._virtuosoResizeObserver = null;
+    }
+    this._virtuosoBoundEl = el;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    try {
+      this._virtuosoResizeObserver = new ResizeObserver(() => this._onScrollerResize(el));
+      this._virtuosoResizeObserver.observe(el);
+      this._refreshFollowTarget(el);
+    } catch {}
+  };
+
   _bindStickyScroll() {
     this._stickyScrollRafId = null;
+    this._followTarget = 0;
     this._onStickyScroll = () => {
       if (this._stickyScrollLock) return;
       if (this._stickyScrollRafId) return;
@@ -603,7 +861,9 @@ class ChatView extends React.Component {
         this._stickyScrollRafId = null;
         const el = this.containerRef.current;
         if (!el) return;
-        const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+        // gap 用缓存的 _followTarget 算 —— 用户滚动不改 scrollHeight，缓存值有效。
+        // 仅当容器尺寸变化（ResizeObserver）或新 chunk 到达（_startSmoothStickyFollow）才需刷新。
+        const gap = this._followTarget - el.scrollTop;
         if (this.state.stickyBottom && gap > 50) {
           this.setState({ stickyBottom: false });
         } else if (!this.state.stickyBottom && gap <= 10) {
@@ -619,9 +879,23 @@ class ChatView extends React.Component {
     if (el === this._stickyBoundEl) return;
     if (this._stickyBoundEl) {
       this._stickyBoundEl.removeEventListener('scroll', this._onStickyScroll);
+      if (this._stickyResizeObserver) {
+        try { this._stickyResizeObserver.disconnect(); } catch {}
+        this._stickyResizeObserver = null;
+      }
     }
     this._stickyBoundEl = el;
-    if (el) el.addEventListener('scroll', this._onStickyScroll, { passive: true });
+    if (el) {
+      el.addEventListener('scroll', this._onStickyScroll, { passive: true });
+      // 初次刷新 + 容器尺寸变化时重算 target（clientHeight 随窗口缩放变化）
+      this._refreshFollowTarget(el);
+      if (typeof ResizeObserver !== 'undefined') {
+        try {
+          this._stickyResizeObserver = new ResizeObserver(() => this._onScrollerResize(el));
+          this._stickyResizeObserver.observe(el);
+        } catch {}
+      }
+    }
   }
 
   _unbindStickyScroll() {
@@ -632,6 +906,10 @@ class ChatView extends React.Component {
     if (this._stickyScrollRafId) {
       cancelAnimationFrame(this._stickyScrollRafId);
       this._stickyScrollRafId = null;
+    }
+    if (this._stickyResizeObserver) {
+      try { this._stickyResizeObserver.disconnect(); } catch {}
+      this._stickyResizeObserver = null;
     }
   }
 
@@ -648,6 +926,10 @@ class ChatView extends React.Component {
 
   // rAF 缓动吸底：流式 chunk 抵达后用 easeOut 平滑追底，避免每帧 scrollTop=scrollHeight
   // 带来的硬跳与换行抖动。gap<=0.5 停止；新 chunk 到达会续约（cancel 旧 rAF 重启循环）。
+  //
+  // 性能：target = scrollHeight - clientHeight 不在 step 内每帧读（forced layout），
+  // 改为入口（DOM 已 layout 完）刷新一次缓存到 this._followTarget；step 仅读 scrollTop。
+  // 续约时（流式新 chunk 抵达）会重新调本函数，target 自动更新。
   _startSmoothStickyFollow = (useVirtuoso) => {
     const scroller = useVirtuoso ? this._virtuosoScrollerEl : this.containerRef.current;
     if (!scroller) return;
@@ -657,7 +939,7 @@ class ChatView extends React.Component {
       this._smoothFollowRafId = null;
       if (this._unmounted) { this._stickyScrollLock = false; return; }
       if (!this.state.stickyBottom) { this._stickyScrollLock = false; return; }
-      const target = scroller.scrollHeight - scroller.clientHeight;
+      const target = this._followTarget;
       const current = scroller.scrollTop;
       const gap = target - current;
       if (gap <= 0.5) {
@@ -670,9 +952,12 @@ class ChatView extends React.Component {
       scroller.scrollTop = current + delta;
       this._smoothFollowRafId = requestAnimationFrame(step);
     };
-    // 先让新内容 layout 完成再测量（原实现用双 rAF 正是为此）
+    // 先让新内容 layout 完成再测量（原实现用双 rAF 正是为此），随后刷新 target 缓存。
     this._smoothFollowRafId = requestAnimationFrame(() => {
-      this._smoothFollowRafId = requestAnimationFrame(step);
+      this._smoothFollowRafId = requestAnimationFrame(() => {
+        this._refreshFollowTarget(scroller);
+        step();
+      });
     });
   };
 
@@ -767,8 +1052,61 @@ class ChatView extends React.Component {
     }
   }
 
-  renderSessionMessages(messages, keyPrefix, resolveModelInfo, tsToIndex, startIdx = 0) {
+  // 派生 per-keyPrefix 的 _mergedAskAnswerMap：cached.askAnswerMap 是原地 mutate 的，引用永远不变；
+  // 用 _askDirty + localAsk 引用 + 上一轮 cache 引用做三信号失效判断。
+  // localAsk（用户乐观更新缓存）每次提交都换新引用，要并入失效信号，否则用户答题后到 server ack 之间 UI 会闪回 pending。
+  // 永远 spread 创建新引用，让下游 ChatMessage SCU 检测到 askAnswerMap 变化（修老 bug：local 空时复用 cached 引用导致 SCU 不命中）。
+  _getMergedAskAnswerMap(messages, keyPrefix, localAsk) {
+    const cached = getToolResultCache(messages);
+    const askMap = cached?.askAnswerMap || EMPTY_MAP;
+    const askDirty = cached?._askDirty || 0;
+    if (!this._mergedAskAnswerMapByKey) this._mergedAskAnswerMapByKey = {};
+    if (!this._prevAskCacheByKey) this._prevAskCacheByKey = {};
+    if (!this._prevAskDirtyByKey) this._prevAskDirtyByKey = {};
+    if (!this._prevAskLocalByKey) this._prevAskLocalByKey = {};
+    if (this._prevAskCacheByKey[keyPrefix] !== askMap
+        || this._prevAskDirtyByKey[keyPrefix] !== askDirty
+        || this._prevAskLocalByKey[keyPrefix] !== localAsk) {
+      const hasLocal = localAsk && Object.keys(localAsk).length > 0;
+      this._mergedAskAnswerMapByKey[keyPrefix] = hasLocal
+        ? { ...askMap, ...localAsk }
+        : { ...askMap };
+      this._prevAskCacheByKey[keyPrefix] = askMap;
+      this._prevAskDirtyByKey[keyPrefix] = askDirty;
+      this._prevAskLocalByKey[keyPrefix] = localAsk;
+    }
+    return this._mergedAskAnswerMapByKey[keyPrefix];
+  }
+
+  // 派生 per-session 的 _mergedPlanApprovalMap：cached.planApprovalMap 是原地 mutate 的，引用永远不变；
+  // 用 _planDirty + 上一轮 cache 引用做失效判断，每次内容变化时创建一个新引用 {} 覆盖。
+  // keyPrefix 区分 main session（s${si}）vs sub-agent（tm${si}），避免互相覆盖。
+  // FULL HIT 路径（_sessionItemCache 命中）和内部 renderSessionMessages 都调用此方法，引用保持一致。
+  _getMergedPlanApprovalMap(messages, keyPrefix) {
+    const cached = getToolResultCache(messages);
+    if (!cached) return EMPTY_MAP;
+    const planDirty = cached._planDirty || 0;
+    if (!this._mergedPlanApprovalMapByKey) this._mergedPlanApprovalMapByKey = {};
+    if (!this._prevPlanCacheByKey) this._prevPlanCacheByKey = {};
+    if (!this._prevPlanDirtyByKey) this._prevPlanDirtyByKey = {};
+    if (this._prevPlanCacheByKey[keyPrefix] !== cached.planApprovalMap
+        || this._prevPlanDirtyByKey[keyPrefix] !== planDirty) {
+      this._mergedPlanApprovalMapByKey[keyPrefix] = { ...cached.planApprovalMap };
+      this._prevPlanCacheByKey[keyPrefix] = cached.planApprovalMap;
+      this._prevPlanDirtyByKey[keyPrefix] = planDirty;
+    }
+    return this._mergedPlanApprovalMapByKey[keyPrefix];
+  }
+
+  // 浏览本地历史日志时为 true；CLI / SDK 实时会话为 false。
+  // 用作 ChatMessage 的 isHistoryLog prop，控制时间戳 compact 显示。
+  _getIsHistoryLog() {
+    return !this.props.cliMode && !this.props.sdkMode;
+  }
+
+  renderSessionMessages(messages, keyPrefix, resolveModelInfo, tsToIndex, requestCacheTokenMap, startIdx = 0) {
     const { userProfile, collapseToolResults, expandThinking, showFullToolContent, showThinkingSummaries, onViewRequest } = this.props;
+    const isHistoryLog = this._getIsHistoryLog();
     // 增量 / WeakMap 缓存
     let cached = getToolResultCache(messages);
     if (cached && messages.length > this._incToolProcessedCount) {
@@ -790,15 +1128,9 @@ class ChatView extends React.Component {
       setToolResultCache(messages, cached);
     }
     const { toolUseMap, toolResultMap, readContentMap, editSnapshotMap, askAnswerMap, latestPlanContent } = cached;
-    // planApprovalMap 是同一对象引用被原地修改，需要在 _planDirty 变化时创建新引用
-    // 以触发 ChatMessage shouldComponentUpdate 检测到变化
-    const _planDirty = cached._planDirty || 0;
-    if (this._prevPlanCache !== cached.planApprovalMap || this._prevPlanDirty !== _planDirty) {
-      this._mergedPlanApprovalMap = { ...cached.planApprovalMap };
-      this._prevPlanCache = cached.planApprovalMap;
-      this._prevPlanDirty = _planDirty;
-    }
-    const planApprovalMap = this._mergedPlanApprovalMap || cached.planApprovalMap;
+    // planApprovalMap 派生统一走 _getMergedPlanApprovalMap（per keyPrefix），保证 FULL HIT 路径与 cache miss 路径
+    // 拿到同一引用，prop diff 才能正确触发 ExitPlanMode 卡片重渲。
+    const planApprovalMap = this._getMergedPlanApprovalMap(messages, keyPrefix);
 
     const activePlanPrompt = this.props.cliMode
       ? this.state.ptyPromptHistory.slice().reverse().find(p => isPlanApprovalPrompt(p) && p.status === 'active') || null
@@ -813,34 +1145,57 @@ class ChatView extends React.Component {
     let lastPendingAskId = null;
     // 收集历史中所有 AskUserQuestion block ID，用于 Last Response 去重
     const historyAskIds = new Set();
-    // 合并 localAskAnswers 到历史 askAnswerMap，使提交后立即显示已回答
-    // 缓存引用：只在 _localAsk 或 askAnswerMap 变化时重建，避免每次创建新对象导致 shouldComponentUpdate 级联触发
+    // 合并 localAskAnswers 到历史 askAnswerMap，使提交后立即显示已回答。
+    // 派生统一走 _getMergedAskAnswerMap（per keyPrefix），保证 FULL HIT 路径与 cache miss 路径
+    // 拿到同一引用，prop diff 才能正确触发 AskUserQuestion 卡片重渲。
     const _localAsk = this.state.localAskAnswers || {};
-    const _askDirty = cached?._askDirty || 0;
-    if (this._prevAskCache !== askAnswerMap || this._prevLocalAsk !== _localAsk || this._prevAskDirty !== _askDirty) {
-      this._mergedAskAnswerMap = Object.keys(_localAsk).length > 0
-        ? { ...askAnswerMap, ..._localAsk }
-        : askAnswerMap;
-      this._prevAskCache = askAnswerMap;
-      this._prevLocalAsk = _localAsk;
-      this._prevAskDirty = _askDirty;
-    }
-    const mergedAskAnswerMap = this._mergedAskAnswerMap;
-    for (const msg of messages) {
+    const mergedAskAnswerMap = this._getMergedAskAnswerMap(messages, keyPrefix, _localAsk);
+    // 记录"持有 lastPendingAskId/PlanId 的 message 索引"——streaming 期间同一 toolId 可能出现在
+    // 多条 assistant message（增量 push 而不是 mutate），若每条 message 都拿到 msgLastAskId=X，
+    // 会让多个 ChatMessage 都进 isInteractive=true 路径，把多份 AskQuestionForm portal 到 modal askSlot。
+    // 用 owner index 锁定只有一条 message 拿到 lastPendingAskId。
+    let lastPendingAskOwnerIdx = -1;
+    let lastPendingPlanOwnerIdx = -1;
+    // 先扫历史 askIds(全量,用于 Last Response 去重),不参与 lastPending* 派生。
+    for (let _mi = 0; _mi < messages.length; _mi++) {
+      const msg = messages[_mi];
       if (msg.role === 'assistant' && Array.isArray(msg.content)) {
         for (const block of msg.content) {
-          if (block.type === 'tool_use' && block.name === 'ExitPlanMode') {
-            const approval = planApprovalMap[block.id];
-            if (!approval || approval.status === 'pending') {
-              lastPendingPlanId = block.id;
-            }
-          }
           if (block.type === 'tool_use' && block.name === 'AskUserQuestion') {
             historyAskIds.add(block.id);
-            const answers = mergedAskAnswerMap[block.id];
-            if (!answers || Object.keys(answers).length === 0) {
-              lastPendingAskId = block.id;
-            }
+          }
+        }
+      }
+    }
+    // lastPendingPlanId / lastPendingAskId:**只考虑"最后一条 assistant message"内的工具**。
+    // 原因:ExitPlanMode V2 / plan-mode 工具不会有常规 tool_result 文本(后端用 system 注入接管),
+    //   planApprovalMap[id] 永远 undefined,旧实现把每一个这样的 plan 都标 pending → 历史里任何
+    //   旧 plan 都会无限弹 modal,刷新刷新都跳出来。
+    // 真理:plan/ask 一旦被处理(approved/rejected/answered),Claude 才能继续 turn。所以**只要后面
+    //   还有 assistant message,前面那条 plan/ask 一定已被处理**,不应再视为 pending。
+    let lastAssistantIdx = -1;
+    for (let _mi = messages.length - 1; _mi >= 0; _mi--) {
+      const m = messages[_mi];
+      if (m && m.role === 'assistant' && Array.isArray(m.content) && m.content.length > 0) {
+        lastAssistantIdx = _mi;
+        break;
+      }
+    }
+    if (lastAssistantIdx >= 0) {
+      const lastMsg = messages[lastAssistantIdx];
+      for (const block of lastMsg.content) {
+        if (block.type === 'tool_use' && block.name === 'ExitPlanMode') {
+          const approval = planApprovalMap[block.id];
+          if (!approval || approval.status === 'pending') {
+            lastPendingPlanId = block.id;
+            lastPendingPlanOwnerIdx = lastAssistantIdx;
+          }
+        }
+        if (block.type === 'tool_use' && block.name === 'AskUserQuestion') {
+          const answers = mergedAskAnswerMap[block.id];
+          if (!answers || Object.keys(answers).length === 0) {
+            lastPendingAskId = block.id;
+            lastPendingAskOwnerIdx = lastAssistantIdx;
           }
         }
       }
@@ -853,7 +1208,11 @@ class ChatView extends React.Component {
       const content = msg.content;
       const ts = msg._timestamp || null;
       const reqIdx = ts ? tsToIndex[ts] : undefined;
-      const viewReqProps = reqIdx != null && onViewRequest ? { requestIndex: reqIdx, onViewRequest } : EMPTY_OBJ;
+      // cacheTotalTokens 仅传给 assistant 渲染处，避免 user 消息也接到该 prop 触发 SCU streaming 期间的虚假重渲。
+      const cacheTotalTokens = reqIdx != null
+        ? (requestCacheTokenMap?.get(reqIdx) ?? 0)
+        : null;
+      const hasViewRequest = reqIdx != null && onViewRequest;
       const modelInfo = resolveModelInfo(ts, msg.role);
 
       if (msg.role === 'user') {
@@ -868,7 +1227,7 @@ class ChatView extends React.Component {
             // 渲染 slash command 作为独立用户输入
             for (let ci = 0; ci < commands.length; ci++) {
               renderedMessages.push(
-                <ChatMessage key={`${keyPrefix}-cmd-${mi}-${ci}`} role="user" text={commands[ci]} timestamp={ts} userProfile={userProfile} modelInfo={modelInfo} {...viewReqProps} />
+                <ChatMessage key={`${keyPrefix}-cmd-${mi}-${ci}`} role="user" text={commands[ci]} timestamp={ts} userProfile={userProfile} modelInfo={modelInfo} requestIndex={hasViewRequest ? reqIdx : undefined} onViewRequest={hasViewRequest ? onViewRequest : undefined} isHistoryLog={isHistoryLog} />
               );
             }
             // 渲染 skill 加载块
@@ -876,14 +1235,14 @@ class ChatView extends React.Component {
               const nameMatch = sb.text.match(/^#\s+(.+)$/m);
               const skillName = nameMatch ? nameMatch[1] : 'Skill';
               renderedMessages.push(
-                <ChatMessage key={`${keyPrefix}-skill-${mi}`} role="skill-loaded" text={sb.text} skillName={skillName} timestamp={ts} {...viewReqProps} />
+                <ChatMessage key={`${keyPrefix}-skill-${mi}`} role="skill-loaded" text={sb.text} skillName={skillName} timestamp={ts} requestIndex={hasViewRequest ? reqIdx : undefined} onViewRequest={hasViewRequest ? onViewRequest : undefined} isHistoryLog={isHistoryLog} />
               );
             }
             // 渲染普通用户文本块
             for (let ti = 0; ti < textBlocks.length; ti++) {
               const isPlan = /Implement the following plan:/i.test(textBlocks[ti].text || '');
               renderedMessages.push(
-                <ChatMessage key={`${keyPrefix}-user-${mi}-${ti}`} role={isPlan ? 'plan-prompt' : 'user'} text={textBlocks[ti].text} timestamp={ts} userProfile={userProfile} modelInfo={modelInfo} {...viewReqProps} />
+                <ChatMessage key={`${keyPrefix}-user-${mi}-${ti}`} role={isPlan ? 'plan-prompt' : 'user'} text={textBlocks[ti].text} timestamp={ts} userProfile={userProfile} modelInfo={modelInfo} requestIndex={hasViewRequest ? reqIdx : undefined} onViewRequest={hasViewRequest ? onViewRequest : undefined} isHistoryLog={isHistoryLog} />
               );
             }
             // 渲染 teammate-message 块
@@ -898,7 +1257,9 @@ class ChatView extends React.Component {
                   toolName={tm.status || null}
                   timestamp={ts}
                   modelInfo={modelInfo}
-                  {...viewReqProps}
+                  requestIndex={hasViewRequest ? reqIdx : undefined}
+                  onViewRequest={hasViewRequest ? onViewRequest : undefined}
+                  isHistoryLog={isHistoryLog}
                 />
               );
             }
@@ -912,7 +1273,9 @@ class ChatView extends React.Component {
                   taskNotification={tn}
                   timestamp={ts}
                   modelInfo={modelInfo}
-                  {...viewReqProps}
+                  requestIndex={hasViewRequest ? reqIdx : undefined}
+                  onViewRequest={hasViewRequest ? onViewRequest : undefined}
+                  isHistoryLog={isHistoryLog}
                 />
               );
             }
@@ -929,21 +1292,24 @@ class ChatView extends React.Component {
                   taskNotification={strTnBlocks[tni]}
                   timestamp={ts}
                   modelInfo={modelInfo}
-                  {...viewReqProps}
+                  requestIndex={hasViewRequest ? reqIdx : undefined}
+                  onViewRequest={hasViewRequest ? onViewRequest : undefined}
+                  isHistoryLog={isHistoryLog}
                 />
               );
             }
           } else if (!isSystemText(content)) {
             const isPlan = /Implement the following plan:/i.test(content);
             renderedMessages.push(
-              <ChatMessage key={`${keyPrefix}-user-${mi}`} role={isPlan ? 'plan-prompt' : 'user'} text={content} timestamp={ts} userProfile={userProfile} modelInfo={modelInfo} {...viewReqProps} />
+              <ChatMessage key={`${keyPrefix}-user-${mi}`} role={isPlan ? 'plan-prompt' : 'user'} text={content} timestamp={ts} userProfile={userProfile} modelInfo={modelInfo} requestIndex={hasViewRequest ? reqIdx : undefined} onViewRequest={hasViewRequest ? onViewRequest : undefined} isHistoryLog={isHistoryLog} />
             );
           }
         }
       } else if (msg.role === 'assistant') {
-        // 定向传递 lastPendingAskId/PlanId：只传给包含匹配 block 的消息，避免全量 re-render
-        const msgLastAskId = lastPendingAskId && Array.isArray(content) && content.some(b => b.type === 'tool_use' && b.name === 'AskUserQuestion' && b.id === lastPendingAskId) ? lastPendingAskId : null;
-        const msgLastPlanId = lastPendingPlanId && Array.isArray(content) && content.some(b => b.type === 'tool_use' && b.name === 'ExitPlanMode' && b.id === lastPendingPlanId) ? lastPendingPlanId : null;
+        // 定向传递 lastPendingAskId/PlanId：只传给"owner message"（即 streaming 中最新一份），
+        // 避免同 toolId 出现在多条 message 时让多个 ChatMessage 都进 isInteractive 路径并双重 portal
+        const msgLastAskId = (mi === lastPendingAskOwnerIdx) ? lastPendingAskId : null;
+        const msgLastPlanId = (mi === lastPendingPlanOwnerIdx) ? lastPendingPlanId : null;
         if (Array.isArray(content)) {
           // 过滤掉系统文本块（例如 SUGGESTION MODE）
           const filteredContent = content.filter(block =>
@@ -952,21 +1318,25 @@ class ChatView extends React.Component {
           // 只在有非系统内容时才渲染
           if (filteredContent.length > 0) {
             renderedMessages.push(
-              <ChatMessage key={`${keyPrefix}-asst-${mi}`} role="assistant" content={filteredContent} toolResultMap={toolResultMap} readContentMap={readContentMap} editSnapshotMap={editSnapshotMap} askAnswerMap={mergedAskAnswerMap} planApprovalMap={planApprovalMap} latestPlanContent={latestPlanContent} timestamp={ts} modelInfo={modelInfo} collapseToolResults={collapseToolResults} expandThinking={expandThinking} showFullToolContent={showFullToolContent} showThinkingSummaries={showThinkingSummaries} ptyPrompt={this.state.ptyPrompt} activePlanPrompt={activePlanPrompt} activeDangerousPrompt={activeDangerousPrompt} lastPendingPlanId={msgLastPlanId} lastPendingAskId={msgLastAskId} onPlanApprovalClick={this.handlePromptOptionClick} onPlanFeedbackSubmit={this.handlePlanFeedbackSubmit} onDangerousApprovalClick={this.handlePromptOptionClick} onAskQuestionSubmit={this.handleAskQuestionSubmit} cliMode={this.props.cliMode} onOpenFile={this.handleOpenToolFilePath} {...viewReqProps} />
+              <ChatMessage key={`${keyPrefix}-asst-${mi}`} role="assistant" content={filteredContent} toolResultMap={toolResultMap} readContentMap={readContentMap} editSnapshotMap={editSnapshotMap} askAnswerMap={mergedAskAnswerMap} planApprovalMap={planApprovalMap} latestPlanContent={latestPlanContent} planFileContents={this.state.planFileContents} timestamp={ts} modelInfo={modelInfo} collapseToolResults={collapseToolResults} expandThinking={expandThinking} showFullToolContent={showFullToolContent} showThinkingSummaries={showThinkingSummaries} ptyPrompt={this.state.ptyPrompt} activePlanPrompt={activePlanPrompt} activePtyPlanId={this.state.pendingPtyPlan?.id ?? null} activeDangerousPrompt={activeDangerousPrompt} lastPendingPlanId={msgLastPlanId} lastPendingAskId={msgLastAskId} onPlanApprovalClick={this.handlePromptOptionClick} onPlanFeedbackSubmit={this.handlePlanFeedbackSubmit} onDangerousApprovalClick={this.handlePromptOptionClick} onAskQuestionSubmit={this.handleAskQuestionSubmit} cliMode={this.props.cliMode} onOpenFile={this.handleOpenToolFilePath} cacheTotalTokens={cacheTotalTokens} requestIndex={hasViewRequest ? reqIdx : undefined} onViewRequest={hasViewRequest ? onViewRequest : undefined} isHistoryLog={isHistoryLog} />
             );
           }
         } else if (typeof content === 'string') {
           // 过滤字符串类型的系统文本
           if (!isSystemText(content)) {
             renderedMessages.push(
-              <ChatMessage key={`${keyPrefix}-asst-${mi}`} role="assistant" content={[{ type: 'text', text: content }]} toolResultMap={toolResultMap} readContentMap={readContentMap} editSnapshotMap={editSnapshotMap} askAnswerMap={mergedAskAnswerMap} planApprovalMap={planApprovalMap} latestPlanContent={latestPlanContent} timestamp={ts} modelInfo={modelInfo} collapseToolResults={collapseToolResults} expandThinking={expandThinking} showFullToolContent={showFullToolContent} showThinkingSummaries={showThinkingSummaries} ptyPrompt={this.state.ptyPrompt} activePlanPrompt={activePlanPrompt} activeDangerousPrompt={activeDangerousPrompt} lastPendingPlanId={msgLastPlanId} lastPendingAskId={msgLastAskId} onPlanApprovalClick={this.handlePromptOptionClick} onPlanFeedbackSubmit={this.handlePlanFeedbackSubmit} onDangerousApprovalClick={this.handlePromptOptionClick} onAskQuestionSubmit={this.handleAskQuestionSubmit} cliMode={this.props.cliMode} onOpenFile={this.handleOpenToolFilePath} {...viewReqProps} />
+              <ChatMessage key={`${keyPrefix}-asst-${mi}`} role="assistant" content={[{ type: 'text', text: content }]} toolResultMap={toolResultMap} readContentMap={readContentMap} editSnapshotMap={editSnapshotMap} askAnswerMap={mergedAskAnswerMap} planApprovalMap={planApprovalMap} latestPlanContent={latestPlanContent} planFileContents={this.state.planFileContents} timestamp={ts} modelInfo={modelInfo} collapseToolResults={collapseToolResults} expandThinking={expandThinking} showFullToolContent={showFullToolContent} showThinkingSummaries={showThinkingSummaries} ptyPrompt={this.state.ptyPrompt} activePlanPrompt={activePlanPrompt} activePtyPlanId={this.state.pendingPtyPlan?.id ?? null} activeDangerousPrompt={activeDangerousPrompt} lastPendingPlanId={msgLastPlanId} lastPendingAskId={msgLastAskId} onPlanApprovalClick={this.handlePromptOptionClick} onPlanFeedbackSubmit={this.handlePlanFeedbackSubmit} onDangerousApprovalClick={this.handlePromptOptionClick} onAskQuestionSubmit={this.handleAskQuestionSubmit} cliMode={this.props.cliMode} onOpenFile={this.handleOpenToolFilePath} cacheTotalTokens={cacheTotalTokens} requestIndex={hasViewRequest ? reqIdx : undefined} onViewRequest={hasViewRequest ? onViewRequest : undefined} isHistoryLog={isHistoryLog} />
             );
           }
         }
       }
     }
 
-    return { items: renderedMessages, lastPendingAskId, lastPendingPlanId };
+    // ownerInRange：owner-idx 是否落在本轮渲染的范围（>= startIdx）；
+    // 增量路径上层据此判断旧 sc.items 里 stale 的 lastPendingAskId/PlanId 是否需要清空。
+    const askOwnerInRange = lastPendingAskOwnerIdx >= startIdx;
+    const planOwnerInRange = lastPendingPlanOwnerIdx >= startIdx;
+    return { items: renderedMessages, lastPendingAskId, lastPendingPlanId, askOwnerInRange, planOwnerInRange };
   }
 
   /**
@@ -975,6 +1345,7 @@ class ChatView extends React.Component {
    */
   _buildTeammateFallbackItems() {
     const { requests, collapseToolResults, expandThinking, showFullToolContent, onViewRequest } = this.props;
+    const isHistoryLog = this._getIsHistoryLog();
     if (!requests || requests.length === 0) return [];
 
     // Teammate 名称解析
@@ -1006,7 +1377,7 @@ class ChatView extends React.Component {
           <Text className={styles.sessionDividerText}>{name}</Text>
         </Divider>
       );
-      const { items: msgs } = this.renderSessionMessages(session.messages, `tm${si}`, nullModelInfoResolver, {});
+      const { items: msgs } = this.renderSessionMessages(session.messages, `tm${si}`, nullModelInfoResolver, {}, this._reqScanCache.requestCacheTokenMap);
       allItems.push(...msgs);
 
       // 渲染 response content（如果有）
@@ -1016,7 +1387,7 @@ class ChatView extends React.Component {
           const lastItems = respContent
             .filter(b => b.type === 'text' && b.text)
             .map((b, bi) => (
-              <ChatMessage key={`tm-resp-${si}-${bi}`} role="assistant" content={[b]} collapseToolResults={collapseToolResults} expandThinking={expandThinking} showFullToolContent={showFullToolContent} onViewRequest={onViewRequest} onOpenFile={this.handleOpenToolFilePath} />
+              <ChatMessage key={`tm-resp-${si}-${bi}`} role="assistant" content={[b]} collapseToolResults={collapseToolResults} expandThinking={expandThinking} showFullToolContent={showFullToolContent} onViewRequest={onViewRequest} onOpenFile={this.handleOpenToolFilePath} isHistoryLog={isHistoryLog} />
             ));
           if (lastItems.length > 0) {
             this._lastResponseItems = lastItems;
@@ -1031,11 +1402,13 @@ class ChatView extends React.Component {
 
   buildAllItems() {
     const { mainAgentSessions, requests, collapseToolResults, expandThinking, showFullToolContent, onViewRequest } = this.props;
+    const isHistoryLog = this._getIsHistoryLog();
     this._lastResponseItems = null;
     this._lastResponseAskQuestions = null;
     if (!mainAgentSessions || mainAgentSessions.length === 0) {
       // Fallback: 无 MainAgent 时，从 requests 提取 teammate entries 渲染其对话历史，
       // 避免 JSONL 截断只剩 teammate 时界面完全空白。
+      this._currentLastPendingPlanId = null;
       return this._buildTeammateFallbackItems();
     }
 
@@ -1049,6 +1422,7 @@ class ChatView extends React.Component {
         cache.modelName = null;
         cache.completedModelName = null;
         cache.modelNameByReqIdx = [];
+        cache.requestCacheTokenMap = new Map();
       }
       // carry-over 初值：从上轮末态继承，保证流式追加时非 MainAgent 或无 body.model 的 req 也能拿到"最近活跃模型"
       let lastModelName = cache.modelName;
@@ -1067,6 +1441,17 @@ class ChatView extends React.Component {
           if (req.response) cache.completedModelName = lastModelName;
         }
         cache.modelNameByReqIdx[i] = lastModelName;
+        // 上下文 token 总量（cache_read + cache_creation），用于在 assistant
+        // 消息时间戳旁显示。usage 仅在 response 到达后存在；流式中保持 0。
+        const usage = req?.response?.body?.usage;
+        if (usage) {
+          const total = (usage.cache_read_input_tokens || 0)
+                      + (usage.cache_creation_input_tokens || 0);
+          cache.requestCacheTokenMap.set(i, total);
+        } else {
+          // streaming 中或失败的请求：删除可能存在的旧值，确保 0K 显示而非过期数字
+          cache.requestCacheTokenMap.delete(i);
+        }
       }
       cache.processedCount = requests.length;
 
@@ -1108,6 +1493,7 @@ class ChatView extends React.Component {
       cache.subAgentProcessedCount = requests.length;
     }
     const tsToIndex = cache.tsToIndex;
+    const requestCacheTokenMap = cache.requestCacheTokenMap;
     // globalModelInfo 仅给 line ~1342 的 lastResponse 路径（最新一轮 response 渲染）使用，
     // 1v1 per-message 解析不再回落到此值 —— 避免历史 logo 被最新 entry 模型污染。
     const globalModelInfo = getModelInfo(cache.modelName);
@@ -1132,6 +1518,22 @@ class ChatView extends React.Component {
     if (this._sessionItemCache.length > mainAgentSessions.length) {
       this._sessionItemCache.length = mainAgentSessions.length;
     }
+    // 清理 _getMergedXxxMap 的 byKey 字典中已不存在的 main session 条目（s${si}），
+    // 否则用户切换/删除 session 后旧 keyPrefix 永不释放（每条 entry 占 ~8 引用，重 session 用户累积可见内存）。
+    // tm${si} (sub-agent) 的清理由各自 render 周期短，不在此处处理。
+    const _validS = mainAgentSessions.length;
+    const _byKeyDicts = [
+      this._mergedPlanApprovalMapByKey, this._prevPlanCacheByKey, this._prevPlanDirtyByKey,
+      this._mergedAskAnswerMapByKey, this._prevAskCacheByKey, this._prevAskDirtyByKey, this._prevAskLocalByKey,
+    ];
+    for (const dict of _byKeyDicts) {
+      if (!dict) continue;
+      for (const k of Object.keys(dict)) {
+        if (!k.startsWith('s')) continue;
+        const idx = parseInt(k.slice(1), 10);
+        if (Number.isFinite(idx) && idx >= _validS) delete dict[k];
+      }
+    }
 
     // Server-side pagination: "load earlier conversations" button
     if (this.props.hasMoreHistory || this.props.loadingMore) {
@@ -1152,6 +1554,9 @@ class ChatView extends React.Component {
     }
 
     let subIdx = 0;
+    // 跨 session + LR 跟踪当前活跃的 ExitPlanMode tool_use id（最末非 null 即为当前 pending）。
+    // 写入 this._currentLastPendingPlanId 供 componentDidUpdate 派生 pendingPtyPlan 用。
+    let buildLpid = null;
 
     mainAgentSessions.forEach((session, si) => {
       if (si > 0) {
@@ -1186,21 +1591,102 @@ class ChatView extends React.Component {
       // === session 级缓存判断 ===
       const sc = this._sessionItemCache[si];
       let msgs, lastPendingAskId, lastPendingPlanId;
+      // hoist 当前 session 的 planApprovalMap，供下方增量 cache 合并守卫 + LR 路径 lpid 守卫使用。
+      // renderSessionMessages 内 L906 也基于 cached 派生 planApprovalMap，但其作用域只在 renderSessionMessages，
+      // 这里的引用必须独立从 toolResultCache 取，与 LR 路径 L1508 的 _cachedLR.planApprovalMap 同源。
+      const sessionPlanApprovalMap = (getToolResultCache(session.messages) || {}).planApprovalMap || {};
+      // FULL HIT / INCREMENTAL 路径下用本派生 map 做 prop diff，与 renderSessionMessages 内 L955 同源（同一 keyPrefix）。
+      const mergedPlanApprovalMap = this._getMergedPlanApprovalMap(session.messages, `s${si}`);
+      const _localAskForSession = this.state.localAskAnswers || {};
+      const mergedAskAnswerMap = this._getMergedAskAnswerMap(session.messages, `s${si}`, _localAskForSession);
+
+      // === 预判：Last Response 是否将持有 ask / plan 交互权 ===
+      // 防 messages-side ChatMessage 与 LR <ChatMessage key="resp-asst"> 同时进入 isInteractive 路径，
+      // 双 portal 进 ApprovalModal askSlot / ptyPlanSlot（multi-agent-room 等场景的双卡空白 bug）。
+      // LR 只在最后一个 session 出现（与 L1479 同源）。
+      let lrWillOwnAsk = false;
+      let lrWillOwnPlan = false;
+      let lrHistoryAskIds = null;
+      let lrHistoryPlanIds = null;
+      if (si === mainAgentSessions.length - 1 && session.response?.body?.content) {
+        const _resp = session.response.body.content;
+        if (Array.isArray(_resp)) {
+          const _hasInteractiveBlock = _resp.some(b =>
+            b.type === 'tool_use' && (b.name === 'AskUserQuestion' || b.name === 'ExitPlanMode')
+          );
+          const _hasSuggestionMode = _resp.some(b =>
+            b.type === 'text' && typeof b.text === 'string' && b.text.includes('[SUGGESTION MODE:')
+          );
+          const _shouldHide = _hasSuggestionMode && !_hasInteractiveBlock;
+          if (!_shouldHide && _hasInteractiveBlock) {
+            lrHistoryAskIds = new Set();
+            lrHistoryPlanIds = new Set();
+            for (const m of session.messages) {
+              if (m.role === 'assistant' && Array.isArray(m.content)) {
+                for (const b of m.content) {
+                  if (b.type === 'tool_use' && b.name === 'AskUserQuestion') lrHistoryAskIds.add(b.id);
+                  if (b.type === 'tool_use' && b.name === 'ExitPlanMode') lrHistoryPlanIds.add(b.id);
+                }
+              }
+            }
+            const _localAsk = this.state.localAskAnswers || {};
+            // 用本 session 的派生 mergedAskAnswerMap（含 localAsk）做预判，与下面 LR 实际判定（L1675）同源。
+            // 旧版直接读 raw cache 不含 localAsk → 用户快速答题、ack 还没到时预判会误认 LR 持有 ask，
+            // 导致 messages-side 与 LR 同时 isInteractive，双 portal 进 ApprovalModal askSlot。
+            for (const b of _resp) {
+              if (b.type !== 'tool_use') continue;
+              if (b.name === 'AskUserQuestion') {
+                if (lrHistoryAskIds.has(b.id)) continue;
+                const merged = mergedAskAnswerMap[b.id];
+                if (merged && Object.keys(merged).length > 0) continue;
+                const la = _localAsk[b.id];
+                if (!la || Object.keys(la).length === 0) { lrWillOwnAsk = true; }
+              }
+              if (b.name === 'ExitPlanMode') {
+                // ChatMessage:472 ExitPlanMode 仅当 cliMode 才 isInteractive；非 cliMode 下剥夺 messages 端反而双双不可交互
+                if (!this.props.cliMode) continue;
+                if (lrHistoryPlanIds.has(b.id)) continue;
+                const approval = sessionPlanApprovalMap[b.id];
+                if (!approval || approval.status === 'pending') { lrWillOwnPlan = true; }
+              }
+            }
+          }
+        }
+      }
 
       if (sc && sc.session === session && sc.msgsLen === session.messages.length) {
-        // 完全命中：session 对象不变且消息数不变 → 直接复用
-        msgs = sc.items;
+        // 完全命中：session 对象不变且消息数不变 → 直接复用。
+        // 但 planApprovalMap / askAnswerMap 引用变化时（ExitPlanMode 审批落盘 / AskUserQuestion 答完），
+        // 刷新持有相应 tool_use 的旧 element 的 prop，避免 React 因 element 引用未变跳过 SCU 让卡片永远停在 pending 视图。
+        msgs = refreshPlanApprovalOnCachedItems(sc.items, sc.planApprovalMap, mergedPlanApprovalMap);
+        msgs = refreshAskAnswerOnCachedItems(msgs, sc.askAnswerMap, mergedAskAnswerMap);
         lastPendingAskId = sc.lastPendingAskId;
         lastPendingPlanId = sc.lastPendingPlanId;
       } else if (sc && sc.session === session && session.messages.length > sc.msgsLen) {
         // 增量：session 对象不变但消息增长 → 只渲染新消息，拼接到缓存
-        const result = this.renderSessionMessages(session.messages, `s${si}`, resolveModelInfo, tsToIndex, sc.msgsLen);
-        msgs = sc.items.concat(result.items);
+        const result = this.renderSessionMessages(session.messages, `s${si}`, resolveModelInfo, tsToIndex, requestCacheTokenMap, sc.msgsLen);
+        // 旧段同样要刷新 planApprovalMap / askAnswerMap prop（同 FULL HIT 理由）
+        msgs = refreshPlanApprovalOnCachedItems(sc.items, sc.planApprovalMap, mergedPlanApprovalMap).slice();
+        msgs = refreshAskAnswerOnCachedItems(msgs, sc.askAnswerMap, mergedAskAnswerMap);
         lastPendingAskId = result.lastPendingAskId;
         lastPendingPlanId = result.lastPendingPlanId;
+        // 增量 result 范围内若无新 pending plan/ask，但 sc 旧值仍未 resolved → 保留 sc 值，
+        // 否则会让 modal 在 streaming 间隙短暂关闭再重弹（闪烁）。
+        if (!lastPendingPlanId && sc.lastPendingPlanId) {
+          const prevPlanApproval = sessionPlanApprovalMap[sc.lastPendingPlanId];
+          if (!prevPlanApproval || prevPlanApproval.status === 'pending') {
+            lastPendingPlanId = sc.lastPendingPlanId;
+          }
+        }
+        if (!lastPendingAskId && sc.lastPendingAskId) {
+          const prevAns = mergedAskAnswerMap?.[sc.lastPendingAskId];
+          if (!prevAns || Object.keys(prevAns).length === 0) {
+            lastPendingAskId = sc.lastPendingAskId;
+          }
+        }
         // 如果 lastPendingAskId 迁移了，修补旧缓存中持有旧 id 的 ChatMessage
         if (sc.lastPendingAskId && sc.lastPendingAskId !== lastPendingAskId) {
-          for (let i = 0; i < sc.items.length; i++) {
+          for (let i = 0; i < msgs.length; i++) {
             if (msgs[i].props.lastPendingAskId === sc.lastPendingAskId) {
               msgs[i] = React.cloneElement(msgs[i], { lastPendingAskId: null });
               break;
@@ -1208,26 +1694,65 @@ class ChatView extends React.Component {
           }
         }
         if (sc.lastPendingPlanId && sc.lastPendingPlanId !== lastPendingPlanId) {
-          for (let i = 0; i < sc.items.length; i++) {
+          for (let i = 0; i < msgs.length; i++) {
             if (msgs[i].props.lastPendingPlanId === sc.lastPendingPlanId) {
               msgs[i] = React.cloneElement(msgs[i], { lastPendingPlanId: null });
               break;
             }
           }
         }
+        // streaming 期间同一 toolId 可能在多条 message 里出现（增量 push 而非 mutate）。
+        // owner-idx 算法保证 result.items 内只有一条 ChatMessage 拿到 lastPendingAskId。
+        // 但 sc.items 里上一轮赋的 owner 可能 stale —— 当本轮 owner 落在 result 范围内时，
+        // 必须清掉 sc.items 中所有持同一 id 的 ChatMessage，否则会出现两份 portal 到 modal askSlot。
+        if (result.lastPendingAskId && result.askOwnerInRange) {
+          for (let i = 0; i < msgs.length; i++) {
+            if (msgs[i].props.lastPendingAskId === result.lastPendingAskId) {
+              msgs[i] = React.cloneElement(msgs[i], { lastPendingAskId: null });
+            }
+          }
+        }
+        if (result.lastPendingPlanId && result.planOwnerInRange) {
+          for (let i = 0; i < msgs.length; i++) {
+            if (msgs[i].props.lastPendingPlanId === result.lastPendingPlanId) {
+              msgs[i] = React.cloneElement(msgs[i], { lastPendingPlanId: null });
+            }
+          }
+        }
+        msgs = msgs.concat(result.items);
       } else {
         // 缓存未命中 → 全量渲染
-        const result = this.renderSessionMessages(session.messages, `s${si}`, resolveModelInfo, tsToIndex);
+        const result = this.renderSessionMessages(session.messages, `s${si}`, resolveModelInfo, tsToIndex, requestCacheTokenMap);
         msgs = result.items;
         lastPendingAskId = result.lastPendingAskId;
         lastPendingPlanId = result.lastPendingPlanId;
       }
 
-      // 更新缓存
+      // 更新缓存（保持 raw msgs / lastPendingAskId / lastPendingPlanId 未做 LR-stripping 的原始版本，
+      // 使下一轮 LR 不再持权时 messages-side 能自动恢复为 interactive）
       this._sessionItemCache[si] = {
         session, msgsLen: session.messages.length,
         items: msgs, lastPendingAskId, lastPendingPlanId,
+        // 记下本轮 planApprovalMap / askAnswerMap 引用，下轮 FULL HIT / INCREMENTAL 据此判断是否要刷新旧 element 的 prop。
+        planApprovalMap: mergedPlanApprovalMap,
+        askAnswerMap: mergedAskAnswerMap,
       };
+      // LR 持有交互权 → 派生新的 msgs 数组（不污染 cache.items），让 messages-side 同 toolId 卡降级成静态展示，
+      // 保证唯一交互点是 LR <ChatMessage key="resp-asst">。
+      // 用 map 而非 in-place mutation，cache.items 保持原始；下一轮 LR 不持权时 cache 命中能恢复 interactive。
+      if (lrWillOwnAsk && lastPendingAskId) {
+        const _stripAskId = lastPendingAskId;
+        msgs = msgs.map(m => m.props.lastPendingAskId === _stripAskId
+          ? React.cloneElement(m, { lastPendingAskId: null }) : m);
+        lastPendingAskId = null;
+      }
+      if (lrWillOwnPlan && lastPendingPlanId) {
+        const _stripPlanId = lastPendingPlanId;
+        msgs = msgs.map(m => m.props.lastPendingPlanId === _stripPlanId
+          ? React.cloneElement(m, { lastPendingPlanId: null }) : m);
+        lastPendingPlanId = null;
+      }
+      if (lastPendingPlanId) buildLpid = lastPendingPlanId;
 
       // 将 SubAgent entries 按时间戳插入到 session 消息之间
       for (const m of msgs) {
@@ -1236,8 +1761,11 @@ class ChatView extends React.Component {
         while (subIdx < subAgentEntries.length && msgTs && subAgentEntries[subIdx].timestamp <= msgTs) {
           const sa = subAgentEntries[subIdx];
           if (sa.timestamp) tsItemMap[sa.timestamp] = allItems.length;
+          const subCacheTotal = sa.requestIndex != null
+            ? (requestCacheTokenMap?.get(sa.requestIndex) ?? 0)
+            : null;
           allItems.push(
-            <ChatMessage key={`sub-${sa.requestIndex}-${sa.timestamp}`} role="sub-agent-chat" content={sa.content} toolResultMap={sa.toolResultMap} label={sa.label} isTeammate={sa.isTeammate} timestamp={sa.timestamp} collapseToolResults={collapseToolResults} expandThinking={expandThinking} showFullToolContent={showFullToolContent} requestIndex={sa.requestIndex} onViewRequest={onViewRequest} onOpenFile={this.handleOpenToolFilePath} />
+            <ChatMessage key={`sub-${sa.requestIndex}-${sa.timestamp}`} role="sub-agent-chat" content={sa.content} toolResultMap={sa.toolResultMap} label={sa.label} isTeammate={sa.isTeammate} timestamp={sa.timestamp} collapseToolResults={collapseToolResults} expandThinking={expandThinking} showFullToolContent={showFullToolContent} requestIndex={sa.requestIndex} cacheTotalTokens={subCacheTotal} onViewRequest={onViewRequest} onOpenFile={this.handleOpenToolFilePath} isHistoryLog={isHistoryLog} />
           );
           subIdx++;
         }
@@ -1251,8 +1779,11 @@ class ChatView extends React.Component {
         const nextSessionStart = si < mainAgentSessions.length - 1 && mainAgentSessions[si + 1].messages?.[0]?._timestamp;
         if (nextSessionStart && sa.timestamp > nextSessionStart) break;
         if (sa.timestamp) tsItemMap[sa.timestamp] = allItems.length;
+        const subCacheTotal = sa.requestIndex != null
+          ? (requestCacheTokenMap?.get(sa.requestIndex) ?? 0)
+          : null;
         allItems.push(
-          <ChatMessage key={`sub-${sa.requestIndex}-${sa.timestamp}`} role="sub-agent-chat" content={sa.content} toolResultMap={sa.toolResultMap} label={sa.label} isTeammate={sa.isTeammate} timestamp={sa.timestamp} collapseToolResults={collapseToolResults} expandThinking={expandThinking} showFullToolContent={showFullToolContent} requestIndex={sa.requestIndex} onViewRequest={onViewRequest} onOpenFile={this.handleOpenToolFilePath} />
+          <ChatMessage key={`sub-${sa.requestIndex}-${sa.timestamp}`} role="sub-agent-chat" content={sa.content} toolResultMap={sa.toolResultMap} label={sa.label} isTeammate={sa.isTeammate} timestamp={sa.timestamp} collapseToolResults={collapseToolResults} expandThinking={expandThinking} showFullToolContent={showFullToolContent} requestIndex={sa.requestIndex} cacheTotalTokens={subCacheTotal} onViewRequest={onViewRequest} onOpenFile={this.handleOpenToolFilePath} isHistoryLog={isHistoryLog} />
         );
         subIdx++;
       }
@@ -1288,16 +1819,29 @@ class ChatView extends React.Component {
             const _localAsk = this.state.localAskAnswers || {};
             for (const block of respContent) {
               if (block.type === 'tool_use' && block.name === 'AskUserQuestion') {
-                // 已在本地提交过的问题不再视为 pending
+                // 主历史已含此 toolId → 主历史 ChatMessage 是 owner，LR 不再分配 lastPendingAskId
+                // 否则 streaming 边界双侧各自标记 isInteractive=true，会让 modal askSlot 收到双份 portal。
+                if (historyAskIds.has(block.id)) continue;
+                // 已应答（服务端 ack 写入 mergedAskAnswerMap，或本地乐观 _localAsk）→ 不视为 pending
+                // 与主历史 L924-928 对齐，防 reload 时 LR 残留已答 ask 误触发 modal
+                const merged = mergedAskAnswerMap?.[block.id];
+                if (merged && Object.keys(merged).length > 0) continue;
                 const la = _localAsk[block.id];
                 if (!la || Object.keys(la).length === 0) {
                   respLastPendingAskId = block.id;
                 }
               }
               if (block.type === 'tool_use' && block.name === 'ExitPlanMode') {
-                respLastPendingPlanId = block.id;
+                // 与主历史 L915-921 对齐：只有 planApprovalMap 中 status='pending' 或无 entry 才算未审批
+                // 防 reload 时 LR 残留已 approved/rejected 的 ExitPlanMode 把 buildLpid 错绑成 resolved id
+                // 进而让 ApprovalModal 弹出空 body（ChatMessage isInteractive=false 不 portal）
+                const approval = sessionPlanApprovalMap[block.id];
+                if (!approval || approval.status === 'pending') {
+                  respLastPendingPlanId = block.id;
+                }
               }
             }
+            if (respLastPendingPlanId) buildLpid = respLastPendingPlanId;
             // 收集 Last Response 中所有 AskUserQuestion 的问题文本，用于 prompt 去重
             this._lastResponseAskQuestions = new Set();
             for (const block of respContent) {
@@ -1311,7 +1855,8 @@ class ChatView extends React.Component {
               }
             }
             const _cachedLR = getToolResultCache(session.messages) || {};
-            const planApprovalMap = _cachedLR.planApprovalMap || {};
+            // 复用 forEach 顶部 hoist 的 sessionPlanApprovalMap，避免重复一次 getToolResultCache 调用 + 同源同值
+            const planApprovalMap = sessionPlanApprovalMap;
             const latestPlanContent = _cachedLR.latestPlanContent || null;
             const activePlanPrompt = this.props.cliMode
               ? this.state.ptyPromptHistory.slice().reverse().find(p => isPlanApprovalPrompt(p) && p.status === 'active') || null
@@ -1320,9 +1865,12 @@ class ChatView extends React.Component {
               ? this.state.ptyPromptHistory.slice().reverse().find(p => isDangerousOperationPrompt(p) && p.status === 'active') || null
               : null;
             // Last Response 过滤：隐藏 tool_use 块，仅保留交互卡片（AskUserQuestion / ExitPlanMode）
-            // 去重：如果 AskUserQuestion 已在消息历史中渲染，不再在 Last Response 重复显示
+            // 去重：如果 AskUserQuestion / ExitPlanMode 已在消息历史中渲染，不再在 Last Response 重复显示
+            // ExitPlanMode 这一向去重之前缺失（始终包含），与 AskUserQuestion 现在对等
             const lrContent = respContent.filter(b =>
-              b.type !== 'tool_use' || ((b.name === 'AskUserQuestion' && !historyAskIds.has(b.id)) || b.name === 'ExitPlanMode')
+              b.type !== 'tool_use'
+              || (b.name === 'AskUserQuestion' && !historyAskIds.has(b.id))
+              || (b.name === 'ExitPlanMode' && !(lrHistoryPlanIds && lrHistoryPlanIds.has(b.id)))
             );
             // 如果过滤后没有可见内容，不显示 Last Response 区域
             const hasVisibleContent = lrContent.some(b => {
@@ -1332,12 +1880,16 @@ class ChatView extends React.Component {
               return false;
             });
             if (!hasVisibleContent) return;
+            const entryReqIdx = session.entryTimestamp ? tsToIndex[session.entryTimestamp] : undefined;
+            const entryCacheTotal = entryReqIdx != null
+              ? (requestCacheTokenMap?.get(entryReqIdx) ?? 0)
+              : null;
             this._lastResponseItems = (
               <React.Fragment key="last-response-group">
                 <Divider className={styles.lastResponseDivider}>
                   <Text type="secondary" className={styles.lastResponseLabel}>{t('ui.lastResponse')}</Text>
                 </Divider>
-                <ChatMessage key="resp-asst" role="assistant" content={lrContent} timestamp={session.entryTimestamp} modelInfo={globalModelInfo} collapseToolResults={collapseToolResults} expandThinking={expandThinking} showFullToolContent={showFullToolContent} toolResultMap={EMPTY_MAP} askAnswerMap={Object.keys(_localAsk).length > 0 ? _localAsk : EMPTY_MAP} planApprovalMap={planApprovalMap} latestPlanContent={latestPlanContent} lastPendingAskId={respLastPendingAskId} lastPendingPlanId={respLastPendingPlanId} activePlanPrompt={activePlanPrompt} activeDangerousPrompt={activeDangerousPrompt} ptyPrompt={this.state.ptyPrompt} onPlanApprovalClick={this.handlePromptOptionClick} onPlanFeedbackSubmit={this.handlePlanFeedbackSubmit} onDangerousApprovalClick={this.handlePromptOptionClick} cliMode={this.props.cliMode} onAskQuestionSubmit={this.handleAskQuestionSubmit} onOpenFile={this.handleOpenToolFilePath} />
+                <ChatMessage key="resp-asst" role="assistant" content={lrContent} timestamp={session.entryTimestamp} modelInfo={globalModelInfo} collapseToolResults={collapseToolResults} expandThinking={expandThinking} showFullToolContent={showFullToolContent} toolResultMap={EMPTY_MAP} askAnswerMap={Object.keys(_localAsk).length > 0 ? _localAsk : EMPTY_MAP} planApprovalMap={planApprovalMap} latestPlanContent={latestPlanContent} planFileContents={this.state.planFileContents} lastPendingAskId={respLastPendingAskId} lastPendingPlanId={respLastPendingPlanId} activePlanPrompt={activePlanPrompt} activePtyPlanId={this.state.pendingPtyPlan?.id ?? null} activeDangerousPrompt={activeDangerousPrompt} ptyPrompt={this.state.ptyPrompt} cacheTotalTokens={entryCacheTotal} onPlanApprovalClick={this.handlePromptOptionClick} onPlanFeedbackSubmit={this.handlePlanFeedbackSubmit} onDangerousApprovalClick={this.handlePromptOptionClick} cliMode={this.props.cliMode} onAskQuestionSubmit={this.handleAskQuestionSubmit} onOpenFile={this.handleOpenToolFilePath} isHistoryLog={isHistoryLog} />
               </React.Fragment>
             );
           }
@@ -1350,6 +1902,8 @@ class ChatView extends React.Component {
     this._scrollTargetIdx = scrollToTimestamp && tsItemMap[scrollToTimestamp] != null
       ? tsItemMap[scrollToTimestamp] : null;
     this._tsItemMap = tsItemMap;
+    // 镜像本轮最末活跃 lpid 给 componentDidUpdate 派生 pendingPtyPlan 用
+    this._currentLastPendingPlanId = buildLpid;
 
     return allItems;
   }
@@ -1421,39 +1975,35 @@ class ChatView extends React.Component {
   }
 
   _loadPresets() {
-    // 判断 Agent Team 是否启用
-    let agentTeamEnabled = false;
-    fetch(apiUrl('/api/claude-settings')).then(r => r.json()).then(data => {
-      agentTeamEnabled = data?.env?.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === '1';
-    }).catch(() => {}).then(() => {
-      if (!agentTeamEnabled) return;
-      // 加载预置快捷方式，合并内置预置
-      fetch(apiUrl('/api/preferences')).then(r => r.json()).then(data => {
-        const dismissed = Array.isArray(data.dismissedBuiltinPresets) ? new Set(data.dismissedBuiltinPresets) : new Set();
-        let items = [];
-        if (Array.isArray(data.presetShortcuts)) {
-          items = data.presetShortcuts.map((item, i) => {
-            if (typeof item === 'string') return { id: Date.now() + i, teamName: '', description: item };
-            return { id: Date.now() + i, teamName: item.teamName || '', description: item.description || '',
-              ...(item.builtinId ? { builtinId: item.builtinId } : {}), ...(item.modified ? { modified: true } : {}) };
-          });
-        }
-        const existingBuiltinIds = new Set(items.filter(i => i.builtinId).map(i => i.builtinId));
-        for (const bp of BUILTIN_PRESETS) {
-          if (dismissed.has(bp.builtinId) || existingBuiltinIds.has(bp.builtinId)) continue;
-          items.unshift({ id: Date.now() + Math.random(), builtinId: bp.builtinId, teamName: bp.teamName, description: bp.description });
-        }
-        const customExperts = Array.isArray(data.customUltraplanExperts) ? data.customUltraplanExperts : [];
-        // 若当前选中的自定义专家已不存在（被另一端删除），回退到 codeExpert
-        const current = this.state.ultraplanVariant;
-        const next = { presetItems: items, customUltraplanExperts: customExperts };
-        if (typeof current === 'string' && current.startsWith('custom:')) {
-          const id = current.slice('custom:'.length);
-          if (!customExperts.some(e => e.id === id)) next.ultraplanVariant = 'codeExpert';
-        }
-        this.setState(next);
-      }).catch(() => {});
-    });
+    // 数据从 props 派生 (SettingsContext 集中 fetch);未 ready 时静默返回,
+    // componentDidUpdate 监听 props.preferences / props.claudeSettings 后重试。
+    const agentTeamEnabled = this.props.claudeSettings?.env?.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === '1';
+    if (!agentTeamEnabled) return;
+    const data = this.props.preferences;
+    if (!data) return;
+    const dismissed = Array.isArray(data.dismissedBuiltinPresets) ? new Set(data.dismissedBuiltinPresets) : new Set();
+    let items = [];
+    if (Array.isArray(data.presetShortcuts)) {
+      items = data.presetShortcuts.map((item, i) => {
+        if (typeof item === 'string') return { id: Date.now() + i, teamName: '', description: item };
+        return { id: Date.now() + i, teamName: item.teamName || '', description: item.description || '',
+          ...(item.builtinId ? { builtinId: item.builtinId } : {}), ...(item.modified ? { modified: true } : {}) };
+      });
+    }
+    const existingBuiltinIds = new Set(items.filter(i => i.builtinId).map(i => i.builtinId));
+    for (const bp of BUILTIN_PRESETS) {
+      if (dismissed.has(bp.builtinId) || existingBuiltinIds.has(bp.builtinId)) continue;
+      items.unshift({ id: Date.now() + Math.random(), builtinId: bp.builtinId, teamName: bp.teamName, description: bp.description });
+    }
+    const customExperts = Array.isArray(data.customUltraplanExperts) ? data.customUltraplanExperts : [];
+    // 若当前选中的自定义专家已不存在（被另一端删除），回退到 codeExpert
+    const current = this.state.ultraplanVariant;
+    const next = { presetItems: items, customUltraplanExperts: customExperts };
+    if (typeof current === 'string' && current.startsWith('custom:')) {
+      const id = current.slice('custom:'.length);
+      if (!customExperts.some(e => e.id === id)) next.ultraplanVariant = 'codeExpert';
+    }
+    this.setState(next);
   }
 
   handlePresetSend = (description) => {
@@ -1567,13 +2117,9 @@ class ChatView extends React.Component {
 
   _persistCustomUltraplanExperts = (experts) => {
     this.setState({ customUltraplanExperts: experts });
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customUltraplanExperts: experts }),
-    })
-      .then(() => window.dispatchEvent(new Event('ccv-presets-changed')))
-      .catch(() => {});
+    if (this.props.onUpdatePreferences) {
+      this.props.onUpdatePreferences({ customUltraplanExperts: experts });
+    }
   };
 
   _saveCustomUltraplanExpert = (item) => {
@@ -1596,23 +2142,34 @@ class ChatView extends React.Component {
     this._closeCustomUltraplanEditor();
   };
 
-  connectInputWs() {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/terminal`;
-    this._inputWs = new WebSocket(wsUrl);
-    this._inputWs.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.type === 'data') {
-          this._appendPtyData(msg.data);
-        } else if (msg.type === 'exit') {
+  // 通过 TerminalWsContext 共享单条 ws,本方法接收消息派发。
+  // 注:`data` 分支不能省 — _appendPtyData → _detectPrompt 解析出的 ptyPrompt state 被多处引用
+  // (renderDangerApproval / SubAgent 兜底权限面板路由 / handlePlanFeedbackSubmit isDanger 检查 /
+  //  _submitViaSequentialQueue 非 danger 类型自检 等)。合并 ws 后 ChatView 仍需要这条解析路径,
+  // CPU 开销保留,但网络层 1 条 ws 是仍有收益(改前 2 条同时收同一份 PTY 流)。
+  _onTerminalWsMessage = (msg) => {
+    try {
+      if (msg.type === 'data') {
+        this._appendPtyData(msg.data);
+      } else if (msg.type === 'exit') {
           this._clearPtyPrompt();
         } else if (msg.type === 'ask-hook-pending') {
           this._askHookActive = true;
           this._askHookQuestions = msg.questions;
+          // Mirror to React state so the global modal can react. PTY hook has only one pending ask at a time.
+          // 仅当 pendingAsk 不存在或仍是占位符时才 setState；避免 sdk-ask-pending 已经设过真实 toolId
+          // 后被后到的 hook 退回 '__ask__'，触发 ChatMessage portal 旧通配 OR 子句把多份 form 都 portal 进 askSlot。
+          if (Array.isArray(msg.questions) && msg.questions.length > 0
+              && (!this.state.pendingAsk || this.state.pendingAsk.id === '__ask__')) {
+            this.setState({ pendingAsk: { id: '__ask__', questions: msg.questions } });
+          }
         } else if (msg.type === 'ask-hook-timeout') {
           this._askHookActive = false;
           this._askHookQuestions = null;
+          // 条件清理：只清自己设过的占位 id，避免误清 SDK 真实 id 路径上的 pendingAsk
+          if (this.state.pendingAsk?.id === '__ask__') {
+            this.setState({ pendingAsk: null });
+          }
         } else if (msg.type === 'sdk-plan-pending') {
           // SDK mode: ExitPlanMode — show plan approval UI
           this.setState({ pendingPlanApproval: { id: msg.id, input: msg.input } });
@@ -1621,10 +2178,14 @@ class ChatView extends React.Component {
           this._askHookActive = true;
           this._askHookQuestions = msg.questions;
           this._sdkAskId = msg.id;
+          if (Array.isArray(msg.questions) && msg.questions.length > 0) {
+            this.setState({ pendingAsk: { id: String(msg.id), questions: msg.questions } });
+          }
         } else if (msg.type === 'sdk-ask-timeout') {
           this._askHookActive = false;
           this._askHookQuestions = null;
           this._sdkAskId = null;
+          this.setState({ pendingAsk: null });
         } else if (msg.type === 'perm-hook-pending') {
           // Queue support: if a permission panel is already showing, queue the new one
           this.setState(state => {
@@ -1659,12 +2220,17 @@ class ChatView extends React.Component {
           // 另一端已回答 AskUserQuestion (PTY hook 模式)
           this._askHookActive = false;
           this._askHookQuestions = null;
+          // 条件清理：只清自己设过的占位 id，避免误清 SDK 真实 id 路径上的 pendingAsk
+          if (this.state.pendingAsk?.id === '__ask__') {
+            this.setState({ pendingAsk: null });
+          }
         } else if (msg.type === 'sdk-ask-resolved') {
           // 另一端已回答 AskUserQuestion (SDK 模式)
           if (this._sdkAskId === msg.id) {
             this._askHookActive = false;
             this._askHookQuestions = null;
             this._sdkAskId = null;
+            if (this.state.pendingAsk) this.setState({ pendingAsk: null });
           }
         } else if (msg.type === 'sdk-plan-resolved') {
           if (this.state.pendingPlanApproval?.id === msg.id) {
@@ -1683,23 +2249,22 @@ class ChatView extends React.Component {
             });
           }
         }
-      } catch {}
-    };
-    this._inputWs.onclose = () => {
-      // 清除可能残留的审批面板（WS 断连后无法响应）
-      if (this.state.pendingPermission || this.state.pendingPlanApproval) {
-        this.setState({ pendingPermission: null, permissionQueue: [], pendingPlanApproval: null });
-      }
-      this._sdkAskId = null;
-      this._askHookActive = false;
-      this._askHookQuestions = null;
-      this._wsReconnectTimer = setTimeout(() => {
-        if (!this._unmounted && this.splitContainerRef.current && this.props.cliMode) {
-          this.connectInputWs();
-        }
-      }, 2000);
-    };
-  }
+    } catch {}
+  };
+
+  // ws 状态变更监听:close 时清残留审批面板(原 _inputWs.onclose 行为);Provider 内部已自动 2s 重连。
+  _onTerminalWsState = (state) => {
+    if (state !== 'close') return;
+    if (this.state.pendingPtyPlan?.id) {
+      this._resolvedPlanIds.add(this.state.pendingPtyPlan.id);
+    }
+    if (this.state.pendingPermission || this.state.pendingPlanApproval || this.state.pendingAsk || this.state.pendingPtyPlan) {
+      this.setState({ pendingPermission: null, permissionQueue: [], pendingPlanApproval: null, pendingAsk: null, pendingPtyPlan: null });
+    }
+    this._sdkAskId = null;
+    this._askHookActive = false;
+    this._askHookQuestions = null;
+  };
 
   _stripAnsi(str) {
     // Remove CSI sequences (ESC [ ... final byte), OSC sequences (ESC ] ... ST), and other escape sequences
@@ -1819,7 +2384,9 @@ class ChatView extends React.Component {
               history[history.length - 1] = { ...last, status: 'dismissed' };
             }
           }
-          history.push({ ...prompt, status: 'active', selectedNumber: null, timestamp: new Date().toISOString() });
+          const ts = new Date().toISOString();
+          const newEntry = { ...prompt, status: 'active', selectedNumber: null, timestamp: ts };
+          history.push(newEntry);
           // Cap history to prevent unbounded growth
           if (history.length > 200) history.splice(0, history.length - 200);
           return { ptyPrompt: prompt, ptyPromptHistory: history };
@@ -1849,7 +2416,8 @@ class ChatView extends React.Component {
         if (last && last.status === 'active') {
           history[history.length - 1] = { ...last, status: 'dismissed' };
         }
-        return { ptyPrompt: null, ptyPromptHistory: history };
+        // Prompt 消失（无匹配）：无论之前是不是 plan，pendingPtyPlan 一并清空作防御。
+        return { ptyPrompt: null, ptyPromptHistory: history, pendingPtyPlan: null };
       });
     }
   }
@@ -1902,13 +2470,19 @@ class ChatView extends React.Component {
 
     // 标记历史中最后一个 active 为 answered
     this._currentPtyPrompt = null;
+    // 用户已提交本轮 plan：把当前 pendingPtyPlan.id 加入 _resolvedPlanIds，
+    // 防 PTY 答案到 JSONL 之间的窗口期 CDU 把 modal 重弹（lpid 仍指向同一 id 直到 tool_result 写入 planApprovalMap）。
+    if (this.state.pendingPtyPlan?.id) {
+      this._resolvedPlanIds.add(this.state.pendingPtyPlan.id);
+    }
     this.setState(state => {
       const history = state.ptyPromptHistory.slice();
       const last = history[history.length - 1];
       if (last && last.status === 'active') {
         history[history.length - 1] = { ...last, status: 'answered', selectedNumber: number };
       }
-      return { ptyPrompt: null, ptyPromptHistory: history };
+      // Atomic clear of pendingPtyPlan so the global modal closes in lockstep with the inline state.
+      return { ptyPrompt: null, ptyPromptHistory: history, pendingPtyPlan: null };
     });
     this._ptyBuffer = '';
     if (this._ptyDebounceTimer) clearTimeout(this._ptyDebounceTimer);
@@ -2047,13 +2621,18 @@ class ChatView extends React.Component {
     sendStep(0);
 
     this._currentPtyPrompt = null;
+    // 用户已提交 plan + feedback：守 modal 不被 CDU 重弹（同 handlePromptOptionClick 注释）
+    if (this.state.pendingPtyPlan?.id) {
+      this._resolvedPlanIds.add(this.state.pendingPtyPlan.id);
+    }
     this.setState(state => {
       const history = state.ptyPromptHistory.slice();
       const last = history[history.length - 1];
       if (last && last.status === 'active') {
         history[history.length - 1] = { ...last, status: 'answered', selectedNumber: number };
       }
-      return { ptyPrompt: null, ptyPromptHistory: history };
+      // Atomic clear of pendingPtyPlan — modal closes together with inline state.
+      return { ptyPrompt: null, ptyPromptHistory: history, pendingPtyPlan: null };
     });
     this._ptyBuffer = '';
     if (this._ptyDebounceTimer) clearTimeout(this._ptyDebounceTimer);
@@ -2090,15 +2669,31 @@ class ChatView extends React.Component {
           localAnswers[q.question] = (q.options || [])[answer.optionIndex]?.label || '';
         }
       }
+      // 暂存原 pendingAsk + askId 到 instance 字段：PTY 路径 prompt 失效时
+      // _abortAskSubmitWithRollback 据此恢复 modal + 清回 localAskAnswers，让用户重试。
+      // 三条成功路径（SDK ws.send / hook bridge ws.send / PTY input-sequential-done）
+      // 必须在成功后清这两个字段，避免下次 abort 误回滚。
+      this._lastClearedPendingAsk = this.state.pendingAsk;
+      this._lastAskSubmitId = askId;
       this.setState(prev => ({
         localAskAnswers: { ...(prev.localAskAnswers || {}), [askId]: localAnswers },
+        // 乐观清空 pendingAsk：让全局 modal 与 inline form 在同一帧消失，不依赖 server ack。
+        // server 后续到达的 sdk-ask-resolved / ask-hook-resolved 会被现有守卫挡掉
+        // (_sdkAskId 已 null 或 pendingAsk?.id === '__ask__' 已不成立)，no-op 无副作用。
+        pendingAsk: null,
       }));
     }
 
     // SDK 模式：直接通过 WS 发送结构化答案，无需 hook bridge 或 PTY
     if (this.props.sdkMode) {
       const resolvedId = askId || this._sdkAskId;
-      if (!resolvedId) return; // 已被其他设备回答，忽略重复提交
+      if (!resolvedId) {
+        // SDK 已被其他设备回答 / 没有可解析的 id：早退也要清暂存字段，
+        // 否则下一轮 PTY abort 时会用过期 pendingAsk 错误回滚出已结束的 modal。
+        this._lastClearedPendingAsk = null;
+        this._lastAskSubmitId = null;
+        return;
+      }
       const ws = this._inputWs;
       if (ws && ws.readyState === WebSocket.OPEN) {
         // 构造 answers 对象: { questionText: selectedLabel }
@@ -2118,6 +2713,15 @@ class ChatView extends React.Component {
         }
         ws.send(JSON.stringify({ type: 'sdk-ask-answer', id: resolvedId, answers: sdkAnswers }));
         this._sdkAskId = null;
+        // 成功路径：清掉 abort 回滚用的暂存字段
+        this._lastClearedPendingAsk = null;
+        this._lastAskSubmitId = null;
+      } else {
+        // SDK 模式但 ws 不可用：sdk-ask-answer 没法发，理论上前端无可补救路径；
+        // 至少清暂存字段避免下次 abort 误回滚。pendingAsk 保持已乐观清空状态——
+        // 等 server 端超时后重发 sdk-ask-pending 自然唤回 modal。
+        this._lastClearedPendingAsk = null;
+        this._lastAskSubmitId = null;
       }
       return;
     }
@@ -2172,12 +2776,13 @@ class ChatView extends React.Component {
   _submitViaPty(answers) {
     const ws = this._inputWs;
 
-    // Lazily connect WebSocket if not connected
+    // ws 暂时不可用 → 准备 queue 后等 Provider 自动重连。
+    // (历史:此处曾调 this.connectInputWs() 主动连;方案 D 重构后该方法已删,保留调用会抛 TypeError。
+    // Provider 在 props.open=true 时自管 2s 退避重连,_waitForWsAndSubmit 轮询到 OPEN 自然继续。)
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       this._askAnswerQueue = this._planSubmissionSteps(answers);
       this._askSubmitting = true;
       this._isMultiQuestionForm = answers.length > 1;
-      this.connectInputWs();
       this._askWsRetries = 0;
       this._waitForWsAndSubmit();
       return;
@@ -2271,31 +2876,86 @@ class ChatView extends React.Component {
   }
 
   /**
+   * PTY 路径 abort：清掉提交中状态、回滚 handleAskQuestionSubmit 入口乐观写入的
+   * pendingAsk + localAskAnswers，让用户能在 modal 重新唤起后重试。
+   * reason 用于诊断（'ws-not-open' / 'pty-prompt-invalid' 等）。
+   */
+  _abortAskSubmitWithRollback(reason) {
+    this._askSubmitting = false;
+    this._askAnswerQueue = [];
+    if (this._lastClearedPendingAsk) {
+      const restored = this._lastClearedPendingAsk;
+      this._lastClearedPendingAsk = null;
+      this.setState({ pendingAsk: restored });
+    }
+    const askId = this._lastAskSubmitId;
+    if (askId) {
+      this._lastAskSubmitId = null;
+      this.setState((prev) => {
+        const nextLocal = { ...(prev.localAskAnswers || {}) };
+        delete nextLocal[askId];
+        return { localAskAnswers: nextLocal };
+      });
+    }
+    try {
+      message.warning(t('ui.askSubmitRetryHint'));
+    } catch {}
+  }
+
+  /**
    * Unified PTY submission: build chunks via ptyChunkBuilder, send via server-side sequential queue.
+   * PTY-prompt 自检：用户 ESC dismiss modal 后 PTY buffer 可能已离开 inquirer ask 状态
+   * （例如 Claude 已切换到下一行 user input prompt）。此时直接发 chunks 会被当成普通
+   * user message → Claude 把 Other 自由文本视为"补充文本"卡死整个流程。
+   * 自检失败时调 _abortAskSubmitWithRollback 回滚乐观状态、唤回 modal 让用户重试。
    */
   _submitViaSequentialQueue(answer, opts = {}) {
-    const ws = this._inputWs;
-    if (!ws || ws.readyState !== WebSocket.OPEN) { this._askSubmitting = false; return; }
+    const ctx = this.context;
+    if (!ctx || !ctx.isOpen || !ctx.isOpen()) {
+      this._abortAskSubmitWithRollback('ws-not-open');
+      return;
+    }
+
+    // PTY prompt 类型自检：必须是合法的 AskUserQuestion inquirer prompt
+    // （options 非空 + 不是 plan 类型 + 不是 dangerous 类型；后两者 options 也非空但语义不同）
+    const p = this.state.ptyPrompt;
+    const isValidAskPrompt = !!(p && Array.isArray(p.options) && p.options.length > 0
+      && !isPlanApprovalPrompt(p)
+      && !isDangerousOperationPrompt(p));
+    if (!isValidAskPrompt) {
+      this._abortAskSubmitWithRollback('pty-prompt-invalid');
+      return;
+    }
 
     const isMultiQuestion = !!this._isMultiQuestionForm;
     const chunks = buildChunksForAnswer(answer, this.state.ptyPrompt, isMultiQuestion);
     const settleMs = opts.settleMs || 300;
 
-    const onMessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'input-sequential-done') {
-          ws.removeEventListener('message', onMessage);
-          this._finishCurrentAskAnswer();
-        }
-      } catch {}
-    };
-    ws.addEventListener('message', onMessage);
+    // 单 ws 合并后 server 的 input-sequential-done 仍是 unicast,但 ws 上有多个发送方
+    // (ChatView 的 ask 提交 + TerminalPanel 的 preset/clear-context/UltraPlan)。
+    // 用 seq 区分:发送时带,handler 严格按 seq 匹配,避免被 TerminalPanel 触发的 done 误判。
+    const seq = `cv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    ws.send(JSON.stringify({ type: 'input-sequential', chunks, settleMs }));
+    // 先 send,只有发送成功才挂 handler——避免孤儿 handler 等满 15s。
+    // ctx.send() 在 readyState 检查后到实际 send 之间可能因 ws.onclose 触发返回 false,
+    // 同步回滚等价于"还没真正提交",和 ws-not-open 同回滚路径,UX 一致。
+    const sent = ctx.send({ type: 'input-sequential', chunks, settleMs, seq });
+    if (!sent) {
+      this._abortAskSubmitWithRollback('ws-send-failed');
+      return;
+    }
+
+    let unsub = null;
+    const onceMsg = (msg) => {
+      if (msg && msg.type === 'input-sequential-done' && msg.seq === seq) {
+        if (unsub) { try { unsub(); } catch {} unsub = null; }
+        this._finishCurrentAskAnswer();
+      }
+    };
+    unsub = ctx.addMessageHandler(onceMsg);
 
     setTimeout(() => {
-      ws.removeEventListener('message', onMessage);
+      if (unsub) { try { unsub(); } catch {} unsub = null; }
       if (this._askSubmitting) {
         this._finishCurrentAskAnswer();
       }
@@ -2317,6 +2977,9 @@ class ChatView extends React.Component {
     // if queue has more items, we need _detectPrompt() to fire for the next question
     if (!this._askAnswerQueue || this._askAnswerQueue.length === 0) {
       if (this._ptyDebounceTimer) clearTimeout(this._ptyDebounceTimer);
+      // 队列已空 = PTY 路径成功结束。清掉 abort 回滚用的暂存字段
+      this._lastClearedPendingAsk = null;
+      this._lastAskSubmitId = null;
     }
 
     // Wait for next prompt to appear (multi-question scenario)
@@ -2369,6 +3032,10 @@ class ChatView extends React.Component {
     }
 
     ws.send(JSON.stringify({ type: 'ask-hook-answer', answers: hookAnswers }));
+
+    // 成功路径：清掉 abort 回滚用的暂存字段
+    this._lastClearedPendingAsk = null;
+    this._lastAskSubmitId = null;
 
     // 不立即清除 _askHookActive：保留 hook bridge 状态以支持重试
     // hook 状态由 ask-hook-timeout WS 消息或下一轮 streaming response 自然清除
@@ -2896,6 +3563,7 @@ class ChatView extends React.Component {
   render() {
     const { mainAgentSessions, cliMode, terminalVisible, onToggleTerminal } = this.props;
     const { allItems, visibleCount, loading, terminalWidth, sidebarWidth, lastResponseItems } = this.state;
+    const streamSpinnerUrl = this._streamSpinnerUrl || shimmerUrl;
 
     // 计算 SnapLineOverlay 的 currentLeft（侧栏拖拽时用侧栏宽度，终端拖拽时用终端位置）
     let snapCurrentLeft = 0;
@@ -3020,6 +3688,7 @@ class ChatView extends React.Component {
             showFullToolContent={this.props.showFullToolContent}
             showTrailingCursor={true}
             toolResultMap={EMPTY_MAP}
+            isHistoryLog={this._getIsHistoryLog()}
           />
         );
         // 方案 D：保留 Last Response（上一轮）显示让用户能对比参考，仅通过 CSS 隐藏
@@ -3028,6 +3697,15 @@ class ChatView extends React.Component {
         // 外包一层条件 div (styles.hideLastResponseDivider)，子 CSS display:none 掉 Divider。
       }
     }
+
+    // 仅在 streaming 或淡出期间挂 <img>，避免 ChatView 冷加载就 fetch 76KB 的 shimmer + orbiting。
+    // streamingFading 由 isStreaming true→false 时拉起 500ms（line ~551），覆盖淡出动画窗口。
+    const showSpinner = this.props.isStreaming || this.state.streamingFading;
+    const spinnerNode = showSpinner ? (
+      <div className={`${styles.streamingSpinnerWrap}${(!this.props.isStreaming || streamingLiveItem) ? ' ' + styles.streamingSpinnerHidden : ''}`}>
+        <object type="image/svg+xml" data={streamSpinnerUrl} width="20" height="20" aria-hidden="true" tabIndex={-1} />
+      </div>
+    ) : null;
 
     const targetIdx = this._scrollTargetIdx;
     const { highlightTs, highlightFading, highlightVisibleIdx } = this.state;
@@ -3042,7 +3720,7 @@ class ChatView extends React.Component {
     const { pendingInput, stickyBottom, ptyPromptHistory } = this.state;
 
     const pendingBubble = cliMode && pendingInput ? (
-      <ChatMessage key="pending-input" role="user" text={pendingInput} timestamp={new Date().toISOString()} userProfile={this.props.userProfile} />
+      <ChatMessage key="pending-input" role="user" text={pendingInput} timestamp={new Date().toISOString()} userProfile={this.props.userProfile} isHistoryLog={false} />
     ) : null;
 
     const stickyBtn = !stickyBottom ? (
@@ -3092,22 +3770,7 @@ class ChatView extends React.Component {
         {useVirtuoso ? (
           this._virtuosoHeader = loadMoreBtn,
           this._virtuosoFooter = <>
-            <div className={`${styles.streamingSpinnerWrap}${(!this.props.isStreaming || streamingLiveItem) ? ' ' + styles.streamingSpinnerHidden : ''}`}>
-              <svg width="20" height="20" viewBox="0 0 20 20">
-                <defs>
-                  <linearGradient id="ccv-spinnerGrad" x1="0" y1="0" x2="1" y2="1">
-                    <stop offset="0%" stopColor="currentColor" stopOpacity="1" />
-                    <stop offset="100%" stopColor="currentColor" stopOpacity="0.1" />
-                  </linearGradient>
-                </defs>
-                <circle cx="10" cy="10" r="7.5" fill="none" strokeWidth="2"
-                  stroke="url(#ccv-spinnerGrad)" strokeLinecap="round"
-                  pathLength="100" strokeDasharray="75 25">
-                  <animateTransform attributeName="transform" type="rotate"
-                    from="0 10 10" to="360 10 10" dur="0.8s" repeatCount="indefinite" />
-                </circle>
-              </svg>
-            </div>
+            {spinnerNode}
           {filteredLastResponseItems && (
             <div className={streamingLiveItem ? styles.hideLastResponseDivider : undefined}>
               {filteredLastResponseItems}
@@ -3143,7 +3806,7 @@ class ChatView extends React.Component {
               if (needsHighlight) el = React.cloneElement(el, { highlight: highlightFading ? 'fading' : 'active' });
               return isScrollTarget ? <div ref={this._scrollTargetRef}>{el}</div> : el;
             }}
-            scrollerRef={(ref) => { this._virtuosoScrollerEl = ref; }}
+            scrollerRef={(ref) => { this._virtuosoScrollerEl = ref; this._bindVirtuosoResizeObserver(ref); }}
             context={{ header: this._virtuosoHeader, footer: this._virtuosoFooter }}
             components={this._virtuosoComponents || (this._virtuosoComponents = {
               Scroller: VirtuosoScroller,
@@ -3168,22 +3831,7 @@ class ChatView extends React.Component {
                 ? <div key={item.key + '-anchor'} ref={this._scrollTargetRef}>{el}</div>
                 : el;
             })}
-            <div className={`${styles.streamingSpinnerWrap}${(!this.props.isStreaming || streamingLiveItem) ? ' ' + styles.streamingSpinnerHidden : ''}`}>
-              <svg width="20" height="20" viewBox="0 0 20 20">
-                <defs>
-                  <linearGradient id="ccv-spinnerGrad-desktop" x1="0" y1="0" x2="1" y2="1">
-                    <stop offset="0%" stopColor="currentColor" stopOpacity="1" />
-                    <stop offset="100%" stopColor="currentColor" stopOpacity="0.1" />
-                  </linearGradient>
-                </defs>
-                <circle cx="10" cy="10" r="7.5" fill="none" strokeWidth="2"
-                  stroke="url(#ccv-spinnerGrad-desktop)" strokeLinecap="round"
-                  pathLength="100" strokeDasharray="75 25">
-                  <animateTransform attributeName="transform" type="rotate"
-                    from="0 10 10" to="360 10 10" dur="0.8s" repeatCount="indefinite" />
-                </circle>
-              </svg>
-            </div>
+            {spinnerNode}
             {filteredLastResponseItems && (
               <div className={streamingLiveItem ? styles.hideLastResponseDivider : undefined}>
                 {targetIdx != null && targetIdx >= visible.length
@@ -3211,7 +3859,7 @@ class ChatView extends React.Component {
             {messageList}
           </div>
         </div>
-        <TeamModal session={this.state.teamModalSession} requests={this.props.requests} mainAgentSessions={this.props.mainAgentSessions} collapseToolResults={this.props.collapseToolResults} expandThinking={this.props.expandThinking} showFullToolContent={this.props.showFullToolContent} userProfile={this.props.userProfile} onViewRequest={this.props.onViewRequest} onClose={() => this.setState({ teamModalSession: null })} />
+        <TeamModal session={this.state.teamModalSession} requests={this.props.requests} mainAgentSessions={this.props.mainAgentSessions} collapseToolResults={this.props.collapseToolResults} expandThinking={this.props.expandThinking} showFullToolContent={this.props.showFullToolContent} userProfile={this.props.userProfile} onViewRequest={this.props.onViewRequest} isHistoryLog={this._getIsHistoryLog()} onClose={() => this.setState({ teamModalSession: null })} />
       </>);
     }
 
@@ -3345,8 +3993,8 @@ class ChatView extends React.Component {
             {/* inputStack 把审批面板 + 输入栏包成同一个定位容器，
                 面板用 position:absolute; bottom:100% 自动贴在输入栏顶部之上，不遮挡 */}
             <div className={styles.inputStack}>
-            {/* 如果父组件处理全局渲染（移动端），跳过本地渲染 */}
-            {!this.props.onPendingPermission && (
+            {/* 如果父组件处理全局渲染（移动端通过 suppressInlineApprovalPanels），跳过本地渲染 */}
+            {!this.props.suppressInlineApprovalPanels && (
               <ToolApprovalPanel
                 toolName={this.state.pendingPermission?.toolName}
                 toolInput={this.state.pendingPermission?.input}
@@ -3366,7 +4014,7 @@ class ChatView extends React.Component {
                 queueDepth={this.state.permissionQueue.length}
               />
             )}
-            {!this.props.onPendingPlanApproval && this.state.pendingPlanApproval && (
+            {!this.props.suppressInlineApprovalPanels && this.state.pendingPlanApproval && (
               <ToolApprovalPanel
                 toolName="ExitPlanMode"
                 toolInput={this.state.pendingPlanApproval.input}
@@ -3410,6 +4058,7 @@ class ChatView extends React.Component {
               streamingFading={this.state.streamingFading}
               pendingImages={this.state.pendingImages}
               onRemovePendingImage={this._removePendingImage}
+              setContextBarSlot={this.props.setContextBarSlot}
             />
             </div>
             <UltraPlanModal
@@ -3417,7 +4066,6 @@ class ChatView extends React.Component {
               variant={this.state.ultraplanVariant}
               prompt={this.state.ultraplanPrompt}
               files={this.state.ultraplanFiles}
-              modelName={this._reqScanCache?.modelName}
               agentTeamEnabled={this.state.agentTeamEnabled}
               customExperts={this.state.customUltraplanExperts}
               onClose={() => this.setState({ ultraplanModalOpen: false })}
@@ -3456,7 +4104,7 @@ class ChatView extends React.Component {
             <>
               <div className={styles.vResizer} onMouseDown={this.handleSplitMouseDown} />
               <div className={styles.terminalPanelWrap} style={{ width: terminalWidth }}>
-                <TerminalPanel onEditorOpen={(sessionId, filePath) => {
+                <TerminalPanel claudeSettings={this.props.claudeSettings} preferences={this.props.preferences} onUpdatePreferences={this.props.onUpdatePreferences} onUpdateClaudeSettings={this.props.onUpdateClaudeSettings} onEditorOpen={(sessionId, filePath) => {
                   this.setState({
                     editorSessionId: sessionId,
                     editorFilePath: filePath,
@@ -3475,14 +4123,15 @@ class ChatView extends React.Component {
                 modelName={this._reqScanCache?.modelName}
                 getChatScroller={() => this._getScrollContainer()}
                 onClearContextOptimistic={this.props.onClearContextOptimistic}
+                setContextBarSlot={this.props.setContextBarSlot}
                 />
               </div>
             </>
           )}
         </div>
       </div>
-      <TeamModal session={this.state.teamModalSession} requests={this.props.requests} mainAgentSessions={this.props.mainAgentSessions} collapseToolResults={this.props.collapseToolResults} expandThinking={this.props.expandThinking} showFullToolContent={this.props.showFullToolContent} userProfile={this.props.userProfile} onViewRequest={this.props.onViewRequest} onClose={() => this.setState({ teamModalSession: null })} />
-      <PresetModal open={this.state.mobilePresetModalVisible} onClose={() => this.setState({ mobilePresetModalVisible: false })} items={this.state.presetItems} onItemsChange={(items) => this.setState({ presetItems: items })} />
+      <TeamModal session={this.state.teamModalSession} requests={this.props.requests} mainAgentSessions={this.props.mainAgentSessions} collapseToolResults={this.props.collapseToolResults} expandThinking={this.props.expandThinking} showFullToolContent={this.props.showFullToolContent} userProfile={this.props.userProfile} onViewRequest={this.props.onViewRequest} isHistoryLog={this._getIsHistoryLog()} onClose={() => this.setState({ teamModalSession: null })} />
+      <PresetModal open={this.state.mobilePresetModalVisible} onClose={() => this.setState({ mobilePresetModalVisible: false })} items={this.state.presetItems} onItemsChange={(items) => this.setState({ presetItems: items })} onSavePresets={(payload) => { if (this.props.onUpdatePreferences) this.props.onUpdatePreferences(payload); }} />
     </>);
   }
 }

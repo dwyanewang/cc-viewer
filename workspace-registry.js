@@ -89,8 +89,15 @@ export function saveWorkspaces(list) {
   }
 }
 
+// 失效 file-access-policy 的 allowlist roots 缓存。lazy import 避免循环依赖。
+function _invalidatePolicyCache() {
+  import('./lib/file-access-policy.js')
+    .then(m => m.bumpWorkspacesVersion?.())
+    .catch(() => { /* policy 模块可能在某些 entry 下未加载,无副作用即可 */ });
+}
+
 export function registerWorkspace(absolutePath) {
-  return withLock(() => {
+  const result = withLock(() => {
     const resolvedPath = resolve(absolutePath);
     const projectName = basename(resolvedPath).replace(/[^a-zA-Z0-9_\-\.]/g, '_');
     const list = loadWorkspaces();
@@ -113,10 +120,12 @@ export function registerWorkspace(absolutePath) {
     saveWorkspaces(list);
     return entry;
   });
+  _invalidatePolicyCache();
+  return result;
 }
 
 export function removeWorkspace(id) {
-  return withLock(() => {
+  const result = withLock(() => {
     const list = loadWorkspaces();
     const filtered = list.filter(w => w.id !== id);
     if (filtered.length !== list.length) {
@@ -125,6 +134,8 @@ export function removeWorkspace(id) {
     }
     return false;
   });
+  if (result) _invalidatePolicyCache();
+  return result;
 }
 
 export function getWorkspaces() {

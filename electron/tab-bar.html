@@ -7,7 +7,7 @@
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     font-size: 12px;
-    height: 36px;
+    height: 60px;
     display: flex;
     align-items: center;
     overflow: hidden;
@@ -57,7 +57,9 @@
     overflow-x: auto;
     overflow-y: hidden;
     height: 100%;
-    align-items: stretch;
+    align-items: center;
+    gap: 4px;
+    padding: 8px 0;
     -webkit-app-region: no-drag;
   }
   /* Empty space after tabs + "+" button becomes drag area */
@@ -72,30 +74,22 @@
     align-items: center;
     gap: 6px;
     padding: 0 12px;
-    height: 100%;
+    height: 44px;
     max-width: 180px;
     min-width: 60px;
     cursor: pointer;
     white-space: nowrap;
-    border-right: 1px solid var(--border);
+    border-radius: 12px;
     background: var(--bg-tab);
     color: var(--text);
     position: relative;
-    transition: background 0.1s;
+    transition: background 0.1s, box-shadow 0.1s;
   }
   .tab:hover { background: var(--bg-tab-hover); }
   .tab.active {
     background: var(--bg-tab-active);
     color: var(--text-active);
-  }
-  .tab.active::after {
-    content: '';
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    height: 2px;
-    background: var(--accent);
+    box-shadow: inset 0 0 0 2px var(--accent);
   }
   .tab.loading { opacity: 0.6; }
   .tab-name {

@@ -215,7 +215,7 @@
   color: var(--text-primary);
   font-size: 14px;
   line-height: 1.75;
-  background: var(--bg-base-alt);
+  background: var(--bg-container);
 }
 .markdownPreview h1,
 .markdownPreview h2,

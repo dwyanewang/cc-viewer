@@ -320,7 +320,9 @@ export function writeToPtySequential(chunks, onComplete, opts = {}) {
     // Space, Enter, arrows need more time for inquirer to re-render
     const isToggleOrSubmit = chunk === ' ' || chunk === '\r'
       || chunk === '\x1b[C' || chunk === '\x1b[A' || chunk === '\x1b[B';
-    const delay = isToggleOrSubmit ? settleMs : 80;
+    // Bracket-paste end needs a frame for Ink to settle paste→normal state.
+    const isPasteEnd = chunk.endsWith('\x1b[201~');
+    const delay = (isToggleOrSubmit || isPasteEnd) ? settleMs : 80;
     setTimeout(sendNext, delay);
   };
 

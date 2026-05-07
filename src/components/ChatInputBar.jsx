@@ -19,7 +19,7 @@ const SPEECH_LANG_MAP = {
   tr: 'tr-TR', uk: 'uk-UA',
 };
 
-function ChatInputBar({ inputRef, inputEmpty, inputSuggestion, terminalVisible, onKeyDown, onChange, onSend, onStop, onSuggestionClick, onUploadPath, presetItems, onPresetSend, onOpenPresetModal, onOpenUltraPlan, onClearContext, isStreaming, streamingFading, pendingImages, onRemovePendingImage }) {
+function ChatInputBar({ inputRef, inputEmpty, inputSuggestion, terminalVisible, onKeyDown, onChange, onSend, onStop, onSuggestionClick, onUploadPath, presetItems, onPresetSend, onOpenPresetModal, onOpenUltraPlan, onClearContext, isStreaming, streamingFading, pendingImages, onRemovePendingImage, setContextBarSlot }) {
   const [plusOpen, setPlusOpen] = useState(false);
   const [recording, setRecording] = useState(false);
   const [interimText, setInterimText] = useState('');
@@ -56,10 +56,25 @@ function ChatInputBar({ inputRef, inputEmpty, inputSuggestion, terminalVisible, 
   useLayoutEffect(() => {
     const el = rootRef.current;
     if (!el) return;
+    // 折算祖先 zoom：Android WebView 在 zoom 容器内 getBoundingClientRect() 给的是 zoom 前 layout
+    // 坐标，乘 parentZoom 才是视觉坐标；Chrome/Safari/iPad（zoom=1 或 pad-mode 覆盖回 1）天然
+    // parentZoom=1，乘 1 等价于不动。每次 setVar 重读，支持运行时 mobile↔pad 切换。
+    const findParentZoom = () => {
+      let p = el.parentElement;
+      while (p) {
+        const z = parseFloat(getComputedStyle(p).zoom);
+        if (z && z > 0 && z !== 1) return z;
+        p = p.parentElement;
+      }
+      return 1;
+    };
     const setVar = () => {
       const rect = el.getBoundingClientRect();
       const vh = window.visualViewport?.height ?? window.innerHeight;
-      const distFromBottom = Math.max(0, vh - rect.top);
+      const visualTop = rect.top * findParentZoom();
+      const distFromBottom = vh - visualTop;
+      // 拒绝异常量测（rect.top ≥ vh 让 distFromBottom ≤ 0）；正常小输入栏 ≥ 50px 远高于阈值。
+      if (distFromBottom < 5) return;
       document.documentElement.style.setProperty('--chat-input-bar-height', distFromBottom + 'px');
     };
     setVar();
@@ -239,23 +254,26 @@ function ChatInputBar({ inputRef, inputEmpty, inputSuggestion, terminalVisible, 
               })}
             </div>
           )}
-          <textarea
-            ref={inputRef}
-            className={styles.chatTextarea}
-            placeholder={inputSuggestion ? '' : t('ui.chatInput.placeholder')}
-            rows={1}
-            onKeyDown={onKeyDown}
-            onInput={handleTextareaInput}
-            onPaste={handlePaste}
-          />
-          {inputSuggestion && inputEmpty && (
-            <div className={styles.ghostText}>{inputSuggestion}</div>
-          )}
-          {recording && interimText && (
-            <div className={styles.interimPreview}>{interimText}</div>
-          )}
+          <div className={styles.textareaWithGhost}>
+            <textarea
+              ref={inputRef}
+              className={styles.chatTextarea}
+              placeholder={inputSuggestion ? '' : t('ui.chatInput.placeholder')}
+              rows={1}
+              onKeyDown={onKeyDown}
+              onInput={handleTextareaInput}
+              onPaste={handlePaste}
+            />
+            {inputSuggestion && inputEmpty && (
+              <div className={styles.ghostText}>{inputSuggestion}</div>
+            )}
+            {recording && interimText && (
+              <div className={styles.interimPreview}>{interimText}</div>
+            )}
+          </div>
         </div>
         <div className={styles.chatInputBottom}>
+          <div className={styles.chatInputBottomLeft}>
           <div className={styles.plusArea}>
             <button className={`${styles.plusBtn}${plusOpen ? ` ${styles.plusBtnOpen}` : ''}`} onClick={() => setPlusOpen(p => !p)} title={t('ui.chatInput.more')}>
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -354,6 +372,13 @@ function ChatInputBar({ inputRef, inputEmpty, inputSuggestion, terminalVisible, 
               </svg>
             </button>
           )}
+          </div>
+          {/* 中段：血条 portal slot；终端关闭 + 非纯移动端时挂在左/右控件之间，
+              flex-basis 200 + flex-shrink 1 自适应填充至 200px 上限；AppHeader 通过 createPortal 把 LiveTagPopover 渲染进来 */}
+          {!(isMobile && !isPad) && !terminalVisible && setContextBarSlot && (
+            <div className={styles.ctxBarSlot} ref={setContextBarSlot} />
+          )}
+          <div className={styles.chatInputBottomRight}>
           <div className={styles.chatInputHint}>
             {(isMobile && !isPad)
               ? null
@@ -401,6 +426,7 @@ function ChatInputBar({ inputRef, inputEmpty, inputSuggestion, terminalVisible, 
                 </svg>
               </button>
             )}
+          </div>
           </div>
         </div>
       </div>

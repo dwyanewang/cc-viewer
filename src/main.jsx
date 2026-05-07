@@ -4,6 +4,7 @@ import ReactDOM from 'react-dom/client';
 import './global.css';
 import { isMobile } from './env';
 import { reloadOnStaleChunk } from './utils/lazyWithReload';
+import { SettingsProvider } from './contexts/SettingsContext';
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 
@@ -16,12 +17,14 @@ const onLoadError = (err) => {
   document.getElementById('root').textContent = 'Loading failed. Please refresh the page.';
 };
 
+// SettingsProvider 必须在 App/Mobile 之外:AppBase 通过 contextType 消费,要求它本身在 Provider 子树里。
+// constructor 内 fire fetch 让 AppBase.componentDidMount 时 _prefsReady Promise 已可用。
 if (isMobile) {
   import('./Mobile').then(({ default: Mobile }) => {
-    root.render(<Mobile />);
+    root.render(<SettingsProvider><Mobile /></SettingsProvider>);
   }).catch(onLoadError);
 } else {
   import('./App').then(({ default: App }) => {
-    root.render(<App />);
+    root.render(<SettingsProvider><App /></SettingsProvider>);
   }).catch(onLoadError);
 }

@@ -82,98 +82,138 @@ export default class AskQuestionForm extends React.Component {
             ? (q.options.find(o => o.label === selectedLabel) || {}).preview
             : null;
 
-          const optionsContent = (
-            <div>
+          const headerAndQuestion = (
+            <>
               {q.header && <span className={styles.askQuestionHeader}>{q.header}</span>}
               <div className={styles.askQuestionText}>{q.question}</div>
+            </>
+          );
 
+          const optionsBody = (
+            <div className={styles.askOptionsBody}>
               {!isMulti ? (
-                <div className={styles.askRadioGroup}>
+                <div className={styles.askRadioGroup} role="radiogroup">
                   {(q.options || []).map((opt, oi) => {
                     const isOtherOpt = /^other$/i.test(opt.label);
                     const isSelected = isOtherOpt
                       ? otherActive[qi]
                       : !otherActive[qi] && selectedLabel === opt.label;
-                    return (
-                      <div
-                        key={oi}
-                        className={`${styles.askRadioItem}${isSelected ? ' ' + styles.askRadioItemSelected : ''}`}
-                        onClick={() => {
-                          if (isOtherOpt) {
-                            this.setState(prev => ({
-                              otherActive: { ...prev.otherActive, [qi]: true },
-                              selections: { ...prev.selections, [qi]: undefined },
-                            }));
-                          } else {
-                            this.setState(prev => ({
-                              selections: { ...prev.selections, [qi]: opt.label },
-                              otherActive: { ...prev.otherActive, [qi]: false },
-                            }));
-                          }
-                        }}
-                      >
-                        <span className={styles.askRadioDot}>{isSelected ? '◉' : '○'}</span>
-                        {opt.label}
-                        {opt.description && <span className={styles.optionDesc}>— {opt.description}</span>}
-                      </div>
-                    );
-                  })}
-                  {!(q.options || []).some(o => /^other$/i.test(o.label)) && (
-                    <div
-                      className={`${styles.askRadioItem}${otherActive[qi] ? ' ' + styles.askRadioItemSelected : ''}`}
-                      onClick={() => {
+                    const activate = () => {
+                      if (isOtherOpt) {
                         this.setState(prev => ({
                           otherActive: { ...prev.otherActive, [qi]: true },
                           selections: { ...prev.selections, [qi]: undefined },
                         }));
-                      }}
-                    >
-                      <span className={styles.askRadioDot}>{otherActive[qi] ? '◉' : '○'}</span>
-                      {t('ui.askOther')}
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className={styles.askCheckboxGroup}>
-                  {(q.options || []).map((opt, oi) => {
-                    const checked = !!(multiSelections[qi] && multiSelections[qi].has(opt.label));
+                      } else {
+                        this.setState(prev => ({
+                          selections: { ...prev.selections, [qi]: opt.label },
+                          otherActive: { ...prev.otherActive, [qi]: false },
+                        }));
+                      }
+                    };
                     return (
                       <div
                         key={oi}
-                        className={`${styles.askRadioItem}${checked ? ' ' + styles.askRadioItemSelected : ''}`}
-                        onClick={() => {
-                          this.setState(prev => {
-                            const prevSet = prev.multiSelections[qi] || new Set();
-                            const next = new Set(prevSet);
-                            if (next.has(opt.label)) next.delete(opt.label);
-                            else next.add(opt.label);
-                            return {
-                              multiSelections: { ...prev.multiSelections, [qi]: next },
-                              otherActive: { ...prev.otherActive, [qi]: false },
-                            };
-                          });
-                        }}
+                        role="radio"
+                        aria-checked={isSelected}
+                        tabIndex={0}
+                        aria-label={opt.description ? `${opt.label}: ${opt.description}` : opt.label}
+                        className={`${styles.askRadioItem}${isSelected ? ' ' + styles.askRadioItemSelected : ''}`}
+                        onClick={activate}
+                        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); } }}
                       >
-                        <span className={styles.askRadioDot}>{checked ? '☑' : '☐'}</span>
-                        {opt.label}
-                        {opt.description && <span className={styles.optionDesc}>— {opt.description}</span>}
+                        <span className={styles.askRadioDot}>{isSelected ? '◉' : '○'}</span>
+                        <span className={styles.askOptionBody}>
+                          <span className={styles.askOptionLabel}>{opt.label}</span>
+                          {opt.description && <span className={styles.askOptionDesc}>{opt.description}</span>}
+                        </span>
                       </div>
                     );
                   })}
-                  {!(q.options || []).some(o => /^other$/i.test(o.label)) && (
-                    <div
-                      className={`${styles.askRadioItem}${otherActive[qi] ? ' ' + styles.askRadioItemSelected : ''}`}
-                      onClick={() => {
-                        this.setState(prev => ({
-                          otherActive: { ...prev.otherActive, [qi]: true },
-                          multiSelections: { ...prev.multiSelections, [qi]: new Set() },
-                        }));
-                      }}
-                    >
-                      <span className={styles.askRadioDot}>{otherActive[qi] ? '☑' : '☐'}</span>
-                      {t('ui.askOther')}
-                    </div>
-                  )}
+                  {!(q.options || []).some(o => /^other$/i.test(o.label)) && (() => {
+                    const activate = () => {
+                      this.setState(prev => ({
+                        otherActive: { ...prev.otherActive, [qi]: true },
+                        selections: { ...prev.selections, [qi]: undefined },
+                      }));
+                    };
+                    return (
+                      <div
+                        role="radio"
+                        aria-checked={!!otherActive[qi]}
+                        tabIndex={0}
+                        aria-label={t('ui.askOther')}
+                        className={`${styles.askRadioItem}${otherActive[qi] ? ' ' + styles.askRadioItemSelected : ''}`}
+                        onClick={activate}
+                        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); } }}
+                      >
+                        <span className={styles.askRadioDot}>{otherActive[qi] ? '◉' : '○'}</span>
+                        <span className={styles.askOptionBody}>
+                          <span className={styles.askOptionLabel}>{t('ui.askOther')}</span>
+                        </span>
+                      </div>
+                    );
+                  })()}
+                </div>
+              ) : (
+                <div className={styles.askCheckboxGroup} role="group">
+                  {(q.options || []).map((opt, oi) => {
+                    const checked = !!(multiSelections[qi] && multiSelections[qi].has(opt.label));
+                    const activate = () => {
+                      this.setState(prev => {
+                        const prevSet = prev.multiSelections[qi] || new Set();
+                        const next = new Set(prevSet);
+                        if (next.has(opt.label)) next.delete(opt.label);
+                        else next.add(opt.label);
+                        return {
+                          multiSelections: { ...prev.multiSelections, [qi]: next },
+                          otherActive: { ...prev.otherActive, [qi]: false },
+                        };
+                      });
+                    };
+                    return (
+                      <div
+                        key={oi}
+                        role="checkbox"
+                        aria-checked={checked}
+                        tabIndex={0}
+                        aria-label={opt.description ? `${opt.label}: ${opt.description}` : opt.label}
+                        className={`${styles.askRadioItem}${checked ? ' ' + styles.askRadioItemSelected : ''}`}
+                        onClick={activate}
+                        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); } }}
+                      >
+                        <span className={styles.askRadioDot}>{checked ? '☑' : '☐'}</span>
+                        <span className={styles.askOptionBody}>
+                          <span className={styles.askOptionLabel}>{opt.label}</span>
+                          {opt.description && <span className={styles.askOptionDesc}>{opt.description}</span>}
+                        </span>
+                      </div>
+                    );
+                  })}
+                  {!(q.options || []).some(o => /^other$/i.test(o.label)) && (() => {
+                    const activate = () => {
+                      this.setState(prev => ({
+                        otherActive: { ...prev.otherActive, [qi]: true },
+                        multiSelections: { ...prev.multiSelections, [qi]: new Set() },
+                      }));
+                    };
+                    return (
+                      <div
+                        role="checkbox"
+                        aria-checked={!!otherActive[qi]}
+                        tabIndex={0}
+                        aria-label={t('ui.askOther')}
+                        className={`${styles.askRadioItem}${otherActive[qi] ? ' ' + styles.askRadioItemSelected : ''}`}
+                        onClick={activate}
+                        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); } }}
+                      >
+                        <span className={styles.askRadioDot}>{otherActive[qi] ? '☑' : '☐'}</span>
+                        <span className={styles.askOptionBody}>
+                          <span className={styles.askOptionLabel}>{t('ui.askOther')}</span>
+                        </span>
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
 
@@ -195,9 +235,10 @@ export default class AskQuestionForm extends React.Component {
 
           return (
             <div key={qi} className={qi < questions.length - 1 ? styles.questionSpacing : undefined}>
+              {headerAndQuestion}
               {hasPreview ? (
                 <div className={styles.askMarkdownLayout}>
-                  {optionsContent}
+                  {optionsBody}
                   <div className={styles.askMarkdownPreview}>
                     {focusedPreview
                       ? <pre>{focusedPreview}</pre>
@@ -205,7 +246,7 @@ export default class AskQuestionForm extends React.Component {
                     }
                   </div>
                 </div>
-              ) : optionsContent}
+              ) : optionsBody}
             </div>
           );
         })}

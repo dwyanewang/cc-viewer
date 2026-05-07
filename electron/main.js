@@ -8,11 +8,11 @@
  *
  * Each tab = fork('tab-worker.js') → isolated proxy + server + PTY
  */
-import { app, BaseWindow, WebContentsView, Menu, ipcMain, dialog } from 'electron';
+import { app, BaseWindow, WebContentsView, Menu, ipcMain, dialog, Notification } from 'electron';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { dirname, join, basename, delimiter } from 'path';
 import { fork, execSync } from 'child_process';
-import { realpathSync, existsSync, readFileSync, watchFile, unwatchFile } from 'fs';
+import { realpathSync, existsSync, readFileSync, watchFile, unwatchFile, mkdirSync, createWriteStream, readdirSync, statSync, unlinkSync } from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -20,7 +20,7 @@ const rootDir = join(__dirname, '..');
 // Windows 下 import(绝对路径) 会被 Node 把 'c:' 当 URL scheme 拒绝 (ERR_UNSUPPORTED_ESM_URL_SCHEME)。
 // pathToFileURL(p).href 在 POSIX 产出 file:///abs/.. 在 Windows 产出 file:///C:/.. —— 两平台 ESM 等价。
 const { t } = await import(pathToFileURL(join(rootDir, 'i18n.js')).href);
-const { getClaudeConfigDir } = await import(pathToFileURL(join(rootDir, 'findcc.js')).href);
+const { getClaudeConfigDir, LOG_DIR } = await import(pathToFileURL(join(rootDir, 'findcc.js')).href);
 
 // --- Resolve shell environment (Finder-launched Electron has minimal env) ---
 // When launched from Finder/dock, process.env lacks shell profile vars (HTTP_PROXY, PATH, LANG, etc.)
@@ -132,7 +132,9 @@ async function startMgmtServer() {
 }
 
 // --- Tab state ---
-const TAB_BAR_HEIGHT = 36;
+const TAB_BAR_HEIGHT = 60;
+// debug worker 日志保留窗口（CCV_DEBUG_WORKER_LOGS=1 时使用）
+const LOG_RETENTION_MS = 7 * 24 * 3600 * 1000;
 const tabs = new Map(); // tabId -> { child, port, token, projectName, realPath, view, status }
 let nextTabId = 1;
 let activeTabId = null;
@@ -141,6 +143,174 @@ let activeTabId = null;
 let mainWindow = null;
 let tabBarView = null;
 let workspaceView = null;
+
+// --- Pending-approval aggregation across tabs ---
+// pendingByTab: tabId -> { permission?: Map<id,payload>, plan?: Map<id,payload>, ask?: Map<id,payload>, projectName }
+const pendingByTab = new Map();
+// notifiedKeys: dedupe Notification + flashFrame triggers across WS reconnects.
+// Key form: `${tabId}|${kind}|${id}` — cleared when the same tuple goes through pending-remove.
+const notifiedKeys = new Set();
+let _isFlashing = false;
+// 用户偏好：仅窗口失焦时弹通知。默认 true 保留历史行为(失焦才通知)；
+// 关掉后窗口聚焦时也通知。renderer 通过 set-approval-pref IPC 推过来,首次 mount 也会推一次同步初值。
+// 启动时同步从 preferences.json 读初值,消除"默认 true → renderer hydrate 后才生效"的 race window。
+// 读失败/字段缺失则保留 true(向后兼容旧 preferences.json)。
+let _notifyOnlyWhenHidden = true;
+try {
+  const _prefsPath = join(LOG_DIR, 'preferences.json');
+  if (existsSync(_prefsPath)) {
+    const _prefs = JSON.parse(readFileSync(_prefsPath, 'utf-8'));
+    if (_prefs?.approvalModal && typeof _prefs.approvalModal.notifyOnlyWhenHidden === 'boolean') {
+      _notifyOnlyWhenHidden = _prefs.approvalModal.notifyOnlyWhenHidden;
+    }
+  }
+} catch (e) {
+  console.warn('[main] failed to load notifyOnlyWhenHidden from preferences.json:', e?.message || e);
+}
+
+function _kindCount(tabState) {
+  if (!tabState) return 0;
+  // Sum sizes of every Map field; 'projectName' (string) is skipped automatically.
+  let n = 0;
+  for (const k of Object.keys(tabState)) {
+    if (tabState[k] instanceof Map) n += tabState[k].size;
+  }
+  return n;
+}
+
+function _totalPendingCount() {
+  let total = 0;
+  for (const tabState of pendingByTab.values()) total += _kindCount(tabState);
+  return total;
+}
+
+function broadcastApproval() {
+  // Send aggregated state to every tab content view so they can render chips and route jumps.
+  const others = [];
+  for (const [tabId, st] of pendingByTab) {
+    const count = _kindCount(st);
+    if (count > 0) others.push({ tabId, projectName: st.projectName || '', count });
+  }
+  for (const [tabId, t] of tabs) {
+    if (!t.view || t.view.webContents.isDestroyed()) continue;
+    const ownState = pendingByTab.get(tabId);
+    const ownPending = ownState ? {
+      ptyPlan: ownState.ptyPlan ? [...ownState.ptyPlan.entries()].map(([id, p]) => ({ id, ...p })) : [],
+      ask: ownState.ask ? [...ownState.ask.entries()].map(([id, p]) => ({ id, ...p })) : [],
+    } : { ptyPlan: [], ask: [] };
+    const otherTabs = others.filter(o => o.tabId !== tabId);
+    try { t.view.webContents.send('approval-broadcast', { ownTabId: tabId, ownPending, others: otherTabs }); } catch {}
+  }
+}
+
+function aggregateApproval() {
+  const total = _totalPendingCount();
+  // Dock badge / Windows taskbar overlay
+  try { app.setBadgeCount(total); } catch {}
+  // flashFrame transitions: 0→≥1 start; ≥1→0 stop. Window focus also stops (handled in mainWindow.on('focus'))
+  if (total > 0 && !_isFlashing) {
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isFocused()) {
+      try { mainWindow.flashFrame(true); _isFlashing = true; } catch {}
+    }
+  } else if (total === 0 && _isFlashing) {
+    if (mainWindow && !mainWindow.isDestroyed()) try { mainWindow.flashFrame(false); } catch {}
+    _isFlashing = false;
+  }
+  broadcastApproval();
+}
+
+function maybeNotify(tabId, kind, id, payload) {
+  const key = `${tabId}|${kind}|${id}`;
+  if (notifiedKeys.has(key)) return; // dedupe across reconnects
+  notifiedKeys.add(key);
+  // 受 _notifyOnlyWhenHidden(用户偏好)控制:开启时窗口聚焦则不通知;关掉后聚焦也通知。
+  if (_notifyOnlyWhenHidden && mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()) return;
+  const projectName = payload?.projectName || pendingByTab.get(tabId)?.projectName || 'CC Viewer';
+  // i18n with safe fallback: t() returns the key itself when missing — detect that and substitute defaults.
+  const _tr = (key, params, fallback) => {
+    try {
+      const r = t(key, params);
+      return (r && r !== key) ? r : fallback;
+    } catch { return fallback; }
+  };
+  let title = '';
+  let body = '';
+  if (kind === 'ask') {
+    title = _tr('electron.approval.notify.title.ask', null, 'Question');
+    body = _tr('electron.approval.notify.body.ask', { project: projectName }, `Question in ${projectName}`);
+  } else if (kind === 'ptyPlan') {
+    title = _tr('electron.approval.notify.title.ptyPlan', null, 'Plan review');
+    body = _tr('electron.approval.notify.body.ptyPlan', { project: projectName }, `Plan in ${projectName}`);
+  }
+  // Defensive: unknown kind (e.g. stale message after rollback) → drop silently rather than show empty notification.
+  if (!title) return;
+  if (!Notification.isSupported || !Notification.isSupported()) return;
+  try {
+    const n = new Notification({ title, body, silent: false });
+    n.on('click', () => {
+      try {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          if (mainWindow.isMinimized()) mainWindow.restore();
+          if (process.platform === 'darwin' && app.dock) try { app.dock.show(); } catch {}
+          if (typeof app.show === 'function') try { app.show(); } catch {}
+          mainWindow.show();
+          mainWindow.focus();
+        }
+      } catch {}
+      try { switchTab(tabId); } catch {}
+    });
+    n.show();
+  } catch {}
+}
+
+function recordPendingAdd(tabId, kind, id, payload) {
+  if (!pendingByTab.has(tabId)) pendingByTab.set(tabId, { projectName: payload?.projectName || '' });
+  const tabState = pendingByTab.get(tabId);
+  if (payload?.projectName) tabState.projectName = payload.projectName;
+  if (!tabState[kind]) tabState[kind] = new Map();
+  if (tabState[kind].has(id)) {
+    // 占位 id `__ask__` 在 PTY hook 复用 — 比对 payload 决定是 WS 重连重发（dedupe）
+    // 还是新一轮 ask（替换 + 清 notifiedKey 让重新弹通知）。其它 id 直接 dedupe。
+    if (id === '__ask__') {
+      const prev = tabState[kind].get(id);
+      const sameContent = JSON.stringify(prev?.questions || null) === JSON.stringify(payload?.questions || null);
+      if (sameContent) return;
+      notifiedKeys.delete(`${tabId}|${kind}|${id}`);
+    } else {
+      return;
+    }
+  }
+  tabState[kind].set(id, payload || {});
+  maybeNotify(tabId, kind, id, payload);
+  aggregateApproval();
+}
+
+function recordPendingRemove(tabId, kind, id) {
+  const tabState = pendingByTab.get(tabId);
+  if (!tabState) { aggregateApproval(); return; }
+  const sub = tabState[kind];
+  if (sub) sub.delete(id);
+  notifiedKeys.delete(`${tabId}|${kind}|${id}`);
+  // Cleanup empty submaps to keep state lean — generic so new kinds (ptyPlan, etc.) are handled
+  // without per-kind branching. 'projectName' is a string, not a Map, so it's correctly skipped.
+  for (const k of Object.keys(tabState)) {
+    if (tabState[k] instanceof Map && tabState[k].size === 0) delete tabState[k];
+  }
+  if (_kindCount(tabState) === 0) {
+    pendingByTab.delete(tabId);
+  }
+  aggregateApproval();
+}
+
+function clearPendingForTab(tabId) {
+  if (pendingByTab.delete(tabId)) {
+    // Also clear any notifiedKeys belonging to this tab
+    for (const k of [...notifiedKeys]) {
+      if (k.startsWith(`${tabId}|`)) notifiedKeys.delete(k);
+    }
+    aggregateApproval();
+  }
+}
 
 function getTabList() {
   return [...tabs.entries()].map(([id, t]) => ({
@@ -208,12 +378,42 @@ function createTab(projectPath, extraArgs = []) {
   delete childEnv.ANTHROPIC_BASE_URL;
   childEnv.CCV_PROJECT_DIR = realPath;
 
+  // worker stdio：默认 inherit（行为与原版一致，零 IO 开销）；
+  // CCV_DEBUG_WORKER_LOGS=1 时切到 pipe + 写文件（便于排查打包后从 Finder 启动的问题）
+  // — Finder 启动 .app 时 inherit 等于丢弃 worker 输出，开关打开后日志落到
+  //   ${CCV_LOG_DIR || ~/.claude/cc-viewer}/electron-debug-{ts}-tab{N}.log，自动清理 7 天前旧文件
+  const _debugWorkerLogs = process.env.CCV_DEBUG_WORKER_LOGS === '1';
+  let _logStream = null;
+  if (_debugWorkerLogs) {
+    const _logDir = process.env.CCV_LOG_DIR || join(home, '.claude', 'cc-viewer');
+    try { mkdirSync(_logDir, { recursive: true }); } catch (err) { console.error('[Electron] mkdir log dir failed:', err.message); }
+    try {
+      const cutoff = Date.now() - LOG_RETENTION_MS;
+      for (const f of readdirSync(_logDir)) {
+        if (!f.startsWith('electron-debug-') || !f.endsWith('.log')) continue;
+        const fp = join(_logDir, f);
+        if (statSync(fp).mtimeMs < cutoff) unlinkSync(fp);
+      }
+    } catch (err) { console.error('[Electron] cleanup old debug logs failed:', err.message); }
+    const _logPath = join(_logDir, `electron-debug-${Date.now()}-tab${tabId}.log`);
+    _logStream = createWriteStream(_logPath, { flags: 'a' });
+    console.error(`[Electron] tab ${tabId} debug log → ${_logPath}`);
+  }
+
   const child = fork(join(__dirname, 'tab-worker.js'), [], {
     execPath: _nodePath,
     cwd: realPath,
     env: childEnv,
-    stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+    stdio: _debugWorkerLogs
+      ? ['ignore', 'pipe', 'pipe', 'ipc']
+      : ['inherit', 'inherit', 'inherit', 'ipc'],
+    silent: _debugWorkerLogs,
   });
+  if (_logStream) {
+    child.stdout?.pipe(_logStream, { end: false });
+    child.stderr?.pipe(_logStream, { end: false });
+    child.on('exit', () => { try { _logStream.end(); } catch {} });
+  }
 
   tabs.get(tabId).child = child;
 
@@ -238,11 +438,23 @@ function createTab(projectPath, extraArgs = []) {
 
       // Create WebContentsView (don't add to content yet — switchTab will manage it)
       const view = new WebContentsView({
-        webPreferences: { nodeIntegration: false, contextIsolation: true },
+        webPreferences: {
+          nodeIntegration: false,
+          contextIsolation: true,
+          preload: join(__dirname, 'tab-content-preload.js'),
+          autoplayPolicy: 'no-user-gesture-required',
+        },
       });
       const url = `http://127.0.0.1:${msg.port}${msg.token ? `?token=${msg.token}` : ''}`;
       view.webContents.loadURL(url);
       tab.view = view;
+
+      // Push tabId so the renderer can self-identify in approval-broadcast routing.
+      view.webContents.once('did-finish-load', () => {
+        try { view.webContents.send('tab-id-init', tabId); } catch {}
+        // Also send any current aggregated approval state so a reload doesn't lose context.
+        broadcastApproval();
+      });
 
       switchTab(tabId);
       broadcastTabs();
@@ -250,11 +462,18 @@ function createTab(projectPath, extraArgs = []) {
     if (msg.type === 'pty-exit') {
       const tab = tabs.get(tabId);
       if (tab) { tab.status = 'exited'; broadcastTabs(); }
+      clearPendingForTab(tabId);
     }
     if (msg.type === 'error') {
       clearTimeout(timeout);
       const tab = tabs.get(tabId);
       if (tab) { tab.status = 'error'; broadcastTabs(); }
+    }
+    // Pending state changes bubbled up by tab-worker's server.js (see _notifyParentPending).
+    if (msg.type === 'pending-add' && msg.kind && msg.id != null) {
+      recordPendingAdd(tabId, msg.kind, String(msg.id), msg.payload);
+    } else if (msg.type === 'pending-remove' && msg.kind && msg.id != null) {
+      recordPendingRemove(tabId, msg.kind, String(msg.id));
     }
   });
 
@@ -265,6 +484,7 @@ function createTab(projectPath, extraArgs = []) {
       tab.status = 'error';
       broadcastTabs();
     }
+    clearPendingForTab(tabId);
   });
 
   // Send launch command
@@ -352,6 +572,7 @@ async function closeTab(tabId) {
   }
 
   tabs.delete(tabId);
+  clearPendingForTab(tabId);
 
   // Switch to another tab or show workspace
   if (tabs.size > 0) {
@@ -372,6 +593,7 @@ function showWorkspaceSelector() {
         nodeIntegration: false,
         contextIsolation: true,
         preload: join(__dirname, 'workspace-preload.js'),
+        autoplayPolicy: 'no-user-gesture-required',
       },
     });
     const token = mgmtServerMod.getAccessToken();
@@ -405,6 +627,57 @@ ipcMain.on('tab-new', () => showWorkspaceSelector());
 ipcMain.on('workspace-launch', (_, data) => {
   console.log('[main] workspace-launch IPC:', data);
   createTab(data.path, data.extraArgs);
+});
+ipcMain.on('approval-jump', (_, tabId) => {
+  if (tabId != null && tabs.has(tabId)) switchTab(tabId);
+});
+
+// Resolve sender's tabId by reverse-scanning the tabs Map. O(n) but n is small (<10).
+// Used for PTY plan IPC where the sender (chat WebContentsView) is the authority on which tab
+// owns the message. Falls back to client-supplied tabId if reverse lookup fails (e.g. early init).
+function _resolveSenderTabId(sender) {
+  if (!sender) return null;
+  for (const [id, t] of tabs) {
+    if (t.view && t.view.webContents === sender) return id;
+  }
+  return null;
+}
+
+ipcMain.on('pty-plan-pending', (event, msg) => {
+  if (!msg || msg.id == null) return;
+  const tabId = _resolveSenderTabId(event.sender) ?? (msg.tabId ?? null);
+  if (tabId == null) return;
+  recordPendingAdd(tabId, 'ptyPlan', String(msg.id), msg.payload || {});
+});
+
+ipcMain.on('pty-plan-resolved', (event, msg) => {
+  if (!msg || msg.id == null) return;
+  const tabId = _resolveSenderTabId(event.sender) ?? (msg.tabId ?? null);
+  if (tabId == null) return;
+  recordPendingRemove(tabId, 'ptyPlan', String(msg.id));
+});
+
+// 渲染端兜底：WS 断连 / ChatView unmount 时 server 不一定推 ask-hook-resolved，
+// renderer 通过该 IPC 让 main 同步清 pendingByTab[tabId].ask。
+// 与 server.js 的 ask-hook-resolved/sdk-ask-resolved 路径并行；recordPendingRemove 对不存在的 id 是 no-op，重复调用安全。
+ipcMain.on('ask-resolved', (event, msg) => {
+  if (!msg || msg.id == null) return;
+  const tabId = _resolveSenderTabId(event.sender) ?? (msg.tabId ?? null);
+  if (tabId == null) return;
+  recordPendingRemove(tabId, 'ask', String(msg.id));
+});
+
+// Renderer 同步用户偏好(目前仅 notifyOnlyWhenHidden 影响 main 进程的通知行为;
+// 其他字段如 modalEnabled / soundEnabled 仅在 renderer 内消费,这里 forward-compatible 接收但不使用)。
+// 任何 tab 改了都会推同一份(prefs 全局共享单一 preferences.json),最后一次 win;无 tab 隔离需求。
+ipcMain.on('set-approval-pref', (event, prefs) => {
+  // 防御加固:contextIsolation 已经隔离了 renderer/main world,这里再校验 sender 还在/未销毁,
+  // 避免 webview tab 销毁后的延迟事件继续修改全局偏好。
+  if (!event.sender || event.sender.isDestroyed()) return;
+  if (!prefs || typeof prefs !== 'object') return;
+  if (typeof prefs.notifyOnlyWhenHidden === 'boolean') {
+    _notifyOnlyWhenHidden = prefs.notifyOnlyWhenHidden;
+  }
 });
 
 // --- Cleanup ---
@@ -578,6 +851,7 @@ if (!gotLock) {
       minHeight: 600,
       title: 'CC Viewer',
       titleBarStyle: 'hiddenInset',
+      trafficLightPosition: { x: 16, y: 22 },
     });
 
     // Tab bar
@@ -586,10 +860,19 @@ if (!gotLock) {
         nodeIntegration: false,
         contextIsolation: true,
         preload: join(__dirname, 'tab-preload.js'),
+        autoplayPolicy: 'no-user-gesture-required',
       },
     });
     tabBarView.webContents.loadFile(join(__dirname, 'tab-bar.html'));
     mainWindow.contentView.addChildView(tabBarView);
+
+    // When the user brings the window back to focus, stop the taskbar/dock flash and clear notifications already opened on screen.
+    mainWindow.on('focus', () => {
+      if (_isFlashing) {
+        try { mainWindow.flashFrame(false); } catch {}
+        _isFlashing = false;
+      }
+    });
 
     // Show workspace selector
     showWorkspaceSelector();

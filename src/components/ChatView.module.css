@@ -277,6 +277,10 @@
 .terminalPanelWrap {
   flex-shrink: 0;
   min-width: 200px;
+  /* min-height:0 + overflow:hidden 阻断 xterm rows × charHeight 撑大 flex 链；
+     移除任一都可能让特定窗口高度下 footer toolbar 被 xterm 渲染层遮挡 */
+  min-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
 }

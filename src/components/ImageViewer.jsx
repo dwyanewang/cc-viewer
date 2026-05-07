@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import DOMPurify from 'dompurify';
 import { t as i18n } from '../i18n';
 import { apiUrl } from '../utils/apiUrl';
+import { sanitizeSvg } from '../utils/svgSanitize';
 import styles from './ImageViewer.module.css';
 
 function formatFileSize(bytes) {
@@ -33,7 +33,7 @@ export default function ImageViewer({ filePath, onClose, editorSession }) {
     if (!isSvg) { setSvgContent(null); return; }
     setLoading(true);
     fetch(imgSrc).then(r => r.text()).then(text => {
-      setSvgContent(DOMPurify.sanitize(text, { USE_PROFILES: { svg: true } }));
+      setSvgContent(sanitizeSvg(text));
       // SVG viewBox 通常很小（如 24x24），用合理的渲染基准尺寸避免 fitToWindow 过度放大
       const vb = text.match(/viewBox=["']([^"']+)["']/);
       const vbW = vb ? (vb[1].split(/[\s,]+/).map(Number)[2] || 24) : 24;
@@ -45,10 +45,24 @@ export default function ImageViewer({ filePath, onClose, editorSession }) {
     }).catch(() => { setError('Failed to load SVG'); setLoading(false); });
   }, [isSvg, imgSrc]);
 
-  // Fetch file size
+  // Fetch file size + 校验访问权限。HEAD 失败时再发 GET 拿 JSON reason,显示具体原因。
   useEffect(() => {
     fetch(imgSrc, { method: 'HEAD' })
       .then(r => {
+        if (!r.ok) {
+          // 403 sensitive / 404 not found 等:再发 GET 取详细 reason 显示给用户
+          fetch(imgSrc).then(rr => rr.json()).then(err => {
+            const reasonMsg = err && err.reason
+              ? (i18n(`ui.fileLoadError.reason.${err.reason}`) || err.error)
+              : (err && err.error) || `HTTP ${r.status}`;
+            setError(reasonMsg);
+            setLoading(false);
+          }).catch(() => {
+            setError(`HTTP ${r.status}`);
+            setLoading(false);
+          });
+          return;
+        }
         const len = r.headers.get('content-length');
         if (len) setFileSize(parseInt(len, 10));
       })

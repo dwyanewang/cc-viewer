@@ -1,3 +1,8 @@
+// ============================================================================
+// 主 terminal 组件 —— 渲染 Claude Code TUI 的"大 terminal"
+// 工具栏下方的"小/scratch terminal"是另外一个独立组件，见 ScratchTerminal.jsx
+// CSS：主 terminal 用 .terminalContainer + .terminalHost；scratch 用 .scratchInner + .scratchHost
+// ============================================================================
 import React from 'react';
 import { message, Tooltip, Popover, Popconfirm, Button, Checkbox, Modal } from 'antd';
 import { Terminal } from '@xterm/xterm';
@@ -8,34 +13,115 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
 import { t } from '../i18n';
 import { tc, getClaudeConfigDir } from '../utils/tClaude';
+import { TerminalWsContext } from './TerminalWsContext';
 import { apiUrl } from '../utils/apiUrl';
 import { isMobile, isIOS, isPad } from '../env';
 import styles from './TerminalPanel.module.css';
 import { BUILTIN_PRESETS } from '../utils/builtinPresets.js';
 import { buildLocalUltraplan } from '../utils/ultraplanTemplates';
-import { getModelMaxTokens } from '../utils/helpers';
+import { buildBracketPasteSubmitChunks, BRACKET_PASTE_SUBMIT_SETTLE_MS } from '../utils/ptyChunkBuilder';
 import ConceptHelp from './ConceptHelp';
 import CustomUltraplanEditModal from './CustomUltraplanEditModal';
+import { TerminalWriteQueue } from '../utils/terminalWriteQueue';
 import ImageLightbox from './ImageLightbox';
 import ConfirmRemoveButton from './ConfirmRemoveButton';
+import ScratchTerminal from './ScratchTerminal';
+import { darkTerminalTheme, lightTerminalTheme } from './terminalThemes';
 import { resizeImageIfNeeded } from '../utils/imageResize';
 
-const darkTerminalTheme = {
-  background: '#0a0a0a', foreground: '#d4d4d4', cursor: '#0a0a0a',
-  selectionBackground: '#264f78',
-  black: '#000000', red: '#ef4444', green: '#73c991', yellow: '#fbbf24',
-  blue: '#3b82f6', magenta: '#d946ef', cyan: '#06b6d4', white: '#e5e5e5',
-  brightBlack: '#666666', brightRed: '#ff7b7b', brightGreen: '#9ddc6f', brightYellow: '#ffce5b',
-  brightBlue: '#66b3ff', brightMagenta: '#e88ce8', brightCyan: '#7eddd9', brightWhite: '#ffffff',
-};
-const lightTerminalTheme = {
-  background: '#ffffff', foreground: '#333333', cursor: '#333333',
-  selectionBackground: '#cce5ff',
-  black: '#000000', red: '#CD3131', green: '#107C10', yellow: '#949800',
-  blue: '#0451A5', magenta: '#BC05BC', cyan: '#0598BC', white: '#555555',
-  brightBlack: '#666666', brightRed: '#CD3131', brightGreen: '#14CE14', brightYellow: '#B5BA00',
-  brightBlue: '#0451A5', brightMagenta: '#BC05BC', brightCyan: '#0598BC', brightWhite: '#A5A5A5',
-};
+const SCRATCH_OPEN_KEY = 'cc-viewer-scratch-open';
+const SCRATCH_HEIGHT_KEY = 'cc-viewer-scratch-height';
+const SCRATCH_TABS_KEY = 'cc-viewer-scratch-tabs';
+const SCRATCH_ACTIVE_TAB_KEY = 'cc-viewer-scratch-active-tab';
+// 注：.scratchWrap 用 outline + outline-offset:-4px 画 focus 环（不占布局），存储/clamp 的高度
+// 即可见高度本身，不再被边框吞噬；fitAddon 自动 refit，与历史 session 存储值兼容。
+const SCRATCH_HEIGHT_MIN = 100;
+const SCRATCH_HEIGHT_MAX = 600;
+const SCRATCH_HEIGHT_DEFAULT = 200;
+const SCRATCH_TAB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const SCRATCH_TAB_MAX = 8;
+
+function readScratchOpen() {
+  try { return localStorage.getItem(SCRATCH_OPEN_KEY) === 'true'; } catch { return false; }
+}
+function readScratchHeight() {
+  try {
+    const v = parseInt(localStorage.getItem(SCRATCH_HEIGHT_KEY), 10);
+    if (!Number.isFinite(v)) return SCRATCH_HEIGHT_DEFAULT;
+    return Math.max(SCRATCH_HEIGHT_MIN, Math.min(SCRATCH_HEIGHT_MAX, v));
+  } catch { return SCRATCH_HEIGHT_DEFAULT; }
+}
+
+function genScratchTabId() {
+  // 与服务端 SCRATCH_ID_RE `/^[A-Za-z0-9_-]{1,64}$/` 兼容
+  const rand = (typeof crypto !== 'undefined' && crypto.randomUUID)
+    ? crypto.randomUUID().replace(/-/g, '')
+    : Math.random().toString(36).slice(2) + Date.now().toString(36);
+  return ('t-' + rand).slice(0, 64);
+}
+
+function readScratchTabs() {
+  try {
+    const raw = localStorage.getItem(SCRATCH_TABS_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    const out = [];
+    for (const t of arr) {
+      if (t && typeof t.id === 'string' && SCRATCH_TAB_ID_RE.test(t.id)) {
+        out.push({ id: t.id });
+        if (out.length >= SCRATCH_TAB_MAX) break;
+      }
+    }
+    return out;
+  } catch { return []; }
+}
+
+function readScratchActiveTab(tabs) {
+  try {
+    const v = localStorage.getItem(SCRATCH_ACTIVE_TAB_KEY);
+    if (v && tabs.some(t => t.id === v)) return v;
+  } catch {}
+  return tabs[0]?.id ?? '';
+}
+
+function writeScratchTabs(tabs) {
+  try { localStorage.setItem(SCRATCH_TABS_KEY, JSON.stringify(tabs)); } catch {}
+}
+function writeScratchActiveTab(id) {
+  try { localStorage.setItem(SCRATCH_ACTIVE_TAB_KEY, id); } catch {}
+}
+
+// 真实 $SHELL basename 由后端 WS state 消息上报后填进 state.scratchShellBasename，
+// 在拿到之前用 'zsh' 作为占位（macOS 默认 shell；新 server 到达 state 后会按真实 basename 覆盖）
+
+function PlusIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="12" y1="5" x2="12" y2="19" />
+      <line x1="5" y1="12" x2="19" y2="12" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="18" y1="6" x2="6" y2="18" />
+      <line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+  );
+}
+
+function ScratchTerminalIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <polyline points="7 9 10 12 7 15" />
+      <line x1="13" y1="15" x2="17" y2="15" />
+    </svg>
+  );
+}
 
 // 虚拟按键定义：label 显示文字，seq 为发送到终端的转义序列
 const VIRTUAL_KEYS = [
@@ -108,13 +194,33 @@ export async function uploadFileAndGetPath(file) {
 }
 
 class TerminalPanel extends React.Component {
+  // 通过 Context 共享 App 层的单条 /ws/terminal,this.context = { send, isOpen, addMessageHandler, addStateListener }
+  static contextType = TerminalWsContext;
+
+  // 兼容 stub:同 ChatView,getter 模拟旧 this.ws 的 send/readyState API → 映射到 context。
+  // 这样所有 `this.ws.send(JSON.stringify(...))` 和 `this.ws.readyState === WebSocket.OPEN` 不用改。
+  get ws() {
+    const ctx = this.context;
+    if (!ctx || typeof ctx.send !== 'function') return null;
+    return {
+      get readyState() { return ctx.isOpen && ctx.isOpen() ? WebSocket.OPEN : WebSocket.CLOSED; },
+      send: (s) => {
+        let obj;
+        try { obj = JSON.parse(s); } catch { return false; }
+        return ctx.send(obj);
+      },
+    };
+  }
+
   constructor(props) {
     super(props);
     this.containerRef = React.createRef();
     this.fileInputRef = React.createRef();
     this.terminal = null;
     this.fitAddon = null;
-    this.ws = null;
+    // ws 现在是 getter(挂在原型),不在 constructor 上设字段,避免覆盖 getter
+    this._unsubWsHandler = null;
+    this._unsubWsState = null;
     this.resizeObserver = null;
     this.state = {
       terminalFocused: false,
@@ -137,21 +243,187 @@ class TerminalPanel extends React.Component {
       lightbox: null,
       ultraplanLightbox: null,
       ultraplanConfirming: false,
+      scratchOpen: readScratchOpen(),
+      scratchHeight: readScratchHeight(),
+      isDraggingScratch: false,
+      scratchFocused: false,
+      scratchTabs: (() => {
+        const t = readScratchTabs();
+        return t.length > 0 ? t : [{ id: genScratchTabId() }];
+      })(),
+      activeScratchTabId: '',
+      scratchShellBasename: '',
     };
+    // 持久化 active id（先用 readScratchActiveTab 选；下面 mount 后再 sync 到 localStorage）
+    this.state.activeScratchTabId = readScratchActiveTab(this.state.scratchTabs);
+    this._scratchWrapRef = React.createRef();
+    this._scratchRefs = new Map(); // id -> React.createRef()
+    this._scratchDragging = false;
+    this._scratchDragLastH = null;
+    this._scratchPointerId = null;
   }
+
+  _getScratchRef(id) {
+    let ref = this._scratchRefs.get(id);
+    if (!ref) {
+      ref = React.createRef();
+      this._scratchRefs.set(id, ref);
+    }
+    return ref;
+  }
+
+  handleScratchTabClick = (id) => {
+    if (id === this.state.activeScratchTabId) return;
+    this.setState({ activeScratchTabId: id }, () => {
+      writeScratchActiveTab(id);
+      const r = this._scratchRefs.get(id);
+      if (r?.current) {
+        r.current.refit();
+        r.current.focus();
+      }
+    });
+  };
+
+  handleScratchTabAdd = () => {
+    if (this.state.scratchTabs.length >= SCRATCH_TAB_MAX) return;
+    const newId = genScratchTabId();
+    const tabs = [...this.state.scratchTabs, { id: newId }];
+    this.setState({ scratchTabs: tabs, activeScratchTabId: newId }, () => {
+      writeScratchTabs(tabs);
+      writeScratchActiveTab(newId);
+      // 等下一帧 ScratchTerminal mount + 显示后再 refit/focus
+      Promise.resolve().then(() => {
+        const r = this._scratchRefs.get(newId);
+        r?.current?.refit();
+        r?.current?.focus();
+      });
+    });
+  };
+
+  handleScratchTabClose = (id, e) => {
+    if (e) { e.stopPropagation(); e.preventDefault(); }
+    if (this.state.scratchTabs.length <= 1) return; // 最少保留 1
+    const ref = this._scratchRefs.get(id);
+    try { ref?.current?.requestKill(); } catch {}
+    this._scratchRefs.delete(id);
+    const idx = this.state.scratchTabs.findIndex(t => t.id === id);
+    const tabs = this.state.scratchTabs.filter(t => t.id !== id);
+    let active = this.state.activeScratchTabId;
+    if (active === id) {
+      // 取右邻居，否则左邻居
+      active = (this.state.scratchTabs[idx + 1] ?? this.state.scratchTabs[idx - 1])?.id ?? tabs[0]?.id ?? '';
+    }
+    this.setState({ scratchTabs: tabs, activeScratchTabId: active }, () => {
+      writeScratchTabs(tabs);
+      writeScratchActiveTab(active);
+      if (active) {
+        const r = this._scratchRefs.get(active);
+        r?.current?.refit();
+        r?.current?.focus();
+      }
+    });
+  };
+
+  // 仅 active tab 的 focus/blur 事件影响 scratchFocused，避免 tab 切换时新旧并发触发抖动
+  handleScratchTabFocusChange = (id, focused) => {
+    if (id !== this.state.activeScratchTabId) return;
+    if (focused !== this.state.scratchFocused) {
+      this.setState({ scratchFocused: focused });
+    }
+  };
+
+  // 后端首条 state 消息携带 shellBasename；所有 tab 共用一个 $SHELL，只需取第一次到达的
+  handleScratchShellInfo = (name) => {
+    if (!name || this.state.scratchShellBasename) return;
+    this.setState({ scratchShellBasename: name });
+  };
+
+  toggleScratch = () => {
+    const next = !this.state.scratchOpen;
+    this.setState({ scratchOpen: next });
+    try { localStorage.setItem(SCRATCH_OPEN_KEY, String(next)); } catch {}
+  };
+
+  // 用 DOM 直写 style.height 而非 React JSX inline style：
+  // 1) 防 theme MutationObserver / preset-changed 等无关 setState 在拖拽中途把高度 snap 回去
+  // 2) 拖拽期间每帧 setState 抖动开销大；mouseup 时一次性 setState + localStorage 提交
+  _applyScratchHeight = () => {
+    const el = this._scratchWrapRef.current;
+    if (el) el.style.height = this.state.scratchHeight + 'px';
+  };
+
+  // Pointer Events + setPointerCapture：自动覆盖 mouseup 飞出窗口、iPad 触摸；不挂 document 全局监听
+  handleScratchResizerPointerDown = (e) => {
+    if (e.button !== undefined && e.button !== 0) return; // 仅主键
+    e.preventDefault();
+    this._scratchDragging = true;
+    this._scratchDragStartY = e.clientY;
+    this._scratchDragStartH = this.state.scratchHeight;
+    this._scratchDragLastH = this.state.scratchHeight;
+    this._scratchPointerId = e.pointerId;
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+    this.setState({ isDraggingScratch: true });
+  };
+
+  handleScratchResizerPointerMove = (e) => {
+    if (!this._scratchDragging) return;
+    const newH = Math.max(
+      SCRATCH_HEIGHT_MIN,
+      Math.min(SCRATCH_HEIGHT_MAX, this._scratchDragStartH + (this._scratchDragStartY - e.clientY))
+    );
+    const el = this._scratchWrapRef.current;
+    if (!el) return;
+    el.style.height = newH + 'px';
+    this._scratchDragLastH = newH;
+  };
+
+  handleScratchResizerPointerUp = (e) => {
+    if (!this._scratchDragging) return;
+    this._endScratchDrag(e);
+  };
+
+  _endScratchDrag = (e) => {
+    this._scratchDragging = false;
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    if (e && this._scratchPointerId != null && e.currentTarget) {
+      try { e.currentTarget.releasePointerCapture(this._scratchPointerId); } catch {}
+    }
+    this._scratchPointerId = null;
+    const h = this._scratchDragLastH;
+    this._scratchDragLastH = null;
+    if (h != null) {
+      try { localStorage.setItem(SCRATCH_HEIGHT_KEY, String(h)); } catch {}
+      this.setState({ scratchHeight: h, isDraggingScratch: false });
+    } else {
+      this.setState({ isDraggingScratch: false });
+    }
+  };
 
   componentDidMount() {
     this.initTerminal();
-    this.connectWebSocket();
+    // 注册 ws 消息 + 状态 handler。Provider 已在 App/Mobile 层根据 cliMode/terminalVisible 决定是否建立 ws。
+    if (this.context && this.context.addMessageHandler) {
+      this._unsubWsHandler = this.context.addMessageHandler(this._onTerminalWsMessage);
+    }
+    if (this.context && this.context.addStateListener) {
+      this._unsubWsState = this.context.addStateListener(this._onTerminalWsState);
+    }
+    // 若 ws 已 OPEN(本组件 mount 较 Provider 晚的常见场景),立即 sendResize 让 PTY 用当前 cols/rows。
+    if (this.context && this.context.isOpen && this.context.isOpen()) {
+      this.sendResize();
+    }
     this.setupResizeObserver();
-    // 读取 claude settings 判断 Agent Team 是否可用
-    fetch(apiUrl('/api/claude-settings')).then(r => r.json()).then(data => {
-      const enabled = data?.env?.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === '1';
+    // claude-settings 由 SettingsContext 集中提供;通过 props 派生 agentTeamEnabled,
+    // mount 时若已 ready 同步 setState,否则等 componentDidUpdate 接力。
+    if (this.props.claudeSettings) {
+      const enabled = this.props.claudeSettings?.env?.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === '1';
       this.setState({ agentTeamEnabled: enabled });
-    }).catch(() => {});
+    }
+    // 加载预置 (props.preferences 已 ready 时立即,否则 componentDidUpdate 接力)
     this._loadPresetShortcuts();
-    this._onPresetsChanged = () => this._loadPresetShortcuts();
-    window.addEventListener('ccv-presets-changed', this._onPresetsChanged);
     this._onFocusTerminal = () => { if (this.terminal && this.containerRef?.current?.offsetWidth > 0) this.terminal.focus(); };
     window.addEventListener('ccv-focus-terminal', this._onFocusTerminal);
     this._themeObserver = new MutationObserver(() => {
@@ -161,60 +433,104 @@ class TerminalPanel extends React.Component {
       }
     });
     this._themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    if (this.state.scratchOpen) this._applyScratchHeight();
+    // mount 时 sync tab 列表 / active id 到 localStorage（兼容旧版本只有 open/height 的存档）
+    writeScratchTabs(this.state.scratchTabs);
+    if (this.state.activeScratchTabId) writeScratchActiveTab(this.state.activeScratchTabId);
+  }
+
+  componentDidUpdate(prevProps, prevState) {
+    // SettingsContext 异步 fetch 完成后,props.claudeSettings / props.preferences 才到达;
+    // 同步派生的 agentTeamEnabled 与 _loadPresetShortcuts 都在这里接力。
+    if (prevProps.claudeSettings !== this.props.claudeSettings) {
+      const enabled = this.props.claudeSettings?.env?.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === '1';
+      if (enabled !== this.state.agentTeamEnabled) {
+        this.setState({ agentTeamEnabled: enabled });
+      }
+    }
+    if (prevProps.preferences !== this.props.preferences) {
+      this._loadPresetShortcuts();
+    }
+    if (prevState.scratchOpen !== this.state.scratchOpen) {
+      if (this.state.scratchOpen) {
+        // componentDidUpdate 在 React commit 之后、浏览器 paint 之前同步触发，
+        // 此时 ref.current 已是最新 DOM；直接写 style.height，不走 microtask 防 1 帧闪烁
+        this._applyScratchHeight();
+      } else if (this._scratchDragging) {
+        // 拖拽过程中 scratchOpen 被外部翻 false：resizer 已卸载、pointerup 不会再触达，
+        // 这里兜底恢复 body 样式与拖拽标志，防止 cursor/userSelect 残留
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+        this._scratchDragging = false;
+        this._scratchDragLastH = null;
+        this._scratchPointerId = null;
+        this.setState({ isDraggingScratch: false });
+      }
+    }
   }
 
   _loadPresetShortcuts() {
-    // 读取预置快捷方式（兼容旧版 string[] 和新版 {teamName, description}[]），合并内置预置
-    fetch(apiUrl('/api/preferences')).then(r => r.json()).then(data => {
-      const dismissed = Array.isArray(data.dismissedBuiltinPresets) ? new Set(data.dismissedBuiltinPresets) : new Set();
-      this._dismissedBuiltinPresets = dismissed;
-      let items = [];
-      if (Array.isArray(data.presetShortcuts)) {
-        items = data.presetShortcuts.map((item, i) => {
-          if (typeof item === 'string') return { id: Date.now() + i, teamName: '', description: item };
-          return {
-            id: Date.now() + i,
-            teamName: item.teamName || '',
-            description: item.description || '',
-            ...(item.builtinId ? { builtinId: item.builtinId } : {}),
-            ...(item.modified ? { modified: true } : {}),
-          };
-        });
-      }
-      // 合并内置预置：未被用户删除且不在已有列表中的
-      const existingBuiltinIds = new Set(items.filter(i => i.builtinId).map(i => i.builtinId));
-      for (const bp of BUILTIN_PRESETS) {
-        if (dismissed.has(bp.builtinId) || existingBuiltinIds.has(bp.builtinId)) continue;
-        items.unshift({ id: Date.now() + Math.random(), builtinId: bp.builtinId, teamName: bp.teamName, description: bp.description });
-      }
-      const customExperts = Array.isArray(data.customUltraplanExperts) ? data.customUltraplanExperts : [];
-      // 若当前选中的自定义专家已不存在（被另一端删除），回退到 codeExpert
-      const current = this.state.ultraplanVariant;
-      const next = { presetItems: items, customUltraplanExperts: customExperts };
-      if (typeof current === 'string' && current.startsWith('custom:')) {
-        const id = current.slice('custom:'.length);
-        if (!customExperts.some(e => e.id === id)) next.ultraplanVariant = 'codeExpert';
-      }
-      this.setState(next);
-    }).catch(() => {});
+    // 数据从 props.preferences 派生(SettingsContext 集中 fetch);未 ready 时静默返回,
+    // componentDidUpdate 接力。
+    const data = this.props.preferences;
+    if (!data) return;
+    const dismissed = Array.isArray(data.dismissedBuiltinPresets) ? new Set(data.dismissedBuiltinPresets) : new Set();
+    this._dismissedBuiltinPresets = dismissed;
+    let items = [];
+    if (Array.isArray(data.presetShortcuts)) {
+      items = data.presetShortcuts.map((item, i) => {
+        if (typeof item === 'string') return { id: Date.now() + i, teamName: '', description: item };
+        return {
+          id: Date.now() + i,
+          teamName: item.teamName || '',
+          description: item.description || '',
+          ...(item.builtinId ? { builtinId: item.builtinId } : {}),
+          ...(item.modified ? { modified: true } : {}),
+        };
+      });
+    }
+    // 合并内置预置：未被用户删除且不在已有列表中的
+    const existingBuiltinIds = new Set(items.filter(i => i.builtinId).map(i => i.builtinId));
+    for (const bp of BUILTIN_PRESETS) {
+      if (dismissed.has(bp.builtinId) || existingBuiltinIds.has(bp.builtinId)) continue;
+      items.unshift({ id: Date.now() + Math.random(), builtinId: bp.builtinId, teamName: bp.teamName, description: bp.description });
+    }
+    const customExperts = Array.isArray(data.customUltraplanExperts) ? data.customUltraplanExperts : [];
+    // 若当前选中的自定义专家已不存在（被另一端删除），回退到 codeExpert
+    const current = this.state.ultraplanVariant;
+    const next = { presetItems: items, customUltraplanExperts: customExperts };
+    if (typeof current === 'string' && current.startsWith('custom:')) {
+      const id = current.slice('custom:'.length);
+      if (!customExperts.some(e => e.id === id)) next.ultraplanVariant = 'codeExpert';
+    }
+    this.setState(next);
   }
 
   componentWillUnmount() {
+    // mid-drag 卸载兜底：恢复 body 样式，标记终止
+    if (this._scratchDragging) {
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      this._scratchDragging = false;
+      this._scratchDragLastH = null;
+      this._scratchPointerId = null;
+    }
     if (this.terminal?.textarea) {
       this.terminal.textarea.removeEventListener('focus', this._handleTermFocus);
       this.terminal.textarea.removeEventListener('blur', this._handleTermBlur);
     }
     if (this._themeObserver) { this._themeObserver.disconnect(); this._themeObserver = null; }
-    window.removeEventListener('ccv-presets-changed', this._onPresetsChanged);
     window.removeEventListener('ccv-focus-terminal', this._onFocusTerminal);
     if (this._stopMobileMomentum) this._stopMobileMomentum();
-    if (this._writeTimer) cancelAnimationFrame(this._writeTimer);
-    if (this._wsReconnectTimer) clearTimeout(this._wsReconnectTimer);
-    if (this.ws) {
-      this.ws.onclose = null;
-      this.ws.close();
-      this.ws = null;
+    // unmount 前同步排空 buffer 给 xterm，防最后 16ms 数据丢失（既有 bug 缓解）。
+    // dispose 后 push 静默忽略、rAF 取消，与 terminal.dispose 顺序无关。
+    if (this._writeQ) {
+      try { this._writeQ.drain(); } catch {}
+      this._writeQ.dispose();
     }
+    if (this._wsReconnectTimer) clearTimeout(this._wsReconnectTimer);
+    if (this._unsubWsHandler) { try { this._unsubWsHandler(); } catch {} this._unsubWsHandler = null; }
+    if (this._unsubWsState) { try { this._unsubWsState(); } catch {} this._unsubWsState = null; }
     if (this._resizeDebounceTimer) clearTimeout(this._resizeDebounceTimer);
     if (this._webglRecoveryTimer) clearTimeout(this._webglRecoveryTimer);
     if (this.resizeObserver) {
@@ -273,9 +589,12 @@ class TerminalPanel extends React.Component {
       this._loadWebglAddon(false);
     }
 
-    // 写入节流：批量合并高频输出，避免逐条触发渲染
-    this._writeBuffer = '';
-    this._writeTimer = null;
+    // 写入节流：批量合并高频输出，避免逐条触发渲染。
+    // 用 TerminalWriteQueue 替代原「string += / slice」实现，消除大流量时
+    // O(n²) 字符串切片热点（trace3 显示 _flushWrite 794ms self），同时
+    // 修复 UTF-16 surrogate 边界切碎、unmount 16ms 数据丢失等隐患。
+    // 节奏与原实现等价：每帧 1 个 chunk（≤32KB），不做激进 multi-chunk drain。
+    this._writeQ = new TerminalWriteQueue(() => this.terminal);
 
     if (isMobile && !isPad) {
       // 移动端：基于屏幕尺寸一次性计算固定 cols/rows，避免动态 fit 导致渲染抖动
@@ -501,51 +820,43 @@ class TerminalPanel extends React.Component {
     this._stopMobileMomentum = stopMomentum;
   }
 
-  connectWebSocket() {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/terminal`;
-
-    this.ws = new WebSocket(wsUrl);
-
-    this.ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'data') {
-          this._throttledWrite(msg.data);
-        } else if (msg.type === 'exit') {
+  // 通过 TerminalWsContext 共享 ws — 不再自建。本方法接收 Provider 派发的所有消息,
+  // 自己 switch type;ChatView/TerminalPanel 各自只处理关心的类型,互不干扰。
+  // (原 hook/sdk-* 类消息在合并 ws 后也会进来,但这里不识别 → try/catch 之外也无作用,自然忽略。)
+  _onTerminalWsMessage = (msg) => {
+    try {
+      if (msg.type === 'data') {
+        this._throttledWrite(msg.data);
+      } else if (msg.type === 'exit') {
+        this._flushWrite();
+        this.terminal.write(`\r\n\x1b[33m${t('ui.terminal.exited', { code: msg.exitCode ?? '?' })}\x1b[0m\r\n`);
+        this.terminal.write(`\x1b[90m${t('ui.terminal.pressEnterForShell')}\x1b[0m\r\n`);
+      } else if (msg.type === 'editor-open') {
+        if (this.props.onEditorOpen) {
+          this.props.onEditorOpen(msg.sessionId, msg.filePath);
+        }
+      } else if (msg.type === 'state') {
+        if (!msg.running && msg.exitCode !== null) {
           this._flushWrite();
-          this.terminal.write(`\r\n\x1b[33m${t('ui.terminal.exited', { code: msg.exitCode ?? '?' })}\x1b[0m\r\n`);
+          this.terminal.write(`\x1b[33m${t('ui.terminal.exited', { code: msg.exitCode })}\x1b[0m\r\n`);
           this.terminal.write(`\x1b[90m${t('ui.terminal.pressEnterForShell')}\x1b[0m\r\n`);
-        } else if (msg.type === 'editor-open') {
-          if (this.props.onEditorOpen) {
-            this.props.onEditorOpen(msg.sessionId, msg.filePath);
-          }
-        } else if (msg.type === 'state') {
-          if (!msg.running && msg.exitCode !== null) {
-            this._flushWrite();
-            this.terminal.write(`\x1b[33m${t('ui.terminal.exited', { code: msg.exitCode })}\x1b[0m\r\n`);
-            this.terminal.write(`\x1b[90m${t('ui.terminal.pressEnterForShell')}\x1b[0m\r\n`);
-          }
-        } else if (msg.type === 'toast') {
-          this._flushWrite();
-          this.terminal.write(`\r\n\x1b[33m⚠ ${msg.message}\x1b[0m\r\n`);
         }
-      } catch {}
-    };
+      } else if (msg.type === 'toast') {
+        this._flushWrite();
+        this.terminal.write(`\r\n\x1b[33m⚠ ${msg.message}\x1b[0m\r\n`);
+      }
+    } catch {}
+  };
 
-    this.ws.onclose = () => {
-      this._wsReconnectTimer = setTimeout(() => {
-        if (this.containerRef.current) {
-          this.terminal?.reset();
-          this.connectWebSocket();
-        }
-      }, 2000);
-    };
-
-    this.ws.onopen = () => {
+  // ws 状态变更:open 时 sendResize(原 onopen 行为);close 时 reset xterm(避免残留半截 ANSI)。
+  // 重连本身由 Provider 内部 2s 退避完成,组件无感。
+  _onTerminalWsState = (state) => {
+    if (state === 'open') {
       this.sendResize();
-    };
-  }
+    } else if (state === 'close') {
+      this.terminal?.reset();
+    }
+  };
 
   sendResize() {
     if (this.ws && this.ws.readyState === WebSocket.OPEN && this.terminal) {
@@ -657,42 +968,19 @@ class TerminalPanel extends React.Component {
   }
 
   /**
-   * 写入节流：将高频数据合并到缓冲区，每 16ms（一帧）批量写入一次，
-   * 避免大量输出时逐条触发 xterm 渲染导致卡顿。
-   * 当数据量超过 CHUNK_SIZE 时分帧写入，防止 /resume 等场景阻塞主线程。
+   * 写入节流：委托给 TerminalWriteQueue（src/utils/terminalWriteQueue.js）。
+   * 行为与原实现等价 —— 每帧最多 write 一个 32KB chunk，rAF 续约。
+   * 收益：消除原 `_writeBuffer = _writeBuffer.slice(N)` 的 O(n²) 字符串切片
+   *       + UTF-16 surrogate 守卫 + 异常时不死循环 + drain 修 unmount 数据丢失。
    */
   _throttledWrite(data) {
-    this._writeBuffer += data;
-    if (!this._writeTimer) {
-      this._writeTimer = requestAnimationFrame(() => {
-        this._flushWrite();
-      });
-    }
+    this._writeQ.push(data);
   }
 
+  // 同步排空（exit/state/toast 路径在自身 write 前调用，保留既有顺序语义）。
+  // 注：与原实现一样，这里只 drain 已积累 buffer，不影响 xterm 内部 parser 异步队列。
   _flushWrite() {
-    if (this._writeTimer) {
-      cancelAnimationFrame(this._writeTimer);
-      this._writeTimer = null;
-    }
-    if (!this._writeBuffer || !this.terminal) return;
-
-    const CHUNK_SIZE = 32768; // 32KB per frame
-    if (this._writeBuffer.length <= CHUNK_SIZE) {
-      // 正常小数据：直接写入，无额外开销
-      const buf = this._writeBuffer;
-      this._writeBuffer = '';
-      this.terminal.write(buf);
-    } else {
-      // 大数据分帧：每帧写 32KB，剩余排入下一帧
-      const chunk = this._writeBuffer.slice(0, CHUNK_SIZE);
-      this._writeBuffer = this._writeBuffer.slice(CHUNK_SIZE);
-      this.terminal.write(chunk);
-      // 还有剩余数据，排入下一帧继续写
-      this._writeTimer = requestAnimationFrame(() => {
-        this._flushWrite();
-      });
-    }
+    this._writeQ.drain();
   }
 
   _handlePaste = (e) => {
@@ -846,13 +1134,7 @@ class TerminalPanel extends React.Component {
       }),
     };
     if (dismissed) payload.dismissedBuiltinPresets = [...dismissed];
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }).then(() => {
-      window.dispatchEvent(new Event('ccv-presets-changed'));
-    }).catch(() => {});
+    if (this.props.onUpdatePreferences) this.props.onUpdatePreferences(payload);
   };
 
   handlePresetAdd = () => {
@@ -953,16 +1235,22 @@ class TerminalPanel extends React.Component {
     if (!description) return;
     this.setState({ agentTeamPopoverOpen: false });
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      // bracket paste mode 包裹让终端识别为一次粘贴，末尾 `\r` 让 TUI 直接提交，
-      // 不留在 `[Pasted text #N +M lines]` 状态要用户再按 Enter。对齐同文件 handleUltraplanSend 的做法。
-      this.ws.send(JSON.stringify({ type: 'input', data: `\x1b[200~${description}\x1b[201~\r` }));
+      this.ws.send(JSON.stringify({
+        type: 'input-sequential',
+        chunks: buildBracketPasteSubmitChunks(description),
+        settleMs: BRACKET_PASTE_SUBMIT_SETTLE_MS,
+      }));
     }
     if ((!isMobile || isPad) && this.terminal) this.terminal.focus();
   };
 
   handleClearContext = () => {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'input', data: `\x1b[200~/clear\x1b[201~\r` }));
+      this.ws.send(JSON.stringify({
+        type: 'input-sequential',
+        chunks: buildBracketPasteSubmitChunks('/clear'),
+        settleMs: BRACKET_PASTE_SUBMIT_SETTLE_MS,
+      }));
       this.props.onClearContextOptimistic?.();
     }
     if ((!isMobile || isPad) && this.terminal) this.terminal.focus();
@@ -987,7 +1275,11 @@ class TerminalPanel extends React.Component {
     if (!assembled) return;
     this.setState({ ultraplanOpen: false, ultraplanPrompt: '', ultraplanVariant: 'codeExpert', ultraplanFiles: [] });
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'input', data: `\x1b[200~${assembled}\x1b[201~\r` }));
+      this.ws.send(JSON.stringify({
+        type: 'input-sequential',
+        chunks: buildBracketPasteSubmitChunks(assembled),
+        settleMs: BRACKET_PASTE_SUBMIT_SETTLE_MS,
+      }));
     }
     if ((!isMobile || isPad) && this.terminal) this.terminal.focus();
   };
@@ -1014,13 +1306,9 @@ class TerminalPanel extends React.Component {
 
   persistCustomUltraplanExperts = (experts) => {
     this.setState({ customUltraplanExperts: experts });
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customUltraplanExperts: experts }),
-    })
-      .then(() => window.dispatchEvent(new Event('ccv-presets-changed')))
-      .catch(() => {});
+    if (this.props.onUpdatePreferences) {
+      this.props.onUpdatePreferences({ customUltraplanExperts: experts });
+    }
   };
 
   saveCustomUltraplanExpert = (item) => {
@@ -1106,8 +1394,15 @@ class TerminalPanel extends React.Component {
   render() {
     const { pendingImages, onRemovePendingImage } = this.props;
     return (
-      <div className={`${styles.terminalPanel}${this.state.terminalFocused ? ` ${styles.terminalPanelFocused}` : ''}`}>
-        <div ref={this.containerRef} className={styles.terminalContainer} />
+      <div className={styles.terminalPanel}>
+        {/* === 主 terminal (Claude Code TUI 渲染区) ===
+            外层 .terminalContainer：padding + focus 边线；内层 .terminalHost：xterm 实际父容器，
+            margin-bottom 4px 让 fitAddon 拿到的高度始终 -4px，xterm-screen 接触不到下方 toolbar */}
+        <div
+          className={`${styles.terminalContainer}${this.state.terminalFocused ? ` ${styles.terminalContainerFocused}` : ''}`}
+        >
+          <div ref={this.containerRef} className={styles.terminalHost} />
+        </div>
         {pendingImages?.length > 0 && (
           <div className={styles.pendingFileStrip}>
             {pendingImages.map((img, i) => {
@@ -1149,10 +1444,7 @@ class TerminalPanel extends React.Component {
         <input type="file" ref={this.fileInputRef} className={styles.hiddenFileInput} onChange={this.handleFileUpload} />
         {(!isMobile || isPad) && (
           <div className={styles.terminalToolbar}>
-            <button className={styles.toolbarBtn} onClick={() => this.fileInputRef.current?.click()} title={t('ui.terminal.upload')}>
-              <UploadIcon />
-              <span>{t('ui.terminal.upload')}</span>
-            </button>
+            <div className={styles.toolbarLeft}>
             {this.state.agentTeamEnabled ? (
               <Popover
                 trigger="hover"
@@ -1272,9 +1564,6 @@ class TerminalPanel extends React.Component {
                         </svg>
                       </button>
                     </div>
-                    {(!this.props.modelName || getModelMaxTokens(this.props.modelName) < 1000000) && (
-                      <div className={styles.ultraplanContextWarning}>{t('ui.ultraplan.contextWarning')}</div>
-                    )}
                     {this.state.ultraplanFiles.length > 0 && (
                       <div className={styles.ultraplanFileList}>
                         {this.state.ultraplanFiles.map((f, i) => {
@@ -1356,6 +1645,9 @@ class TerminalPanel extends React.Component {
                 </button>
               </Popover>
             )}
+            <button className={styles.toolbarBtn} onClick={() => this.fileInputRef.current?.click()} title={t('ui.terminal.upload')}>
+              <UploadIcon />
+            </button>
             {(() => {
               // i18n 是单句 "X？Y。" 结构，按 ? / ？ 拆成 Popconfirm 的 title + description 以换行呈现
               const confirmFull = t('ui.chatInput.clearContextConfirm');
@@ -1374,15 +1666,108 @@ class TerminalPanel extends React.Component {
                 >
                   <button className={styles.toolbarBtn} title={t('ui.chatInput.clearContext')}>
                     <TrashIcon />
-                    <span>{t('ui.chatInput.clearContext')}</span>
                   </button>
                 </Popconfirm>
               );
             })()}
-            <button className={`${styles.toolbarBtn} ${styles.toolbarBtnRight}`} onClick={() => this.setState({ presetModalVisible: true })} title={t('ui.terminal.presetShortcuts')}>
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            </div>
+            {/* 中段：血条 portal slot；左/右两端控件分别由 toolbarLeft / toolbarRight 包裹，
+                slot 在中间用 flex-basis 200 + flex-shrink 1 自适应左右控件之间的空间，封顶 200px */}
+            <div className={styles.ctxBarSlot} ref={this.props.setContextBarSlot} />
+            <div className={styles.toolbarRight}>
+            <button
+              className={`${styles.toolbarBtn}${this.state.scratchOpen ? ` ${styles.toolbarBtnActive}` : ''}`}
+              onClick={this.toggleScratch}
+              aria-pressed={this.state.scratchOpen}
+              aria-label={this.state.scratchOpen ? t('ui.terminal.scratchTerminalClose') : t('ui.terminal.scratchTerminalOpen')}
+              title={this.state.scratchOpen ? t('ui.terminal.scratchTerminalClose') : t('ui.terminal.scratchTerminalOpen')}
+            >
+              <ScratchTerminalIcon />
             </button>
+            </div>
           </div>
+        )}
+        {(!isMobile || isPad) && this.state.scratchOpen && (
+          <>
+            <div
+              className={`${styles.scratchResizer}${this.state.isDraggingScratch ? ` ${styles.scratchResizerDragging}` : ''}`}
+              onPointerDown={this.handleScratchResizerPointerDown}
+              onPointerMove={this.handleScratchResizerPointerMove}
+              onPointerUp={this.handleScratchResizerPointerUp}
+              onPointerCancel={this.handleScratchResizerPointerUp}
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label={t('ui.terminal.scratchResizer')}
+            />
+            <div
+              ref={this._scratchWrapRef}
+              className={styles.scratchWrap}
+            >
+              <div className={styles.scratchTabs} role="tablist" aria-orientation="vertical">
+                {this.state.scratchTabs.map((tab, idx) => {
+                  const isActive = tab.id === this.state.activeScratchTabId;
+                  const isLast = this.state.scratchTabs.length === 1;
+                  // 同名 shell 重复时追加序号区分
+                  // 占位 'zsh'：老版本 server 不发 shellBasename 时也展示符合 macOS 默认 shell 的名字；
+                  // 新 server 的 WS state 消息携带真实 basename 后会覆盖（bash/fish 用户也对）
+                  const baseLabel = this.state.scratchShellBasename || 'zsh';
+                  const label = baseLabel + (this.state.scratchTabs.length > 1 ? ` ${idx + 1}` : '');
+                  return (
+                    <div
+                      key={tab.id}
+                      role="tab"
+                      aria-selected={isActive}
+                      tabIndex={isActive ? 0 : -1}
+                      className={`${styles.scratchTab}${isActive ? ` ${styles.scratchTabActive}` : ''}`}
+                      onClick={() => this.handleScratchTabClick(tab.id)}
+                      title={label}
+                    >
+                      <span className={styles.scratchTabIcon}><ScratchTerminalIcon /></span>
+                      <span className={styles.scratchTabLabel}>{label}</span>
+                      {!isLast && (
+                        <button
+                          className={styles.scratchTabClose}
+                          onClick={(e) => this.handleScratchTabClose(tab.id, e)}
+                          title={t('ui.terminal.scratchTabClose')}
+                          aria-label={t('ui.terminal.scratchTabClose')}
+                        >
+                          <CloseIcon />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+                <button
+                  className={styles.scratchTabAdd}
+                  onClick={this.handleScratchTabAdd}
+                  disabled={this.state.scratchTabs.length >= SCRATCH_TAB_MAX}
+                  title={t('ui.terminal.scratchTabAdd')}
+                  aria-label={t('ui.terminal.scratchTabAdd')}
+                >
+                  <PlusIcon />
+                </button>
+              </div>
+              <div className={`${styles.scratchPanes}${this.state.scratchFocused ? ` ${styles.scratchPanesFocused}` : ''}`}>
+                {this.state.scratchTabs.map((tab) => {
+                  const isActive = tab.id === this.state.activeScratchTabId;
+                  return (
+                    <div
+                      key={tab.id}
+                      className={`${styles.scratchPane}${isActive ? ` ${styles.scratchPaneActive}` : ''}`}
+                      role="tabpanel"
+                    >
+                      <ScratchTerminal
+                        ref={this._getScratchRef(tab.id)}
+                        id={tab.id}
+                        onFocusChange={(f) => this.handleScratchTabFocusChange(tab.id, f)}
+                        onShellInfo={this.handleScratchShellInfo}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </>
         )}
         {(isMobile && !isPad) && (
           <div className={styles.virtualKeybar}>

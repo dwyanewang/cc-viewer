@@ -18,7 +18,7 @@ function countryToFlag(code) {
 export default class CountryFlag extends React.Component {
   constructor(props) {
     super(props);
-    this.state = { flag: null, info: null };
+    this.state = { flag: null, info: null, popoverOpen: false };
     this._aborted = false;
   }
 
@@ -43,8 +43,10 @@ export default class CountryFlag extends React.Component {
     // 未知国家或 CN 不显示（和原先 AppHeader 行为保持一致）
     if (!flag || info?.country === 'CN') return null;
 
+    // stopPropagation 防止 popover 内点击冒泡到外层 click 触发 onOpenChange(false);
+    // 与 AppHeader 二维码 popover 同款修复(原 trigger=['hover','focus'] 移动端 tap 即关)。
     const content = (
-      <div className={styles.popover}>
+      <div className={styles.popover} onClick={e => e.stopPropagation()}>
         <div>{flag} {info.country}</div>
         {info.region && <div>{info.region}</div>}
         {info.city && <div>{info.city}</div>}
@@ -56,7 +58,10 @@ export default class CountryFlag extends React.Component {
     return (
       <Popover
         content={content}
-        trigger={['hover', 'focus']}
+        // 移动端 hover/focus 不可靠(tap → focus → 立即触发外部 click 关闭),改 click 受控。
+        trigger={['click']}
+        open={this.state.popoverOpen}
+        onOpenChange={(o) => this.setState({ popoverOpen: o })}
         placement="topLeft"
         overlayInnerStyle={{
           background: 'var(--bg-elevated)',

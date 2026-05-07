@@ -55,6 +55,11 @@ export function setLogDir(dir) {
   const home = homedir();
   if (!resolved.startsWith(home) && !resolved.startsWith('/tmp/')) return;
   LOG_DIR = resolved;
+  // workspace registry 文件位置随 LOG_DIR 变化,allowlist 缓存(含 registered workspaces)需失效。
+  // lazy import 避免循环依赖(file-access-policy 依赖 findcc 和 workspace-registry)。
+  import('./lib/file-access-policy.js')
+    .then(m => m.bumpWorkspacesVersion?.())
+    .catch(() => { /* CLI-only 入口可能未加载 policy 模块,无副作用即可 */ });
 }
 
 // npm 包名候选列表（按优先级排列）

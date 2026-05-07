@@ -1,55 +1,66 @@
 import React from 'react';
-import { Space, Tag, Button, Dropdown, Popover, Modal, Collapse, Drawer, Switch, Radio, Tabs, Spin, Input, Table, Select, Tooltip, Alert, message } from 'antd';
+import { createPortal } from 'react-dom';
+import { Space, Tag, Button, Dropdown, Popover, Modal, Collapse, Drawer, Switch, Radio, Tabs, Spin, Input, Table, Select, message } from 'antd';
 import { MessageOutlined, FileTextOutlined, ImportOutlined, DashboardOutlined, ExportOutlined, DownloadOutlined, SettingOutlined, BarChartOutlined, CodeOutlined, CopyOutlined, ApiOutlined, DeleteOutlined, ReloadOutlined, PlusOutlined, CloudDownloadOutlined, SwapOutlined, EditOutlined, CheckOutlined, CloseOutlined } from '@ant-design/icons';
 import { QRCodeCanvas } from 'qrcode.react';
-import { formatTokenCount, computeTokenStats, computeCacheRebuildStats, computeToolUsageStats, computeSkillUsageStats, getModelMaxTokens, getEffectiveModel, extractCachedContent, parseCachedTools, extractLoadedSkills } from '../utils/helpers';
-import { BUILTIN_SKILL_NAMES, mergeActiveSkills } from '../utils/skillsParser';
+import { formatTokenCount, computeTokenStats, computeCacheRebuildStats, computeToolUsageStats, computeSkillUsageStats, resolveCalibrationTokens, AUTO_COMPACT_USABLE_RATIO } from '../utils/helpers';
 import { isSystemText, classifyUserContent, isMainAgent } from '../utils/contentFilter';
 import { classifyRequest } from '../utils/requestType';
 import { resolveTeammateNames } from '../utils/contentFilter';
-import { t, getLang, setLang } from '../i18n';
+import { t, getLang, setLang, LANG_OPTIONS } from '../i18n';
 import { apiUrl } from '../utils/apiUrl';
+import { SettingsContext } from '../contexts/SettingsContext';
 import ConceptHelp from './ConceptHelp';
 import OpenFolderIcon from './OpenFolderIcon';
+import CachePopoverContent from './CachePopoverContent';
+import LiveTagPopover from './LiveTagPopover';
+import MemoryDetailModal from './MemoryDetailModal';
+import SkillsManagerModal from './SkillsManagerModal';
 import appConfig from '../config.json';
 import { OPTIMISTIC_CLEAR_PERCENT } from '../AppBase';
 const CALIBRATION_MODELS = appConfig.calibrationModels;
+// 1.6.243 之前的旧值（按具体型号校准）→ 新的尺寸维度；让升级用户保留校准语义而不是降级到 'auto'
+// （若 localStorage 残留值在此 map 与 CALIBRATION_MODELS 都没命中，再 fallback 到 'auto'）
+const LEGACY_CALIBRATION_MIGRATION = {
+  'opus-4.7-1m': '1m',
+  'sonnet-4.6': '200k',
+  'glm5': '200k',
+  'kimi-k2.5': '200k',
+  'minimax-2.1': '200k',
+  'Qwen 3.5': '200k',
+};
+function readCalibrationModel() {
+  const raw = localStorage.getItem('ccv_calibrationModel') || 'auto';
+  const migrated = LEGACY_CALIBRATION_MIGRATION[raw] || raw;
+  return CALIBRATION_MODELS.some(m => m.value === migrated) ? migrated : 'auto';
+}
 import styles from './AppHeader.module.css';
-
-const LANG_OPTIONS = [
-  { value: 'zh', short: 'zh', label: '简体中文' },
-  { value: 'en', short: 'en', label: 'English' },
-  { value: 'zh-TW', short: 'zh-TW', label: '繁體中文' },
-  { value: 'ko', short: 'ko', label: '한국어' },
-  { value: 'ja', short: 'ja', label: '日本語' },
-  { value: 'de', short: 'de', label: 'Deutsch' },
-  { value: 'es', short: 'es', label: 'Español' },
-  { value: 'fr', short: 'fr', label: 'Français' },
-  { value: 'it', short: 'it', label: 'Italiano' },
-  { value: 'da', short: 'da', label: 'Dansk' },
-  { value: 'pl', short: 'pl', label: 'Polski' },
-  { value: 'ru', short: 'ru', label: 'Русский' },
-  { value: 'ar', short: 'ar', label: 'العربية' },
-  { value: 'no', short: 'no', label: 'Norsk' },
-  { value: 'pt-BR', short: 'pt-BR', label: 'Português (Brasil)' },
-  { value: 'th', short: 'th', label: 'ไทย' },
-  { value: 'tr', short: 'tr', label: 'Türkçe' },
-  { value: 'uk', short: 'uk', label: 'Українська' },
-];
 
 
 // countryToFlag 已随地理位置控件一起迁到 src/components/CountryFlag.jsx
 
 class AppHeader extends React.Component {
+  static contextType = SettingsContext;
+
   constructor(props) {
     super(props);
-    this.state = { countdownText: '', promptModalVisible: false, promptData: [], promptViewMode: 'original', settingsDrawerVisible: false, globalSettingsVisible: false, projectStatsVisible: false, projectStats: null, projectStatsLoading: false, localUrl: '', pluginModalVisible: false, pluginsList: [], pluginsDir: '', deleteConfirmVisible: false, deleteTarget: null, processModalVisible: false, processList: [], processLoading: false, logoDropdownOpen: false, cacheHighlightIdx: null, cacheHighlightFading: false, cdnModalVisible: false, cdnUrl: '', cdnLoading: false, calibrationModel: (v => CALIBRATION_MODELS.some(m => m.value === v) ? v : 'auto')(localStorage.getItem('ccv_calibrationModel') || 'auto'), proxyModalVisible: false, editingProxy: null, editForm: { name: '', baseURL: '', apiKey: '', models: '', activeModel: '' }, logDirDraft: null, _skillsModal: { open: false, loading: false, skills: [], error: null, toggling: new Set() },
+    this.state = { countdownText: '', promptModalVisible: false, promptData: [], promptViewMode: 'original', settingsDrawerVisible: false, globalSettingsVisible: false, projectStatsVisible: false, projectStats: null, projectStatsLoading: false, localUrl: '', pluginModalVisible: false, pluginsList: [], pluginsDir: '', deleteConfirmVisible: false, deleteTarget: null, processModalVisible: false, processList: [], processLoading: false, logoDropdownOpen: false, cacheHighlightIdx: null, cacheHighlightFading: false, cdnModalVisible: false, cdnUrl: '', cdnLoading: false, calibrationModel: readCalibrationModel(), proxyModalVisible: false, editingProxy: null, editForm: { name: '', baseURL: '', apiKey: '', models: '', activeModel: '' }, logDirDraft: null, qrPopoverOpen: false, _skillsModal: { open: false, loading: false, skills: [], error: null, toggling: new Set() },
       // 文件系统权威的 skill 列表（/api/skills 返回）；live-tail 下作为 popover chip 和管理弹窗的共享数据源。
       // null=未加载 / false=失败 / [] 或 Array=加载结果。workspace 切换由 componentDidUpdate + seq 控制。
-      _fsSkills: null };
+      _fsSkills: null,
+      // 当前项目「持久记忆」入口 MEMORY.md：null=未加载 / false=失败 / { exists, dir, indexPath, content }。
+      // 与 _fsSkills 同样依赖 projectName 切换作废 + seq 防回包污染。
+      _memory: null,
+      // 用户主动点击"刷新记忆"按钮的 spin 状态。与 _memory===null 区分：
+      // null 是 lazy-load 空态（按钮 disabled），_memoryRefreshing 是用户触发的显式刷新。
+      _memoryRefreshing: false,
+      // 点击记忆链接时拉起的明细 Modal 状态：null=关 / { name, content?, error?, loading? }
+      _memoryDetail: null };
     this._countdownTimer = null;
     this._expiredTimer = null;
     this._fsSkillsSeq = 0;
+    this._memorySeq = 0;
+    this._memoryDetailSeq = 0;
     this.updateCountdown = this.updateCountdown.bind(this);
   }
 
@@ -58,9 +69,10 @@ class AppHeader extends React.Component {
     fetch(apiUrl('/api/local-url')).then(r => r.json()).then(data => {
       if (data.url) this.setState({ localUrl: data.url });
     }).catch(() => {});
-    fetch(apiUrl('/api/claude-settings')).then(r => r.json()).then(data => {
-      if (data.model) this.setState({ settingsModel: data.model });
-    }).catch(() => {});
+    // claude-settings 由 SettingsProvider 集中 fetch,这里只订阅 Promise 拿 model 字段
+    this.context._claudeSettingsReady.then(data => {
+      if (data && data.model) this.setState({ settingsModel: data.model });
+    });
     // 预热：live-tail 下提前拉一次文件系统 skill，首次打开 popover 就是权威视图而非闪一下历史。
     if (!this.props.isLocalLog) this.reloadFsSkills();
     // ipinfo.io 请求已移到 CountryFlag 组件里
@@ -77,6 +89,9 @@ class AppHeader extends React.Component {
       this._fsSkillsSeq++;
       this.setState({ _fsSkills: null });
       if (!this.props.isLocalLog && this.props.projectName) this.reloadFsSkills();
+      // _memory 同样作废 —— 沿用 _fsSkills 的失效策略，下次 popover 打开时按需重拉。
+      this._memorySeq++;
+      this.setState({ _memory: null, _memoryDetail: null, _memoryRefreshing: false });
     }
   }
 
@@ -105,16 +120,85 @@ class AppHeader extends React.Component {
     }
   };
 
-  // 把 reloadFsSkills 的 reason code 映射成用户可读文案。
-  // 未知/服务端自带的文案（例如 data.error 原样透传）直接显示。
-  getSkillsLoadErrorLabel(reason) {
-    if (!reason || reason === 'stale' || reason === 'local_log') return '';
-    const mHttp = /^http:(\d+)$/.exec(reason);
-    if (mHttp) return t('ui.skillsLoadError.http', { status: mHttp[1] });
-    if (reason === 'network') return t('ui.skillsLoadError.network');
-    return reason;
-  }
+  // 拉取当前项目入口 MEMORY.md。沿用 _fsSkills 的 seq + 静默回退模式。
+  // 三态契约:null=loading / false=失败 / 对象=成功(消费方在 815-855 / 1636 行依赖此契约)。
+  // 与 loadMemoryDetail 不同:Detail 把错误暴露到 UI(_memoryDetail.error),需要 catch (e);
+  // 入口 popover 失败时只显示通用文案(memoryLoadError),无需 e 详情,故 catch 不带形参。
+  loadMemory = async () => {
+    const seq = ++this._memorySeq;
+    try {
+      const r = await fetch(apiUrl('/api/project-memory'));
+      const data = await r.json();
+      if (seq !== this._memorySeq) return;
+      if (!r.ok) {
+        this.setState({ _memory: false });
+        return;
+      }
+      this.setState({ _memory: data });
+    } catch {
+      if (seq === this._memorySeq) this.setState({ _memory: false });
+    }
+  };
 
+  // 用户主动点击"刷新记忆"按钮：自管 seq 三态（ok/stale/fail）以决定 toast。
+  // 与 loadMemory 区分的原因：lazy-load 失败不打扰用户，只在 popover 内显示 memoryLoadError；
+  // 主动刷新失败要 message.error 明确反馈。stale（workspace 中途切换）保持静默，避免误报。
+  handleRefreshMemory = async () => {
+    if (this.state._memoryRefreshing) return;
+    this.setState({ _memoryRefreshing: true });
+    const seq = ++this._memorySeq;
+    let ok = false;
+    let stale = false;
+    try {
+      const r = await fetch(apiUrl('/api/project-memory'));
+      const data = await r.json();
+      if (seq !== this._memorySeq) { stale = true; }
+      else if (!r.ok) { this.setState({ _memory: false }); }
+      else { this.setState({ _memory: data }); ok = true; }
+    } catch {
+      if (seq !== this._memorySeq) stale = true;
+      else this.setState({ _memory: false });
+    } finally {
+      if (!stale) this.setState({ _memoryRefreshing: false });
+    }
+    if (stale) return;
+    if (ok) message.success(t('ui.memoryRefreshSuccess'));
+    else message.error(t('ui.memoryRefreshFailed'), 5);
+  };
+
+  // 血条 Popover 开关:打开时按需拉 _fsSkills / _memory(避免页面初始化就发两条请求)。
+  // 提取为 class field 后引用稳定,LiveTagPopover memo 不会因 callback 引用变化而失效。
+  handleCachePopoverOpenChange = (open) => {
+    this.setState({ _cachePopoverOpen: open });
+    if (!open) this._cacheScrollInited = false;
+    if (open && this.state._fsSkills === null && !this.props.isLocalLog) this.reloadFsSkills();
+    if (open && this.state._memory === null) this.loadMemory();
+  };
+
+  // 加载明细文件：name 必须是单段 .md basename（前端先校验，server 再校验一遍）。
+  // seq 防快速连点：用户连点两个不同明细时，慢的回包不应覆盖快的（否则用户最后看到的是错的内容）。
+  loadMemoryDetail = async (name) => {
+    const seq = ++this._memoryDetailSeq;
+    this.setState({ _memoryDetail: { name, loading: true } });
+    try {
+      const r = await fetch(apiUrl(`/api/project-memory?file=${encodeURIComponent(name)}`));
+      const data = await r.json();
+      if (seq !== this._memoryDetailSeq) return;
+      if (!r.ok) {
+        this.setState({ _memoryDetail: { name, error: data.error || `http:${r.status}` } });
+        return;
+      }
+      this.setState({ _memoryDetail: { name, content: data.content || '' } });
+    } catch (e) {
+      if (seq === this._memoryDetailSeq) {
+        this.setState({ _memoryDetail: { name, error: e.message || 'network' } });
+      }
+    }
+  };
+
+  // 白名单式 SCU：render() 里读到的每个 props 字段都必须在此列出，否则父组件 setState
+  // 不会触发 AppHeader 重渲染（症状：受控控件的 checked/value 卡住不更新）。
+  // 新增传给 AppHeader 的 prop 时，记得同步加进这里。
   shouldComponentUpdate(nextProps, nextState) {
     return (
       nextProps.requests !== this.props.requests ||
@@ -137,6 +221,7 @@ class AppHeader extends React.Component {
       nextProps.terminalVisible !== this.props.terminalVisible ||
       nextProps.contextWindow !== this.props.contextWindow ||
       nextProps.contextBarOptimistic !== this.props.contextBarOptimistic ||
+      nextProps.contextBarSlot !== this.props.contextBarSlot ||
       nextProps.serverCachedContent !== this.props.serverCachedContent ||
       nextProps.resumeAutoChoice !== this.props.resumeAutoChoice ||
       nextProps.themeColor !== this.props.themeColor ||
@@ -144,6 +229,10 @@ class AppHeader extends React.Component {
       nextProps.proxyProfiles !== this.props.proxyProfiles ||
       nextProps.activeProxyId !== this.props.activeProxyId ||
       nextProps.defaultConfig !== this.props.defaultConfig ||
+      nextProps.approvalPrefs !== this.props.approvalPrefs ||
+      nextProps.approvalGlobal !== this.props.approvalGlobal ||
+      nextProps.approvalDismissedIds !== this.props.approvalDismissedIds ||
+      nextProps.approvalOwnPending !== this.props.approvalOwnPending ||
       nextState !== this.state
     );
   }
@@ -156,9 +245,12 @@ class AppHeader extends React.Component {
     if (this._cacheAutoFadeTimer) clearTimeout(this._cacheAutoFadeTimer);
     if (this._cacheHighlightDelayTimer) clearTimeout(this._cacheHighlightDelayTimer);
     this._cacheUnbindScrollFade();
-    // 让任何在途的 reloadFsSkills / fetch 回包 seq 校验失败 → 不会 setState 到已卸载组件。
-    // React 18 下 setState-on-unmounted 本身是静默 no-op，但明确标记更稳妥。
+    // 让任何在途的 reloadFsSkills / loadMemory / loadMemoryDetail 回包 seq 校验失败
+    // → 不会 setState 到已卸载组件。React 18 下 setState-on-unmounted 本身是静默 no-op，
+    // 但明确标记更稳妥（也保证三个 seq 处理一致，code review 一致性诉求）。
     this._fsSkillsSeq++;
+    this._memorySeq++;
+    this._memoryDetailSeq++;
   }
 
   startCountdown() {
@@ -581,210 +673,6 @@ class AppHeader extends React.Component {
     localStorage.setItem('ccv_calibrationModel', value);
   };
 
-  renderCacheContentPopover(contextPercent) {
-    const { requests = [], serverCachedContent } = this.props;
-    const cached = serverCachedContent || extractCachedContent(requests);
-
-    // 记录最后一次有效的 token / ctx（原展示已移除，保留以便将来恢复）
-    if (cached && (cached.cacheCreateTokens > 0 || cached.cacheReadTokens > 0)) {
-      this._lastCachedTokens = { cacheCreateTokens: cached.cacheCreateTokens, cacheReadTokens: cached.cacheReadTokens };
-    }
-    if (contextPercent > 0) {
-      this._lastContextPercent = contextPercent;
-    }
-
-    // 解析 tools 并缓存：tools 数组引用未变时复用上次解析结果，避免 200 条量级重复 split/regex。
-    const toolsArr = Array.isArray(cached?.tools) ? cached.tools : null;
-    let parsed;
-    if (toolsArr === this._lastToolsRef && this._lastParsedTools) {
-      parsed = this._lastParsedTools;
-    } else {
-      parsed = parseCachedTools(toolsArr);
-      this._lastToolsRef = toolsArr;
-      this._lastParsedTools = parsed;
-    }
-    const { builtin, mcpByServer } = parsed;
-    const hasBuiltin = builtin.length > 0;
-    const hasMcp = mcpByServer.size > 0;
-
-    // skills 缓存：以「被选中的 MainAgent 请求引用」为 key（而非 requests 数组引用），
-    // live-tail 追加新请求时，chosen 不变就不重扫。
-    const chosenForSkills = (() => {
-      if (!Array.isArray(requests) || requests.length === 0) return null;
-      if (requests.length === 1) return requests[0];
-      for (let i = requests.length - 1; i >= 0; i--) {
-        const r = requests[i];
-        if (r && r.type !== 'teammate' && r.type !== 'subAgent') return r;
-      }
-      return null;
-    })();
-    if (chosenForSkills !== this._lastChosenForSkills) {
-      this._lastSkills = extractLoadedSkills(requests);
-      this._lastChosenForSkills = chosenForSkills;
-    }
-    // Chip 数据源：优先走 /api/skills（文件系统权威，禁用立即生效；插件名带前缀符合 system-reminder 格式）。
-    // `_fsSkills` 为 null / false（本地 log / fetch 失败）时，回退到历史 system-reminder 解析 —— 不回归旧行为。
-    const historicalSkills = (this._lastSkills || []).filter(s => !BUILTIN_SKILL_NAMES.has(s.name));
-    const mergedSkills = mergeActiveSkills(this.state._fsSkills, this._lastSkills || []);
-    const skills = mergedSkills !== null ? mergedSkills : historicalSkills;
-    const hasSkills = skills.length > 0;
-
-    // 内置工具 chip：若有对应 Tool-<name>.md 文档（由 ConceptHelp 内部白名单校验），
-    // 点击直接打开 md modal；无文档则退化为纯展示 chip（ConceptHelp children fallback）。
-    // MCP 工具 chip：暂无对应文档，维持纯展示 + title hover 预览。
-    const renderBuiltinChip = ({ name, description }) => {
-      const title = [name, description].filter(Boolean).join('\n\n');
-      const chip = <span className={styles.cacheToolChip} title={title}>{name}</span>;
-      return <ConceptHelp key={name} doc={`Tool-${name}`}>{chip}</ConceptHelp>;
-    };
-    // MCP / Skill chip 改 hover 弹浮窗看 desc（原 click 弹 Modal 交互太重）。
-    // Antd Popover 默认 trigger='hover' + mouseEnter/Leave delay；overlay maxWidth 480
-    // 避免长描述拉爆视口；`.chipDetailBody` 复用原 Modal 样式（pre-wrap + maxHeight: 60vh 滚动）。
-    const renderChipPopoverContent = (description) => (
-      description
-        ? <div className={styles.chipDetailBody}>{description}</div>
-        : <div className={`${styles.chipDetailBody} ${styles.chipDetailEmpty}`}>{t('ui.noDescription')}</div>
-    );
-    const renderMcpChip = ({ name, fullName, description }) => (
-      <Popover
-        key={fullName}
-        title={fullName}
-        content={renderChipPopoverContent(description)}
-        overlayStyle={{ maxWidth: 480 }}
-        mouseEnterDelay={0.2}
-      >
-        <span className={styles.cacheToolChip}>{name}</span>
-      </Popover>
-    );
-    const renderSkillChip = ({ name, description }) => (
-      <Popover
-        key={name}
-        title={name}
-        content={renderChipPopoverContent(description)}
-        overlayStyle={{ maxWidth: 480 }}
-        mouseEnterDelay={0.2}
-      >
-        <span className={styles.cacheToolChip}>{name}</span>
-      </Popover>
-    );
-
-    const renderGroup = (sectionKey, titleKey, count, defaultCollapsed, body, rightAction = null) => {
-      const state = (this.state._cacheSectionCollapsed || {})[sectionKey];
-      const collapsed = state !== undefined ? !!state : defaultCollapsed;
-      const toggle = () => this.setState(prev => ({
-        _cacheSectionCollapsed: { ...(prev._cacheSectionCollapsed || {}), [sectionKey]: !collapsed },
-      }));
-      return (
-        <div className={styles.cacheSection}>
-          <div className={styles.cacheSectionHeader}>
-            <button type="button" className={styles.cacheSectionTitle} onClick={toggle} aria-expanded={!collapsed}>
-              <span className={styles.cacheSectionArrow}>{collapsed ? '▶' : '▼'}</span>
-              {t(titleKey)} ({count})
-            </button>
-            {rightAction}
-          </div>
-          {!collapsed && body}
-        </div>
-      );
-    };
-
-    const builtinBody = (
-      <div className={styles.toolChipGrid}>{builtin.map(renderBuiltinChip)}</div>
-    );
-
-    const mcpBody = (
-      <div className={styles.toolChipGridVertical}>
-        {Array.from(mcpByServer.entries()).map(([server, tools]) => (
-          <div key={server} className={styles.mcpServerGroup}>
-            <div className={styles.mcpServerName}>{server} ({tools.length})</div>
-            <div className={styles.toolChipGrid}>{tools.map(renderMcpChip)}</div>
-          </div>
-        ))}
-      </div>
-    );
-
-    const skillsBody = (
-      <div className={styles.toolChipGrid}>{skills.map(renderSkillChip)}</div>
-    );
-
-    const skillsAction = (
-      <Button
-        type="primary"
-        size="small"
-        onClick={() => {
-          // 打开 modal 同时关掉 popover（popover zIndex 1030 > Modal 1000 会盖住内容）
-          this.handleOpenSkillsModal();
-        }}
-      >
-        {t('ui.skillManage')}
-      </Button>
-    );
-
-    const ctxColor = contextPercent >= 80 ? 'var(--color-error-light)' : contextPercent >= 60 ? 'var(--color-warning-light)' : 'var(--color-success)';
-    return (
-      <div className={styles.cachePopover}>
-        <div className={styles.cachePopoverHeader}>
-          <div className={styles.cachePopoverTitle}>
-            <span className={styles.cachePercent} style={{ color: ctxColor }}>{contextPercent}%</span>
-            <span className={styles.cacheCalibrationLabel}>{t('ui.calibrationModelLabel')}</span>
-            <Select
-              size="small"
-              value={this.state.calibrationModel}
-              onChange={this.handleCalibrationModelChange}
-              options={CALIBRATION_MODELS}
-              className={styles.calibrationSelect}
-              popupMatchSelectWidth={false}
-            />
-          </div>
-        </div>
-        {(hasBuiltin || hasMcp || hasSkills) && (
-          <div className={styles.cacheScrollArea}>
-            {hasBuiltin && renderGroup('tools_builtin', 'ui.builtinTools', builtin.length, true, builtinBody)}
-            {hasMcp && (
-              // MCP 工具一进来就要看（常用且量不大），去掉折叠控件走静态标签 + 视觉分组框
-              <div className={`${styles.cacheSection} ${styles.cacheSectionBordered}`}>
-                <div className={styles.cacheSectionLabel}>
-                  {t('ui.mcpTools')} ({Array.from(mcpByServer.values()).reduce((n, arr) => n + arr.length, 0)})
-                </div>
-                {mcpBody}
-              </div>
-            )}
-            {hasSkills && (
-              // 已载入 Skill 同样去折叠 + 加框；「管理」按钮放标题右侧（space-between + 蓝色 primary）。
-              // skill 数量 >10 黄色提示"浪费 token 幻觉"、>20 红色提示"上下文污染"——插在 label 和 action 之间，
-              // flex:1 填充中间空白。阈值只按展示 chip 数（已排除 builtin）来算，builtin 是系统自带不计。
-              <div className={`${styles.cacheSection} ${styles.cacheSectionBordered}`}>
-                <div className={styles.cacheSectionHeader}>
-                  <div className={styles.cacheSectionLabel}>
-                    {t('ui.loadedSkills')} ({skills.length})
-                  </div>
-                  {skills.length > 20 ? (
-                    <Alert
-                      type="error"
-                      showIcon
-                      banner
-                      message={t('ui.skillsWarnPollution')}
-                      style={{ marginRight: 'auto', padding: '2px 8px', fontSize: 11 }}
-                    />
-                  ) : skills.length > 10 ? (
-                    <Alert
-                      type="warning"
-                      showIcon
-                      banner
-                      message={t('ui.skillsWarnOveruse')}
-                      style={{ marginRight: 'auto', padding: '2px 8px', fontSize: 11 }}
-                    />
-                  ) : null}
-                  {skillsAction}
-                </div>
-                {skillsBody}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    );
-  }
 
   renderCacheRebuildStats() {
     const { requests = [] } = this.props;
@@ -989,25 +877,24 @@ class AppHeader extends React.Component {
   };
 
   handleTogglePlugin = (name, enabled) => {
-    fetch(apiUrl('/api/preferences')).then(r => r.json()).then(prefs => {
+    // 等 SettingsProvider 完成首次 fetch,避免冷启动 RMW 把已持久化的 disabledPlugins 兜底成 []
+    this.context._prefsReady.then(() => {
+      const prefs = this.context.preferences || {};
       let disabledPlugins = Array.isArray(prefs.disabledPlugins) ? [...prefs.disabledPlugins] : [];
       if (enabled) {
         disabledPlugins = disabledPlugins.filter(n => n !== name);
       } else {
         if (!disabledPlugins.includes(name)) disabledPlugins.push(name);
       }
-      return fetch(apiUrl('/api/preferences'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ disabledPlugins }),
-      });
-    }).then(() => {
-      return fetch(apiUrl('/api/plugins/reload'), { method: 'POST' });
-    }).then(r => {
-      if (!r.ok) throw new Error(r.status);
-      return r.json();
-    }).then(data => {
-      this.setState({ pluginsList: data.plugins || [], pluginsDir: data.pluginsDir || '' });
+      return this.context.updatePreferences({ disabledPlugins })
+        .then(() => fetch(apiUrl('/api/plugins/reload'), { method: 'POST' }))
+        .then(r => {
+          if (!r.ok) throw new Error(r.status);
+          return r.json();
+        })
+        .then(data => {
+          this.setState({ pluginsList: data.plugins || [], pluginsDir: data.pluginsDir || '' });
+        });
     }).catch(() => {});
   };
 
@@ -1295,6 +1182,86 @@ class AppHeader extends React.Component {
     );
   }
 
+  // 把 LiveTagPopover（血条 + popover trigger）通过 createPortal 渲染到
+  // TerminalPanel 工具栏（终端开启时）或 ChatInputBar 底部按钮区（终端关闭时）
+  // 提供的 slot DOM 节点。slot 由 App.jsx 集中持有；缺席时返回 null（raw 模式等）。
+  // 状态/数据所有权仍在 AppHeader（_cachePopoverOpen / _fsSkills / _memory /
+  // _lastContextPercent），portal 仅迁移 DOM 位置，不影响 React 子树重建。
+  renderContextBarPortal() {
+    const slot = this.props.contextBarSlot;
+    if (!slot) return null;
+
+    const { requests = [], isLocalLog, localLogFile, projectName, contextWindow, contextBarOptimistic, serverCachedContent } = this.props;
+
+    // 计算上下文使用率：距离 auto-compact 触发点的进度
+    // auto-compact 在 ~83.5% 时触发（扣除 16.5% buffer）
+    // 将 used_percentage 映射到 0~83.5% → 0~100%
+    let contextPercent = 0;
+    // 反向找最后一条带 usage 的 MainAgent 一次，contextPercent 与 contextTokens 共用
+    // AUTO 校准也依赖它的 model 名，所以必须在 calibrationTokens 求值之前完成
+    let lastMainAgent = null;
+    let lastTotalTokens = 0;
+    if (!isLocalLog && requests.length > 0) {
+      for (let i = requests.length - 1; i >= 0; i--) {
+        if (isMainAgent(requests[i]) && requests[i].response?.body?.usage) {
+          lastMainAgent = requests[i];
+          const u = lastMainAgent.response.body.usage;
+          lastTotalTokens = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+          break;
+        }
+      }
+    }
+    // resolveCalibrationTokens 不变量保证返回 1000000 或 200000，永不为 0/null
+    const calibrationTokens = resolveCalibrationTokens(this.state.calibrationModel, lastMainAgent);
+    if (!isLocalLog) {
+      if (contextWindow?.used_percentage != null) {
+        if (lastTotalTokens > 0) {
+          const usable = calibrationTokens * AUTO_COMPACT_USABLE_RATIO;
+          contextPercent = Math.min(100, Math.max(0, Math.round(lastTotalTokens / usable * 100)));
+        } else {
+          const origMax = contextWindow.context_window_size || 200000;
+          contextPercent = Math.min(100, Math.max(0, Math.round(contextWindow.used_percentage * origMax / calibrationTokens / AUTO_COMPACT_USABLE_RATIO)));
+        }
+      } else if (lastMainAgent && lastTotalTokens > 0) {
+        const usable = calibrationTokens * AUTO_COMPACT_USABLE_RATIO;
+        contextPercent = Math.min(100, Math.max(0, Math.round(lastTotalTokens / usable * 100)));
+      }
+    }
+    if (contextPercent > 0) this._lastContextPercent = contextPercent;
+    if (contextPercent === 0 && this._lastContextPercent > 0) {
+      contextPercent = this._lastContextPercent;
+    }
+    // /clear 后立即把血条压到乐观水位；下一次 SSE context_window 推送会取消这个覆盖
+    if (contextBarOptimistic) contextPercent = OPTIMISTIC_CLEAR_PERCENT;
+    const ctxColor = contextPercent >= 80 ? 'var(--color-error-light)' : contextPercent >= 60 ? 'var(--color-warning-light)' : 'var(--color-success)';
+    const contextTokens = lastTotalTokens;
+
+    return createPortal(
+      <LiveTagPopover
+        isLocalLog={isLocalLog}
+        localLogFile={localLogFile}
+        cachePopoverOpen={this.state._cachePopoverOpen}
+        onOpenChange={this.handleCachePopoverOpenChange}
+        requests={requests}
+        serverCachedContent={serverCachedContent}
+        contextPercent={contextPercent}
+        contextTokens={contextTokens}
+        ctxColor={ctxColor}
+        onSkillImported={this.reloadFsSkills}
+        fsSkills={this.state._fsSkills}
+        memory={this.state._memory}
+        memoryRefreshing={this.state._memoryRefreshing}
+        calibrationModel={this.state.calibrationModel}
+        onCalibrationModelChange={this.handleCalibrationModelChange}
+        onOpenMemoryDetail={this.loadMemoryDetail}
+        onOpenSkillsModal={this.handleOpenSkillsModal}
+        onRefreshMemory={this.handleRefreshMemory}
+        projectName={projectName}
+      />,
+      slot
+    );
+  }
+
   render() {
     const { requestCount, requests = [], viewMode, cacheType, onToggleViewMode, onImportLocalLogs, onLangChange, isLocalLog, localLogFile, projectName, collapseToolResults, onCollapseToolResultsChange, expandThinking, onExpandThinkingChange, showFullToolContent, onShowFullToolContentChange, expandDiff, onExpandDiffChange, filterIrrelevant, onFilterIrrelevantChange, logDir, onLogDirChange, updateInfo, onDismissUpdate, cliMode, terminalVisible, onToggleTerminal, onReturnToWorkspaces, contextWindow, contextBarOptimistic, serverCachedContent, resumeAutoChoice, onResumeAutoChoiceToggle, onResumeAutoChoiceChange, themeColor, onThemeColorChange, autoApproveSeconds, onAutoApproveChange } = this.props;
     const { countdownText } = this.state;
@@ -1317,12 +1284,6 @@ class AppHeader extends React.Component {
         icon: <ApiOutlined />,
         label: t('ui.pluginManagement'),
         onClick: this.handleShowPlugins,
-      },
-      {
-        key: 'switch-workspace',
-        icon: <ImportOutlined className={styles.iconMirror} />,
-        label: <span className={styles.disabledMenuItem}>{t('ui.switchWorkspace')}</span>,
-        disabled: true,
       },
       {
         key: 'process-management',
@@ -1374,100 +1335,10 @@ class AppHeader extends React.Component {
               </Tag>
             ) : null;
           })()}
-          {(() => {
-            // 计算上下文使用率：距离 auto-compact 触发点的进度
-            // auto-compact 在 ~83.5% 时触发（扣除 16.5% buffer）
-            // 将 used_percentage 映射到 0~83.5% → 0~100%
-            let contextPercent = 0;
-            const calibration = CALIBRATION_MODELS.find(m => m.value === this.state.calibrationModel);
-            const calibrationTokens = calibration?.tokens; // undefined for 'auto'
-            if (!isLocalLog) {
-              if (calibrationTokens && contextWindow?.used_percentage != null) {
-                // 校准模式 + 精确数据：用实际 token 数重新计算百分比
-                const getTotal = (req) => {
-                  const u = req.response?.body?.usage;
-                  return (u?.input_tokens || 0) + (u?.cache_creation_input_tokens || 0) + (u?.cache_read_input_tokens || 0);
-                };
-                let total = 0;
-                for (let i = requests.length - 1; i >= 0; i--) {
-                  if (isMainAgent(requests[i]) && requests[i].response?.body?.usage) {
-                    total = getTotal(requests[i]);
-                    break;
-                  }
-                }
-                if (total > 0) {
-                  const usable = calibrationTokens * 0.835;
-                  contextPercent = Math.min(100, Math.max(0, Math.round(total / usable * 100)));
-                } else {
-                  // 无 token 数据时，按比例缩放 used_percentage
-                  const origMax = contextWindow.context_window_size || 200000;
-                  contextPercent = Math.min(100, Math.max(0, Math.round(contextWindow.used_percentage * origMax / calibrationTokens / 83.5 * 100)));
-                }
-              } else if (contextWindow?.used_percentage != null) {
-                // 精确模式：statusLine 推送的 used_percentage
-                // 如果 settings.json 指定了模型且上下文大小与 statusLine 检测的不同，按比例修正
-                const settingsTokens = this.state.settingsModel ? getModelMaxTokens(this.state.settingsModel) : 0;
-                const detectedMax = contextWindow.context_window_size || 200000;
-                if (settingsTokens && settingsTokens !== detectedMax) {
-                  contextPercent = Math.min(100, Math.max(0, Math.round(contextWindow.used_percentage * detectedMax / settingsTokens / 83.5 * 100)));
-                } else {
-                  contextPercent = Math.min(100, Math.max(0, Math.round(contextWindow.used_percentage / 83.5 * 100)));
-                }
-              } else if (requests.length > 0) {
-                // fallback：用最后一个 MainAgent 的 total input 估算
-                const getTotal = (req) => {
-                  const u = req.response?.body?.usage;
-                  return (u?.input_tokens || 0) + (u?.cache_creation_input_tokens || 0) + (u?.cache_read_input_tokens || 0);
-                };
-                for (let i = requests.length - 1; i >= 0; i--) {
-                  if (isMainAgent(requests[i]) && requests[i].response?.body?.usage) {
-                    const total = getTotal(requests[i]);
-                    const maxTokens = calibrationTokens || contextWindow?.context_window_size || getModelMaxTokens(getEffectiveModel(requests[i]) || this.state.settingsModel);
-                    const usable = maxTokens * 0.835;
-                    if (usable > 0 && total > 0) {
-                      contextPercent = Math.min(100, Math.max(0, Math.round(total / usable * 100)));
-                    }
-                    break;
-                  }
-                }
-              }
-            }
-            // 回退到最后一次有效值，避免闪烁
-            if (contextPercent === 0 && this._lastContextPercent > 0) {
-              contextPercent = this._lastContextPercent;
-            }
-            // /clear 后立即把血条压到乐观水位；下一次 SSE context_window 推送会取消这个覆盖
-            if (contextBarOptimistic) contextPercent = OPTIMISTIC_CLEAR_PERCENT;
-            const ctxColor = contextPercent >= 80 ? 'var(--color-error-light)' : contextPercent >= 60 ? 'var(--color-warning-light)' : 'var(--color-success)';
-
-            return isLocalLog ? (
-              <Tag className={`${styles.liveTag} ${styles.liveTagHistory}`}>
-                <span className={styles.liveTagText}>{t('ui.historyLog', { file: localLogFile })}</span>
-              </Tag>
-            ) : (
-              <Popover
-                content={this.state._cachePopoverOpen ? this.renderCacheContentPopover(contextPercent) : <div className={styles.cachePopoverPlaceholder} />}
-                trigger="hover"
-                placement="bottomLeft"
-                overlayInnerStyle={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-hover)', borderRadius: 8, padding: '8px 8px' }}
-                onOpenChange={(open) => {
-                  this.setState({ _cachePopoverOpen: open });
-                  if (!open) this._cacheScrollInited = false;
-                  // 首次打开 + 未加载 + live-tail → 拉一次文件系统权威数据
-                  if (open && this.state._fsSkills === null && !this.props.isLocalLog) this.reloadFsSkills();
-                }}
-              >
-                <span className={styles.liveTag} style={{ borderColor: ctxColor, color: ctxColor }}>
-                  <span className={styles.liveTagFill} style={{ width: `${contextPercent}%`, backgroundColor: ctxColor }} />
-                  <span className={styles.liveTagContent}>
-                    <span className={styles.liveTagText}>
-                      {t('ui.liveMonitoring')}{projectName ? `:${projectName}` : ''}
-                    </span>
-                  </span>
-                </span>
-              </Popover>
-            );
-          })()}
+          <span className={styles.headerProjectName}>
+            {t('ui.liveMonitoring')}{projectName ? `:${projectName}` : ''}
+          </span>
+          {this.renderContextBarPortal()}
           {updateInfo && (
             <Tag
               color="orange"
@@ -1480,6 +1351,41 @@ class AppHeader extends React.Component {
         </Space>
 
         <Space size={12} align="center" className={styles.headerRightRow}>
+          {(() => {
+            // 持久 bell：当存在被 ESC/点遮罩 minimised 的 pending（dismissedIds 命中 approvalGlobal 中的 id），
+            // 或本 tab 在 main 端有 ownPending 但本地 approvalGlobal 为空（WS 重连/丢状态边缘），
+            // 渲染一个 bell 按钮供用户主动唤起 modal。点击 → onApprovalReopen 清 dismissedIds，
+            // ApprovalModal 的 visibleKinds 由此重新命中显示。
+            const ag = this.props.approvalGlobal;
+            const adi = this.props.approvalDismissedIds;
+            const own = this.props.approvalOwnPending || { ask: 0, ptyPlan: 0 };
+            if (!ag || !this.props.onApprovalReopen) return null;
+            let dismissedActive = 0;
+            if (ag.ask?.ask?.id != null && adi instanceof Set && adi.has(`ask:${ag.ask.ask.id}`)) dismissedActive++;
+            if (ag.ptyPlan?.ptyPlan?.id != null && adi instanceof Set && adi.has(`ptyPlan:${ag.ptyPlan.ptyPlan.id}`)) dismissedActive++;
+            const localEmpty = !ag.ask?.ask && !ag.ptyPlan?.ptyPlan;
+            const orphanCount = localEmpty ? ((own.ask || 0) + (own.ptyPlan || 0)) : 0;
+            const total = dismissedActive + orphanCount;
+            if (total === 0) return null;
+            const titleKey = dismissedActive > 0 ? 'ui.approval.bell.reopen' : 'ui.approval.bell.orphan';
+            const titleFallback = dismissedActive > 0 ? 'Reopen approval modal' : 'Server has pending approvals';
+            const _tr = (k, p, f) => { try { const r = t(k, p); return (r && r !== k) ? r : f; } catch { return f; } };
+            return (
+              <button
+                type="button"
+                className={styles.approvalBell}
+                aria-label={_tr(titleKey, null, titleFallback)}
+                title={_tr(titleKey, null, titleFallback)}
+                onClick={() => this.props.onApprovalReopen && this.props.onApprovalReopen()}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M12 2a6 6 0 0 0-6 6v3.5L4.5 14a1 1 0 0 0 .8 1.6h13.4a1 1 0 0 0 .8-1.6L18 11.5V8a6 6 0 0 0-6-6z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" fill="none"/>
+                  <path d="M10 18a2 2 0 0 0 4 0" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/>
+                </svg>
+                {total > 0 && <span className={styles.approvalBellBadge}>{total}</span>}
+              </button>
+            );
+          })()}
           {countdownText && viewMode === 'raw' && (
             <Tag className={styles.headerCountdownTag} style={{ color: countdownText === t('ui.cacheExpired') ? 'var(--color-error-light)' : 'var(--text-secondary)' }}>
               {t('ui.cacheCountdown', { type: cacheType ? `(${cacheType})` : '' })}
@@ -1490,7 +1396,9 @@ class AppHeader extends React.Component {
             <>
 <Popover
               content={
-                <div className={styles.qrcodePopover}>
+                /* stopPropagation 防止 popover 内部点击(QR canvas / Input / Copy 图标)冒泡到外层 click 触发 onOpenChange(false)。
+                   单独触发关闭只通过 trigger 元素自身或外部空白处。 */
+                <div className={styles.qrcodePopover} onClick={e => e.stopPropagation()}>
                   <div className={styles.qrcodeTitle}>{t('ui.scanToCoding')} <ConceptHelp doc="QRCode" /></div>
                   <QRCodeCanvas value={this.state.localUrl} size={200} bgColor={themeColor === 'light' ? '#ffffff' : '#141414'} fgColor={themeColor === 'light' ? '#1a1a1a' : '#d9d9d9'} level="M" />
                   <Input
@@ -1510,7 +1418,11 @@ class AppHeader extends React.Component {
                   />
                 </div>
               }
-              trigger={['hover', 'focus']}
+              /* 移动端 hover/focus 不可靠(tap → focus → 立即触发外部 click 关闭),改 click 受控:
+                 单击触发体打开 / 再次单击或外部空白处关闭。stopPropagation 确保 popover 内点击不关。 */
+              trigger={['click']}
+              open={this.state.qrPopoverOpen}
+              onOpenChange={(o) => this.setState({ qrPopoverOpen: o })}
               placement="bottomRight"
               overlayInnerStyle={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-hover)', borderRadius: 8, padding: '8px 8px' }}
             >
@@ -1584,6 +1496,11 @@ class AppHeader extends React.Component {
             {viewMode === 'raw' ? t('ui.chatMode') : t('ui.rawMode')}
           </Button>
         </Space>
+        <MemoryDetailModal
+          detail={this.state._memoryDetail}
+          onClose={() => this.setState({ _memoryDetail: null })}
+          onOpenMemoryDetail={this.loadMemoryDetail}
+        />
         <Modal
           title={`${t('ui.userPrompt')} (${this.state.promptData.length}${t('ui.promptCountUnit')})`}
           open={this.state.promptModalVisible}
@@ -1641,50 +1558,7 @@ class AppHeader extends React.Component {
           onClose={() => this.setState({ settingsDrawerVisible: false })}
         >
           <div className={styles.settingsGroupBox}>
-            <div className={styles.settingsGroupTitle}>{t('ui.chatDisplaySwitches')}</div>
-            <div className={styles.settingsItem}>
-              <span className={styles.settingsLabel}>{t('ui.collapseToolResults')}</span>
-              <Switch
-                checked={!!collapseToolResults}
-                onChange={(checked) => onCollapseToolResultsChange && onCollapseToolResultsChange(checked)}
-              />
-            </div>
-            <div className={styles.settingsItem}>
-              <span className={styles.settingsLabel}>{t('ui.expandThinking')}</span>
-              <Switch
-                checked={!!expandThinking}
-                onChange={(checked) => onExpandThinkingChange && onExpandThinkingChange(checked)}
-              />
-            </div>
-            <div className={styles.settingsItem}>
-              <span className={styles.settingsLabel}>{t('ui.showFullToolContent')}</span>
-              <Switch
-                checked={!!showFullToolContent}
-                onChange={(checked) => onShowFullToolContentChange && onShowFullToolContentChange(checked)}
-              />
-            </div>
-          </div>
-          <div className={styles.settingsGroupBox}>
-            <div className={styles.settingsGroupTitle}>{t('ui.userPreferences')}</div>
-            <div className={styles.settingsItem}>
-              <span className={styles.settingsLabel}>{t('ui.resumeAutoChoice')}</span>
-              <Switch
-                checked={!!resumeAutoChoice}
-                onChange={(checked) => onResumeAutoChoiceToggle && onResumeAutoChoiceToggle(checked)}
-              />
-            </div>
-            {resumeAutoChoice && (
-              <div className={styles.settingsItem}>
-                <Radio.Group
-                  value={resumeAutoChoice}
-                  onChange={(e) => onResumeAutoChoiceChange && onResumeAutoChoiceChange(e.target.value)}
-                  size="small"
-                >
-                  <Radio value="continue">{t('ui.resumeAutoChoice.continue')}</Radio>
-                  <Radio value="new">{t('ui.resumeAutoChoice.new')}</Radio>
-                </Radio.Group>
-              </div>
-            )}
+            <div className={styles.settingsGroupTitle}>{t('ui.chatDisplay')}</div>
             <div className={styles.settingsItem}>
               <span className={styles.settingsLabel}>{t('ui.permission.autoApprove.setting')}</span>
               <Select
@@ -1704,8 +1578,83 @@ class AppHeader extends React.Component {
                 style={{ width: 100 }}
               />
             </div>
+            {this.props.approvalPrefs && this.props.onApprovalPrefsChange && (
+              <>
+                <div className={styles.settingsItem}>
+                  <span className={styles.settingsLabel}>{t('ui.approval.settings.modalEnabled')}</span>
+                  <Switch
+                    checked={this.props.approvalPrefs.modalEnabled !== false}
+                    onChange={(checked) => this.props.onApprovalPrefsChange({ modalEnabled: checked })}
+                  />
+                </div>
+                <div className={styles.settingsItem}>
+                  <span className={styles.settingsLabel}>{t('ui.approval.settings.soundEnabled')}</span>
+                  <Switch
+                    checked={!!this.props.approvalPrefs.soundEnabled}
+                    onChange={(checked) => this.props.onApprovalPrefsChange({ soundEnabled: checked })}
+                  />
+                </div>
+                {/* notifyOnlyWhenHidden 依赖 electron main 进程的 OS Notification + 窗口聚焦判断,
+                    纯 web 模式下 main.js 路径不存在,开关无效果 → 仅 electron 启动模式显示。 */}
+                {typeof window !== 'undefined' && window.tabBridge && (
+                  <div className={styles.settingsItem}>
+                    <span className={styles.settingsLabel}>{t('ui.approval.settings.notifyOnlyWhenHidden')}</span>
+                    <Switch
+                      checked={this.props.approvalPrefs.notifyOnlyWhenHidden !== false}
+                      onChange={(checked) => this.props.onApprovalPrefsChange({ notifyOnlyWhenHidden: checked })}
+                    />
+                  </div>
+                )}
+              </>
+            )}
+            <div className={styles.settingsItem}>
+              <span className={styles.settingsLabel}>{t('ui.expandThinking')}</span>
+              <Switch
+                checked={!!expandThinking}
+                onChange={(checked) => onExpandThinkingChange && onExpandThinkingChange(checked)}
+              />
+            </div>
+            <div className={styles.settingsItem}>
+              <span className={styles.settingsLabel}>{t('ui.showFullToolContent')}</span>
+              <Switch
+                checked={!!showFullToolContent}
+                onChange={(checked) => onShowFullToolContentChange && onShowFullToolContentChange(checked)}
+              />
+            </div>
+            {showFullToolContent && (
+              <div className={styles.settingsItem}>
+                <span className={styles.settingsLabel}>{t('ui.collapseToolResults')}</span>
+                <Switch
+                  checked={!!collapseToolResults}
+                  onChange={(checked) => onCollapseToolResultsChange && onCollapseToolResultsChange(checked)}
+                />
+              </div>
+            )}
           </div>
           <div className={styles.settingsGroupBox}>
+            <div className={styles.settingsGroupTitle}>{t('ui.logSettings')}</div>
+            <div className={styles.settingsItem}>
+              <span className={styles.settingsLabel}>{t('ui.resumeAutoChoice')}</span>
+              <Switch
+                checked={!!resumeAutoChoice}
+                onChange={(checked) => onResumeAutoChoiceToggle && onResumeAutoChoiceToggle(checked)}
+              />
+            </div>
+            {resumeAutoChoice && (
+              <div className={styles.settingsItem}>
+                <Radio.Group
+                  value={resumeAutoChoice}
+                  onChange={(e) => onResumeAutoChoiceChange && onResumeAutoChoiceChange(e.target.value)}
+                  size="small"
+                >
+                  <Radio value="continue">{t('ui.resumeAutoChoice.continue')}</Radio>
+                  <Radio value="new">{t('ui.resumeAutoChoice.new')}</Radio>
+                </Radio.Group>
+              </div>
+            )}
+          </div>
+          <div className={styles.settingsGroupBox}>
+            <div className={styles.settingsGroupTitle}>{t('ui.themeStyle')}</div>
             <div className={styles.settingsItem}>
               <span className={styles.settingsLabel}>{t('ui.themeColor')}</span>
               <Select
@@ -1719,8 +1668,6 @@ class AppHeader extends React.Component {
                 style={{ width: 140 }}
               />
             </div>
-          </div>
-          <div className={styles.settingsGroupBox}>
             <div className={styles.settingsItem}>
               <span className={styles.settingsLabel}>{t('ui.languageSettings')}</span>
               <Select
@@ -2001,10 +1948,7 @@ class AppHeader extends React.Component {
         }
         return;
       }
-      message.success(enable
-        ? t('ui.skillEnabled', { name: skill.name })
-        : t('ui.skillDisabled', { name: skill.name })
-      );
+      // 切换成功不弹 toast：Switch 状态本身已反馈，再加 toast 显得吵
       // 乐观翻 _fsSkills 里这条的 enabled —— 如果后面 reloadFsSkills 失败，chip 也能立即反映用户动作，
       // 不会退化到历史解析让用户以为操作没生效。reload 成功会用权威数据覆盖。
       this.setState(prev => ({
@@ -2013,11 +1957,22 @@ class AppHeader extends React.Component {
           : prev._fsSkills,
       }));
       // 重拉让 popover chip 和管理弹窗用权威数据一次性对齐。拉失败保留乐观值。
+      // 关键：保持当前 modal 显示顺序，避免服务器返回顺序变化时用户看到 card 跳来跳去；
+      // 新增的 entries（modal 之前没见过的）追加到末尾。
       const result = await this.reloadFsSkills();
       if (result.ok) {
-        this.setState(prev => ({
-          _skillsModal: { ...prev._skillsModal, skills: result.skills },
-        }));
+        this.setState(prev => {
+          const orderMap = new Map(prev._skillsModal.skills.map((s, i) => [`${s.source}-${s.name}`, i]));
+          const merged = [...result.skills].sort((a, b) => {
+            const ai = orderMap.get(`${a.source}-${a.name}`);
+            const bi = orderMap.get(`${b.source}-${b.name}`);
+            if (ai === undefined && bi === undefined) return 0;
+            if (ai === undefined) return 1;
+            if (bi === undefined) return -1;
+            return ai - bi;
+          });
+          return { _skillsModal: { ...prev._skillsModal, skills: merged } };
+        });
       }
     } catch (e) {
       // 网络异常也回滚
@@ -2038,83 +1993,16 @@ class AppHeader extends React.Component {
 
   renderSkillsManagerModal() {
     const modal = this.state._skillsModal || {};
-    const { open = false, loading = false, skills = [], error = null, toggling = new Set() } = modal;
     return (
-      <Modal
-        title={t('ui.skillManagerTitle')}
-        open={open}
-        onCancel={() => this.setState(prev => ({ _skillsModal: { ...prev._skillsModal, open: false } }))}
-        footer={null}
-        width="min(1200px, calc(100vw - 80px))"
-        zIndex={1100}
-        styles={{ body: { maxHeight: '70vh', overflowY: 'auto', padding: '16px 20px' } }}
-      >
-        {loading ? (
-          <div className={styles.skillsEmpty}><Spin /></div>
-        ) : error ? (
-          <div className={styles.skillsEmpty}>{t('ui.skillsLoadFailed', { reason: this.getSkillsLoadErrorLabel(error) || error })}</div>
-        ) : skills.length === 0 ? (
-          <div className={styles.skillsEmpty}>{t('ui.noSkillsLoaded')}</div>
-        ) : (
-          <>
-            {/* 只把 user / project（可切换）放 card 列表；plugin + builtin 折叠到底部 chip 行 */}
-            {skills.filter(s => s.source === 'user' || s.source === 'project').length > 0 && (
-              <div className={styles.skillsList}>
-                {skills.filter(s => s.source === 'user' || s.source === 'project').map((s, i) => {
-                  const key = `${s.source}-${s.name}`;
-                  const isToggling = toggling.has(key);
-                  return (
-                    <div key={`${key}-${i}`} className={`${styles.skillCard} ${!s.enabled ? styles.skillCardDisabled : ''}`}>
-                      <div className={styles.skillCardHeader}>
-                        <div className={styles.skillCardTitleRow}>
-                          <span className={`${styles.skillSourceBadge} ${styles['skillSource_' + s.source]}`}>
-                            {t('ui.skillSource.' + s.source)}
-                          </span>
-                          <div className={styles.skillCardName}>{s.name}</div>
-                        </div>
-                        <div className={styles.skillCardActions}>
-                          <Switch size="small" checked={s.enabled} loading={isToggling} onChange={() => this.handleToggleSkill(s)} />
-                        </div>
-                      </div>
-                      {s.description && <div className={styles.skillCardDesc}>{s.description}</div>}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-            {/* Plugin：不可单独禁用（要走 `claude plugin disable <name>` CLI），折叠成 chip 行；每 chip tooltip 带 plugin 名 */}
-            {skills.filter(s => s.source === 'plugin').length > 0 && (
-              <div className={styles.skillsReadonlySection}>
-                <div className={styles.skillsReadonlyLabel}>{t('ui.skillsPluginLabel')}</div>
-                <div className={styles.toolChipGrid}>
-                  {skills.filter(s => s.source === 'plugin').map((s, i) => {
-                    // pluginName 现在返 "name@marketplace"（pluginKey），tooltip 显示时剥后缀
-                    const pluginDisplay = (s.pluginName || '').split('@')[0];
-                    return (
-                      <Tooltip key={`plugin-${s.name}-${i}`} title={t('ui.skillCannotDisablePlugin', { plugin: pluginDisplay })}>
-                        <span className={styles.cacheToolChip}>{s.name}</span>
-                      </Tooltip>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-            {/* Builtin：同样折叠为 chip 行，tooltip 解释"硬编码无法禁用" */}
-            {skills.filter(s => s.source === 'builtin').length > 0 && (
-              <div className={styles.skillsReadonlySection}>
-                <div className={styles.skillsReadonlyLabel}>{t('ui.skillsBuiltinLabel')}</div>
-                <div className={styles.toolChipGrid}>
-                  {skills.filter(s => s.source === 'builtin').map(s => (
-                    <Tooltip key={s.name} title={t('ui.skillCannotDisableBuiltin')}>
-                      <span className={styles.cacheToolChip}>{s.name}</span>
-                    </Tooltip>
-                  ))}
-                </div>
-              </div>
-            )}
-          </>
-        )}
-      </Modal>
+      <SkillsManagerModal
+        open={modal.open || false}
+        loading={modal.loading || false}
+        error={modal.error || null}
+        skills={modal.skills || []}
+        toggling={modal.toggling}
+        onToggle={(s) => this.handleToggleSkill(s)}
+        onClose={() => this.setState(prev => ({ _skillsModal: { ...prev._skillsModal, open: false } }))}
+      />
     );
   }
 

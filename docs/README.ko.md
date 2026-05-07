@@ -20,8 +20,18 @@ Claude Code를 기반으로 직접의 개발 경험을 증류하여 축적한 Vi
 
 ### ccv 설치
 
+#### npm으로 설치
+
 ```bash
 npm install -g cc-viewer --registry=https://registry.npmjs.org
+```
+
+#### Homebrew로 설치 (macOS / Linux 권장)
+
+```bash
+brew tap weiesky/cc-viewer
+brew install cc-viewer
+brew upgrade cc-viewer   # 업데이트용 — brew 설치에는 npm install -g를 사용하지 마세요
 ```
 
 ### 실행 방법

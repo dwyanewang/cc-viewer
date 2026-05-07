@@ -1,10 +1,10 @@
 import React, { useState, useRef, useCallback } from 'react';
 import { Modal, Button, Checkbox } from 'antd';
 import { t } from '../i18n';
-import { apiUrl } from '../utils/apiUrl';
 import styles from './TerminalPanel.module.css';
 
-function savePresets(items, dismissed) {
+// 序列化 + 写入由调用方注入的 onSavePresets 回调完成(走 SettingsContext.updatePreferences)。
+function buildPresetsPayload(items, dismissed) {
   const payload = {
     presetShortcuts: items.map(i => {
       const o = { teamName: i.teamName, description: i.description };
@@ -14,16 +14,15 @@ function savePresets(items, dismissed) {
     }),
   };
   if (dismissed) payload.dismissedBuiltinPresets = [...dismissed];
-  fetch(apiUrl('/api/preferences'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  }).then(() => {
-    window.dispatchEvent(new Event('ccv-presets-changed'));
-  }).catch(() => {});
+  return payload;
 }
 
-export default function PresetModal({ open, onClose, items, onItemsChange, dismissedBuiltinPresets }) {
+export default function PresetModal({ open, onClose, items, onItemsChange, dismissedBuiltinPresets, onSavePresets }) {
+  const savePresets = useCallback((nextItems, nextDismissed) => {
+    if (typeof onSavePresets === 'function') {
+      onSavePresets(buildPresetsPayload(nextItems, nextDismissed));
+    }
+  }, [onSavePresets]);
   const [selected, setSelected] = useState(new Set());
   const [addVisible, setAddVisible] = useState(false);
   const [addName, setAddName] = useState('');

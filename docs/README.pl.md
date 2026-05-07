@@ -20,8 +20,18 @@ Zestaw narzędzi Vibe Coding wydestylowany z praktycznego doświadczenia w rozwo
 
 ### Instalacja ccv
 
+#### Instalacja przez npm
+
 ```bash
 npm install -g cc-viewer --registry=https://registry.npmjs.org
+```
+
+#### Instalacja przez Homebrew (zalecane dla macOS / Linux)
+
+```bash
+brew tap weiesky/cc-viewer
+brew install cc-viewer
+brew upgrade cc-viewer   # do aktualizacji — NIE używaj npm install -g dla instalacji brew
 ```
 
 ### Uruchomienie

@@ -269,7 +269,10 @@ function TeamGantt({ teamAgents, teamTotalStart, teamTotalEnd, leadSegments, gan
               {leadSegments && leadSegments.filter(s => s.label !== 'idle').map((seg, i) => {
                 const tips = { create: 'Team Created', tasks: 'Tasks Created', spawn: 'Agents Spawned', msg: 'SendMessage', cleanup: 'Team Cleanup', text: 'Status Update', thinking: 'Thinking...', 'report-received': 'Report Received' };
                 const dColor = seg.label === 'thinking' ? 'var(--color-code-purple)' : seg.label === 'report-received' ? 'var(--color-success)' : 'var(--color-primary)';
-                return <Tooltip key={`d${i}`} title={tips[seg.label] || seg.label}><span className={styles.teamGanttDiamond} style={{ left: pct(seg.start) + '%', color: dColor }}>◆</span></Tooltip>;
+                // 原生 title 替代 antd Tooltip:gantt 时间线一段会话能渲 100+ 钻石,每个 Tooltip wrapper
+                // 都跑 useToken/useStyleRegister/useZIndex 等 hook(trace 显示 tooltip/index.js 累计 756ms)。
+                // 钻石提示是探索性的,~700ms 浏览器原生延迟可接受;不需要跨行。改 span+title 后 N 倍开销归零。
+                return <span key={`d${i}`} title={tips[seg.label] || seg.label} className={styles.teamGanttDiamond} style={{ left: pct(seg.start) + '%', color: dColor }}>◆</span>;
               })}
             </div>
           </div>
@@ -290,7 +293,8 @@ function TeamGantt({ teamAgents, teamTotalStart, teamTotalEnd, leadSegments, gan
                 {ag.events.filter(ev => !ev.label.startsWith('tool:')).map((ev, ei) => {
                   const tips = { spawn: 'Agent Spawned', claim: 'Task Claimed', done: 'Task Completed', shutdown: 'Shutdown Request', 'msg-in': 'Message Received', report: 'Report Submitted' };
                   const tip = tips[ev.label] || ev.label;
-                  return <Tooltip key={`d${ei}`} title={`${ag.name}: ${tip}`}><span className={`${styles.teamGanttDiamond} ${styles.ganttLabelAgent}`} style={{ left: pct(ev.ts) + '%' }}>◆</span></Tooltip>;
+                  // 同上:agent 行事件钻石也走原生 title,避免每个 agent × 每个事件叠 antd Tooltip 开销。
+                  return <span key={`d${ei}`} title={`${ag.name}: ${tip}`} className={`${styles.teamGanttDiamond} ${styles.ganttLabelAgent}`} style={{ left: pct(ev.ts) + '%' }}>◆</span>;
                 })}
               </div>
             </div>
@@ -371,7 +375,7 @@ function TeamGantt({ teamAgents, teamTotalStart, teamTotalEnd, leadSegments, gan
 }
 
 /* ── Main modal component ── */
-function TeamModal({ session, requests, mainAgentSessions, collapseToolResults, expandThinking, userProfile, onViewRequest, onClose }) {
+function TeamModal({ session, requests, mainAgentSessions, collapseToolResults, expandThinking, userProfile, onViewRequest, isHistoryLog, onClose }) {
   const modalBodyRef = useRef(null);
   const ganttIndicatorRef = useRef(null);
   const ganttWrapRef = useRef(null);
@@ -537,10 +541,10 @@ function TeamModal({ session, requests, mainAgentSessions, collapseToolResults, 
           <div className={styles.teamModalBody} ref={modalBodyRef} onScroll={onScroll}>
             {entries.map((entry, i) => (
               <div key={`tw-${i}`} data-timestamp={entry.timestamp}>
-                {entry.type === 'user' && <ChatMessage role="user" text={entry.text} timestamp={entry.timestamp} userProfile={userProfile} modelInfo={modelInfo} requestIndex={entry.requestIndex} onViewRequest={onViewRequest} />}
-                {entry.type === 'assistant' && <ChatMessage role="assistant" content={entry.content} timestamp={entry.timestamp} modelInfo={entry.modelInfo} collapseToolResults={collapseToolResults} expandThinking={expandThinking} toolResultMap={{}} askAnswerMap={{}} requestIndex={entry.requestIndex} onViewRequest={onViewRequest} />}
-                {entry.type === 'sub-agent' && <ChatMessage role="sub-agent-chat" content={entry.content} toolResultMap={entry.toolResultMap} label={entry.label} isTeammate={entry.isTeammate} timestamp={entry.timestamp} collapseToolResults={collapseToolResults} expandThinking={expandThinking} requestIndex={entry.requestIndex} onViewRequest={onViewRequest} />}
-                {entry.type === 'context' && <ChatMessage role="assistant" content={[{ type: 'text', text: entry.text }]} timestamp={entry.timestamp} modelInfo={modelInfo} collapseToolResults={collapseToolResults} expandThinking={expandThinking} toolResultMap={{}} askAnswerMap={{}} />}
+                {entry.type === 'user' && <ChatMessage role="user" text={entry.text} timestamp={entry.timestamp} userProfile={userProfile} modelInfo={modelInfo} requestIndex={entry.requestIndex} onViewRequest={onViewRequest} isHistoryLog={isHistoryLog} />}
+                {entry.type === 'assistant' && <ChatMessage role="assistant" content={entry.content} timestamp={entry.timestamp} modelInfo={entry.modelInfo} collapseToolResults={collapseToolResults} expandThinking={expandThinking} toolResultMap={{}} askAnswerMap={{}} requestIndex={entry.requestIndex} onViewRequest={onViewRequest} isHistoryLog={isHistoryLog} />}
+                {entry.type === 'sub-agent' && <ChatMessage role="sub-agent-chat" content={entry.content} toolResultMap={entry.toolResultMap} label={entry.label} isTeammate={entry.isTeammate} timestamp={entry.timestamp} collapseToolResults={collapseToolResults} expandThinking={expandThinking} requestIndex={entry.requestIndex} onViewRequest={onViewRequest} isHistoryLog={isHistoryLog} />}
+                {entry.type === 'context' && <ChatMessage role="assistant" content={[{ type: 'text', text: entry.text }]} timestamp={entry.timestamp} modelInfo={modelInfo} collapseToolResults={collapseToolResults} expandThinking={expandThinking} toolResultMap={{}} askAnswerMap={{}} isHistoryLog={isHistoryLog} />}
                 {entry.type === 'teammate-report' && (
                   <div className={styles.teammateReportEntry}>
                     <div className={styles.teammateReportHeader}>

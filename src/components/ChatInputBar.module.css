@@ -23,6 +23,12 @@
   flex: 1;
 }
 
+/* 包住 textarea + ghostText + interimPreview，让 absolute 子元素锚到 textarea 顶部，
+   而不是 chatTextareaWrap 顶（否则有 imagePreviewStrip 时会被 ghostText 覆盖）。 */
+.textareaWithGhost {
+  position: relative;
+}
+
 .chatTextarea {
   width: 100%;
   min-height: 22px;
@@ -48,6 +54,21 @@
   align-items: center;
   padding: 4px 6px 6px;
   gap: 4px;
+}
+
+/* 底部按钮区 3 段式：
+   - .chatInputBottomLeft 紧贴左边界（+ / mic 等操作按钮组）
+   - .ctxBarSlot 中段，flex-basis 200 + flex-shrink 1 自适应填充至 200px
+   - .chatInputBottomRight 用 margin-left:auto 抢占剩余空间贴右边界（hint + send） */
+.chatInputBottomLeft,
+.chatInputBottomRight {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.chatInputBottomRight {
+  margin-left: auto;
 }
 
 .plusArea {
@@ -188,11 +209,28 @@
 }
 
 .chatInputHint {
-  flex: 1;
   font-size: 11px;
   color: var(--border-light);
   user-select: none;
   padding: 0 4px;
+}
+
+/* 血条 portal slot：3 段式中段。flex-basis 200 + flex-shrink 1，把左/右段之间的空间填满至 200px 上限；
+   高度对齐 +/mic 按钮直径（28px），与圆形按钮在视觉上协调。
+   margin-left:4 在 .chatInputBottom 的 gap:4 基础上额外加 4，使血条与左侧 mic 之间的间距加倍到 ~8px（设计要求）。
+   `> *` 让 LiveTagPopover 的 .liveTag 撑满 slot 宽度。 */
+.ctxBarSlot {
+  flex: 0 1 200px;
+  max-width: 200px;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  height: 28px;
+  margin-left: 4px;
+}
+.ctxBarSlot > * {
+  flex: 1 1 0;
+  min-width: 0;
 }
 
 .sendBtn {

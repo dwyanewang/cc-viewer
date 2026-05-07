@@ -4,12 +4,13 @@ import { createConnection } from 'node:net';
 import { randomBytes } from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync, watchFile, unwatchFile, statSync, readdirSync, renameSync, unlinkSync, rmSync, openSync, readSync, closeSync, realpathSync, mkdirSync, createReadStream, cpSync, copyFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, join, extname, resolve, basename } from 'node:path';
+import { dirname, join, extname, resolve, basename, sep } from 'node:path';
 import { homedir, platform, networkInterfaces } from 'node:os';
 import { execFile, exec, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Worker } from 'node:worker_threads';
-import { isPathContained, readFileContent, writeFileContent, resolveFilePath, ERROR_STATUS_MAP, validateImportDir } from './lib/file-api.js';
+import { isPathContained, ERROR_STATUS_MAP, validateImportDir } from './lib/file-api.js';
+import { isReadAllowed, reasonToStatus, bumpWorkspacesVersion } from './lib/file-access-policy.js';
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
@@ -47,6 +48,8 @@ import { watchLogFile, startWatching, getWatchedFiles, sendEventToClients, sendT
 import { isMainAgentEntry, extractCachedContent } from './lib/kv-cache-analyzer.js';
 import { listLocalLogs, deleteLogFiles, mergeLogFiles } from './lib/log-management.js';
 import { countLogEntries, streamRawEntriesAsync, readPagedEntries } from './lib/log-stream.js';
+import { awaitDrainOrClose } from './lib/sse-backpressure.js';
+import { enrichRawIfNeeded } from './lib/enrich-plan-input.js';
 import { buildTeamStatusResponse } from './lib/team-runtime.js';
 
 
@@ -123,6 +126,31 @@ let pendingAskHook = null; // { questions, res, timer, createdAt }
 const pendingPermHooks = new Map(); // Map<id, { toolName, input, res, timer, createdAt }>
 const PERM_HOOK_MAP_MAX = 50;
 
+// Notify the parent process (Electron main, when forked under tab-worker) about pending state changes.
+// No-op outside Electron (process.send is undefined when run as a standalone Node server).
+// Only ask-hook-* / sdk-ask-* are translated. Permission and SDK plan stay inline-only and do not
+// drive global modal / flashFrame / Notification (per UX direction). PTY plan is parsed in the
+// renderer and reported via window.tabBridge directly, not through this server-side hook.
+function _notifyParentPending(msg) {
+  if (!process.send || !msg || typeof msg !== 'object' || !msg.type) return;
+  let event = null;
+  switch (msg.type) {
+    case 'ask-hook-pending':
+    case 'sdk-ask-pending':
+      event = { type: 'pending-add', kind: 'ask', id: msg.id != null ? String(msg.id) : '__ask__', payload: { questions: msg.questions, projectName: _projectName || '' } };
+      break;
+    case 'ask-hook-timeout':
+    case 'sdk-ask-timeout':
+    case 'ask-hook-resolved':
+    case 'sdk-ask-resolved':
+      event = { type: 'pending-remove', kind: 'ask', id: msg.id != null ? String(msg.id) : '__ask__' };
+      break;
+    default:
+      return;
+  }
+  try { process.send(event); } catch {}
+}
+
 // Live stream chunk sequence tracking (per request key) — prevents out-of-order broadcasts
 const _liveStreamLastSeq = new Map(); // Map<`${timestamp}|${url}`, lastSeq>
 
@@ -158,6 +186,13 @@ export function initPostLaunch() {
 
 // Global POST body size limit (10MB) to prevent OOM from malicious/buggy clients
 const MAX_POST_BODY = 10 * 1024 * 1024;
+
+// /events 默认重放窗口：bare 请求（无 since、无 limit、无 cc）时使用，
+// 防止长会话把数十 MB 历史一次性灌进浏览器导致 renderer OOM。
+// 用户显式 ?limit=0 可恢复全量加载（power-user 逃生口）。
+const DEFAULT_EVENTS_LIMIT = 1000;
+// SSE 单客户端 backpressure 容忍上限：连续未排空 > 此时长则视为 dead 客户端剔除。
+const SSE_BACKPRESSURE_TIMEOUT_MS = 5000;
 
 
 
@@ -278,7 +313,7 @@ async function handleRequest(req, res) {
   const method = req.method;
 
   // WebSocket 路径不处理，交给 upgrade 事件
-  if (url === '/ws/terminal') {
+  if (url === '/ws/terminal' || url === '/ws/terminal-scratch') {
     return;
   }
 
@@ -303,6 +338,35 @@ async function handleRequest(req, res) {
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Forbidden: invalid token' }));
       return;
+    }
+  }
+
+  // DNS rebinding 防护:即使带了正确 token,Host header 必须落在 allowlist 里。
+  // 默认放行 loopback + 本机所有 LAN IPv4(getAllLocalIps()):cc-viewer 核心场景就是手机扫码访问 LAN URL,
+  // 要求用户每次手动设 CCV_ALLOWED_HOSTS 不可接受。token 仍是必需(server.js:300-310 ACCESS_TOKEN gate),
+  // DNS rebinding 攻击者需精确知道用户 LAN IP 才能利用,门槛降低但不增新攻击面;Vite/Cursor 同行也默认放开 LAN。
+  // CCV_ALLOWED_HOSTS 显式设(包括 '*' 关闭防护)时完全沿用用户值,与 1.6.227 行为一致,向后兼容。
+  // 静态资源和 OPTIONS 预检不挡。
+  if (!isStaticAsset && method !== 'OPTIONS') {
+    const allowedHosts = process.env.CCV_ALLOWED_HOSTS
+      ? process.env.CCV_ALLOWED_HOSTS.split(',').map(s => s.trim()).filter(Boolean)
+      : ['localhost', '127.0.0.1', '::1', '[::1]', ...getAllLocalIps()];
+    if (!allowedHosts.includes('*')) {
+      const hostHeader = (req.headers.host || '').toLowerCase();
+      // 端口剥离:RFC 3986 要求 IPv6 Host 必须带 brackets `[::1]:port`,bare `::1` 末尾 `\d` 会被错剥成 `:`。
+      // 含 `::` 但无 `]` 闭合的视为 bare IPv6,不剥端口。
+      const isBareIPv6 = hostHeader.includes('::') && !hostHeader.includes(']');
+      const hostNoPort = isBareIPv6 ? hostHeader : hostHeader.replace(/:\d+$/, '');
+      const stripBrackets = hostNoPort.replace(/^\[|\]$/g, '');
+      const ok = allowedHosts.some(h => {
+        const hl = h.toLowerCase();
+        return hl === hostNoPort || hl === stripBrackets || hl === `[${stripBrackets}]`;
+      });
+      if (!ok) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'host-not-allowed', host: hostNoPort }));
+        return;
+      }
     }
   }
 
@@ -373,6 +437,7 @@ async function handleRequest(req, res) {
         const fileData = bodyEnd !== -1 ? buf.slice(bodyStart, bodyEnd) : buf.slice(bodyStart);
         const uploadDir = '/tmp/cc-viewer-uploads';
         mkdirSync(uploadDir, { recursive: true });
+        bumpWorkspacesVersion();
         // Unique filename: prepend timestamp to avoid silent overwrite
         const ts = Date.now();
         const dotIdx = originalName.lastIndexOf('.');
@@ -500,6 +565,68 @@ async function handleRequest(req, res) {
         res.end(JSON.stringify({ error: 'Import failed' }));
       }
     });
+    return;
+  }
+
+  // 读取 ~/.claude/plans/*.md 文件内容（用于 ExitPlanMode V2 input.planFilePath 的兜底显示）
+  // 自身保留:.md 后缀、绝对路径、null-byte、2MB 体积。
+  // 路径前缀 / realpath / 敏感拦截委托 lib/file-access-policy.js(allowlist 已含 ~/.claude/)。
+  if (url === '/api/plan-file' && method === 'GET') {
+    try {
+      const raw = parsedUrl.searchParams.get('path') || '';
+      if (!raw) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'missing path' }));
+        return;
+      }
+      if (raw.indexOf('\x00') !== -1) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'invalid path (null byte)' }));
+        return;
+      }
+      if (!raw.toLowerCase().endsWith('.md')) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'invalid extension' }));
+        return;
+      }
+      const isAbs = /^([a-zA-Z]:[\\/]|[\\/])/.test(raw);
+      if (!isAbs) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'absolute path required' }));
+        return;
+      }
+
+      // 委托 policy:realpath + allowlist + denylist + 项目内豁免一气呵成
+      const policy = isReadAllowed(raw);
+      if (!policy.ok) {
+        // 兼容旧测试断言:plan-file 历史用 'forbidden' / 'not found' 大类,reason 携带细节
+        const status = policy.reason === 'realpath-failed' ? 404 : 403;
+        const errLabel = policy.reason === 'realpath-failed' ? 'not found' : 'forbidden';
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: errLabel, reason: policy.reason }));
+        return;
+      }
+
+      // 用 policy 返回的 real 读,避免 TOCTOU
+      const real = policy.real;
+      const st = statSync(real);
+      if (!st.isFile()) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'not a file' }));
+        return;
+      }
+      if (st.size > 2 * 1024 * 1024) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'too large' }));
+        return;
+      }
+      const content = readFileSync(real, 'utf-8');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, content }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: String(e?.message || e) }));
+    }
     return;
   }
 
@@ -805,8 +932,11 @@ async function handleRequest(req, res) {
   }
 
   if (url === '/api/workspaces/stop' && method === 'POST') {
-    import('./pty-manager.js').then(({ killPty }) => {
-      killPty();
+    Promise.all([
+      import('./pty-manager.js').then(({ killPty }) => killPty()),
+      import('./scratch-pty-manager.js').then(({ killAllScratch }) => killAllScratch()).catch(() => {}),
+    ]).then(() => {
+      // 接续原有清理流程
 
       // 停止日志监听
       for (const logFile of getWatchedFiles().keys()) {
@@ -865,24 +995,53 @@ async function handleRequest(req, res) {
     const projectMatch = !projectParam || projectParam === (_projectName || '');
     const useIncremental = !!(sinceParam && ccParam > 0 && projectMatch && !isNaN(new Date(sinceParam).getTime()));
 
-    // 分页参数：移动端首次加载传 limit=200，与 since 互斥
-    const limitParam = parseInt(parsedUrl.searchParams.get('limit'), 10) || 0;
-    const useLimit = !useIncremental && limitParam > 0;
+    // 分页参数：
+    // - mobile 首次加载传 ?limit=200
+    // - bare desktop 请求（无任何 query 参数）默认套 DEFAULT_EVENTS_LIMIT
+    // - 显式 ?limit=0 表示"我要全量"（保留旧行为入口）
+    const limitParamRaw = parsedUrl.searchParams.get('limit');
+    const limitParamGiven = limitParamRaw !== null;
+    const limitParamNum = parseInt(limitParamRaw, 10);
+    let effectiveLimit = 0;
+    if (!useIncremental) {
+      if (limitParamGiven) {
+        effectiveLimit = Number.isFinite(limitParamNum) && limitParamNum > 0 ? limitParamNum : 0;
+      } else {
+        effectiveLimit = DEFAULT_EVENTS_LIMIT;
+      }
+    }
+    const useLimit = effectiveLimit > 0;
 
     // KV-Cache / context_window 追踪（扫描全量条目，不受 since 过滤影响）
     let latestKvCache = null;
     let latestContextWindow = null;
     let pushedContextWindow = false;
 
-    await streamRawEntriesAsync(LOG_FILE, (raw) => {
+    await streamRawEntriesAsync(LOG_FILE, async (raw) => {
       // 直接发送原始 JSON 字符串，不做 parse/reconstruct/stringify
+      // ExitPlanMode V2 空 input 的条目按需补全 plan / planFilePath，其它原样透传
+      if (res.destroyed || !res.writable) return;
+      const out = enrichRawIfNeeded(raw);
       // SSE data 字段不允许裸换行，去除 pretty-printed JSON 的换行
-      res.write('event: load_chunk\ndata: [');
-      res.write(raw.includes('\n') ? raw.replace(/\n/g, '') : raw);
-      res.write(']\n\n');
+      // 写入路径整体 try-catch 兜底：连接在 res.write 之间被对端 RST/destroy 时不至于
+      // 把 EPIPE 抛穿 async callback；res.on('close'|'error') 已会做 clients 数组清理。
+      let drained = true;
+      try {
+        res.write('event: load_chunk\ndata: [');
+        drained = res.write(out.includes('\n') ? out.replace(/\n/g, '') : out);
+        res.write(']\n\n');
+      } catch {
+        return;
+      }
+      // 写缓冲满则等 drain（或 close/error/超时任一 fulfill），防止浏览器侧 renderer OOM。
+      // helper 内部会在 fulfill 时把另外两个监听器从 res 上摘掉，避免 N 次 backpressure
+      // 累积出 N 个 stale close/error listener 触发 MaxListenersExceededWarning。
+      if (!drained) {
+        await awaitDrainOrClose(res, SSE_BACKPRESSURE_TIMEOUT_MS);
+      }
     }, {
       since: useIncremental ? sinceParam : undefined,
-      limit: useLimit ? limitParam : undefined,
+      limit: useLimit ? effectiveLimit : undefined,
       onScan: (raw) => {
         // 轻量追踪最新 MainAgent 的 KV-Cache 和 context_window（仅 regex 检测）
         if (raw.includes('"mainAgent":true') || raw.includes('"mainAgent": true')) {
@@ -947,11 +1106,16 @@ async function handleRequest(req, res) {
     // 这样 watcher 的 sendToClients 不会在 load 阶段向该客户端推送 live entry。
     clients.push(res);
 
-    req.on('close', () => {
+    // req.on('close') 在某些异常断连时不一定立即触发；res 端 close/error 兜底保证
+    // 不会在 clients 数组里留下幽灵 res，防止 sendToClients 后续写入触发慢泄漏。
+    const removeFromClients = () => {
       clearInterval(pingTimer);
       const idx = clients.indexOf(res);
       if (idx !== -1) clients.splice(idx, 1);
-    });
+    };
+    req.on('close', removeFromClients);
+    res.on('close', removeFromClients);
+    res.on('error', removeFromClients);
     return;
   }
 
@@ -963,7 +1127,7 @@ async function handleRequest(req, res) {
     let first = true;
     await streamRawEntriesAsync(LOG_FILE, (raw) => {
       if (!first) res.write(',');
-      res.write(raw);
+      res.write(enrichRawIfNeeded(raw));
       first = false;
     });
     res.write(']');
@@ -983,8 +1147,9 @@ async function handleRequest(req, res) {
     try {
       const result = readPagedEntries(LOG_FILE, { before, limit: limitVal });
       // entries 是原始 JSON 字符串数组，parse 后返回给客户端
+      // ExitPlanMode V2 空 input 的条目用 enrichRawIfNeeded 在 raw 阶段补全
       const entries = result.entries.map(raw => {
-        try { return JSON.parse(raw); } catch { return null; }
+        try { return JSON.parse(enrichRawIfNeeded(raw)); } catch { return null; }
       }).filter(Boolean);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
@@ -1312,6 +1477,211 @@ async function handleRequest(req, res) {
         const status = statusMap[err?.code] || 500;
         res.writeHead(status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: err?.message || 'internal_error', code: err?.code || 'unknown' }));
+      }
+    });
+    return;
+  }
+
+  // Skill 上传/导入 API —— 接受 .zip 或 SKILL.md（忽略大小写），写入用户级 ~/.claude/skills/{name}/
+  // 设计要点：
+  //  · 100MB 上限，跟 /api/upload 一致；
+  //  · 扩展名白名单只放 zip / md（忽略大小写）；其他类型直接 415；
+  //  · zip 内必须含 SKILL.md（任意子目录、忽略大小写），找最浅的那个所在目录作为 skill 根；
+  //  · skill 名优先取 SKILL.md frontmatter 的 name，回落到 zip / md 文件名（去扩展名）；
+  //  · 名字必须通过 validateSkillName，目标目录已存在则 409 拒绝（前端引导用户改 zip 名）。
+  if (url === '/api/skills/import' && method === 'POST') {
+    const contentType = req.headers['content-type'] || '';
+    // boundary 用 [^;]+ 终止避免吞掉后续 Content-Type 参数；长度封顶 200 防止超长串撑爆 buffer 比对。
+    const boundaryMatch = contentType.match(/boundary=([^;]+)/);
+    if (!boundaryMatch || boundaryMatch[1].length > 200) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid boundary' }));
+      return;
+    }
+    const MAX_UPLOAD = 100 * 1024 * 1024;
+    const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+    if (contentLength > MAX_UPLOAD) {
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'File too large (max 100MB)' }));
+      return;
+    }
+    const boundary = boundaryMatch[1].trim().replace(/^["']|["']$/g, '');
+    const chunks = [];
+    let totalSize = 0;
+    let aborted = false;
+    req.on('data', chunk => {
+      totalSize += chunk.length;
+      if (totalSize > MAX_UPLOAD) {
+        aborted = true;
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'File too large (max 100MB)' }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', async () => {
+      if (aborted) return;
+      try {
+        const buf = Buffer.concat(chunks);
+        const headerEnd = buf.indexOf('\r\n\r\n');
+        if (headerEnd === -1) throw Object.assign(new Error('Malformed multipart'), { status: 400 });
+        const headerStr = buf.slice(0, headerEnd).toString();
+        const nameMatch = headerStr.match(/filename="([^"]+)"/);
+        if (!nameMatch) throw Object.assign(new Error('No filename'), { status: 400 });
+        // NFKC 规范化 + 控制字符/路径分隔符过滤 + 零宽和方向覆盖字符过滤（防止 homoglyph / RLO 混淆）
+        const originalName = nameMatch[1]
+          .normalize('NFKC')
+          .replace(/[\x00-\x1f/\\]/g, '_')
+          .replace(/[​-‏‪-‮⁠﻿]/g, '');
+        const lower = originalName.toLowerCase();
+        const isZip = lower.endsWith('.zip');
+        const isMd = lower.endsWith('.md');
+        if (!isZip && !isMd) {
+          throw Object.assign(new Error('Unsupported file type'), { status: 415, code: 'INVALID_TYPE' });
+        }
+        const bodyStart = headerEnd + 4;
+        const closingBoundary = Buffer.from('\r\n--' + boundary);
+        const bodyEnd = buf.indexOf(closingBoundary, bodyStart);
+        const fileData = bodyEnd !== -1 ? buf.slice(bodyStart, bodyEnd) : buf.slice(bodyStart);
+
+        const { validateSkillName } = await import('./lib/skills-api.js');
+        const skillsRoot = join(getClaudeConfigDir(), 'skills');
+        mkdirSync(skillsRoot, { recursive: true });
+
+        // 简单 frontmatter name 解析：抓 `name: xxx` 单行（与 skills-api.js 的 description 解析风格保持一致，最小实现）
+        const parseNameFromMd = (text) => {
+          const m = /^---\s*\n([\s\S]*?)\n---/.exec(text);
+          if (!m) return null;
+          const nm = /^name\s*:\s*(.*)$/m.exec(m[1]);
+          if (!nm) return null;
+          return nm[1].trim().replace(/^["']|["']$/g, '');
+        };
+
+        const fallbackBaseName = (filename, stripExt) => {
+          let n = filename.replace(/^.*[\\/]/, '');
+          if (stripExt) n = n.replace(/\.[^.]+$/, '');
+          return n;
+        };
+
+        let skillName = null;
+        let skillFiles = []; // { relPath, data }
+
+        if (isMd) {
+          const text = fileData.toString('utf8');
+          skillName = parseNameFromMd(text) || fallbackBaseName(originalName, true);
+          skillFiles = [{ relPath: 'SKILL.md', data: fileData }];
+        } else {
+          // zip：用 adm-zip 解压到内存，校验 SKILL.md 存在（忽略大小写），找最浅的 SKILL.md 所在目录作为 skill 根
+          const AdmZip = (await import('adm-zip')).default;
+          let zip;
+          try {
+            zip = new AdmZip(fileData);
+          } catch {
+            throw Object.assign(new Error('Invalid zip archive'), { status: 400, code: 'INVALID_ZIP' });
+          }
+          const entries = zip.getEntries();
+          // zip bomb 防护：单文件 ≤50MB，总解压 ≤200MB；以及拒绝 symlink entry
+          // adm-zip 不直接暴露 isSymbolicLink，需用 attr 高 16 位的 unix mode 判断 0o120000
+          const MAX_PER_FILE = 50 * 1024 * 1024;
+          const MAX_TOTAL_UNCOMPRESSED = 200 * 1024 * 1024;
+          let totalUncompressed = 0;
+          for (const e of entries) {
+            if (e.isDirectory) continue;
+            const unixMode = (e.attr >>> 16) & 0xffff;
+            if ((unixMode & 0o170000) === 0o120000) {
+              throw Object.assign(new Error('Symlinks not allowed in zip'), { status: 400, code: 'INVALID_ZIP' });
+            }
+            const sizeRaw = e.header?.size || 0;
+            if (sizeRaw > MAX_PER_FILE) {
+              throw Object.assign(new Error('File too large in archive'), { status: 400, code: 'ZIP_BOMB' });
+            }
+            totalUncompressed += sizeRaw;
+            if (totalUncompressed > MAX_TOTAL_UNCOMPRESSED) {
+              throw Object.assign(new Error('Archive expands too large'), { status: 400, code: 'ZIP_BOMB' });
+            }
+          }
+          // 找所有 SKILL.md（忽略大小写）的 entry，挑最浅的
+          let bestSkillEntry = null;
+          let bestDepth = Infinity;
+          for (const e of entries) {
+            if (e.isDirectory) continue;
+            const en = e.entryName;
+            const base = en.split('/').pop() || '';
+            if (base.toLowerCase() === 'skill.md') {
+              const depth = en.split('/').length;
+              if (depth < bestDepth) { bestDepth = depth; bestSkillEntry = e; }
+            }
+          }
+          if (!bestSkillEntry) {
+            throw Object.assign(new Error('SKILL.md not found in zip'), { status: 400, code: 'MISSING_SKILL_MD' });
+          }
+          // skill 根 = SKILL.md 所在目录（如果在 zip 根则空字符串）
+          const lastSlash = bestSkillEntry.entryName.lastIndexOf('/');
+          const skillRootPrefix = lastSlash >= 0 ? bestSkillEntry.entryName.slice(0, lastSlash + 1) : '';
+          const skillMdText = bestSkillEntry.getData().toString('utf8');
+          skillName = parseNameFromMd(skillMdText)
+            || (skillRootPrefix ? skillRootPrefix.replace(/\/$/, '').split('/').pop() : null)
+            || fallbackBaseName(originalName, true);
+
+          // 收集 skill 根下的所有文件，规范化 relPath（去掉 root prefix）
+          // 二次校验：header.size 来自 zip 中央目录是攻击者可控的（可谎报 size=0），
+          // 上面 zip bomb 检查已用 header.size 做"廉价初检"快速拒绝；这里 getData() 后用真实 data.length 复核，
+          // 防止恶意 zip 在 header 上撒谎绕过总大小限制。任一阶段超额都抛 ZIP_BOMB。
+          let actualTotal = 0;
+          for (const e of entries) {
+            if (e.isDirectory) continue;
+            if (skillRootPrefix && !e.entryName.startsWith(skillRootPrefix)) continue;
+            const rel = skillRootPrefix ? e.entryName.slice(skillRootPrefix.length) : e.entryName;
+            if (!rel || rel.includes('..')) continue;
+            const data = e.getData();
+            if (data.length > MAX_PER_FILE) {
+              throw Object.assign(new Error('File actual size too large'), { status: 400, code: 'ZIP_BOMB' });
+            }
+            actualTotal += data.length;
+            if (actualTotal > MAX_TOTAL_UNCOMPRESSED) {
+              throw Object.assign(new Error('Archive actual size too large'), { status: 400, code: 'ZIP_BOMB' });
+            }
+            // SKILL.md 统一规范化大小写
+            const finalRel = rel.split('/').pop().toLowerCase() === 'skill.md'
+              ? rel.replace(/[^/]*$/, 'SKILL.md')
+              : rel;
+            skillFiles.push({ relPath: finalRel, data });
+          }
+        }
+
+        if (!validateSkillName(skillName)) {
+          throw Object.assign(new Error(`Invalid skill name: ${skillName}`), { status: 400, code: 'INVALID_NAME' });
+        }
+        const targetDir = join(skillsRoot, skillName);
+        // 原子创建：不带 recursive 让 mkdir 在已存在时直接抛 EEXIST，消除 existsSync 与 mkdirSync 之间的 TOCTOU 竞争窗口。
+        // skillsRoot 已在前面 mkdirSync(skillsRoot, { recursive: true }) 兜底创建，所以这里 join 出的 parent 一定存在。
+        try {
+          mkdirSync(targetDir);
+        } catch (err) {
+          if (err.code === 'EEXIST') {
+            throw Object.assign(new Error(`Skill already exists: ${skillName}`), { status: 409, code: 'EXISTS' });
+          }
+          throw err;
+        }
+        // 二次防御：resolved + sep 后缀比较，防止 prefix 攻击
+        // (e.g. dest=/skills/my-skill-evil/x 不能以 /skills/my-skill 单独 startsWith 通过)
+        const resolvedTarget = resolve(targetDir) + sep;
+        for (const f of skillFiles) {
+          const dest = join(targetDir, f.relPath);
+          if (!resolve(dest).startsWith(resolvedTarget)) continue;
+          mkdirSync(dirname(dest), { recursive: true });
+          writeFileSync(dest, f.data);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, name: skillName, path: targetDir }));
+      } catch (err) {
+        const status = err?.status || 500;
+        if (status >= 500) console.error('[api/skills/import]', err);
+        // 5xx 不向前端泄漏内部 message（可能含路径），只返回脱敏文本 + code 让前端做 i18n
+        const safeError = status >= 500 ? 'server_error' : (err?.message || 'error');
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: safeError, code: err?.code || 'unknown' }));
       }
     });
     return;
@@ -2011,6 +2381,7 @@ async function handleRequest(req, res) {
                 if (c.readyState === 1) try { c.send(tmsg); } catch {}
               });
             }
+            _notifyParentPending({ type: 'ask-hook-timeout' });
           }
         }, HOOK_TIMEOUT);
 
@@ -2025,6 +2396,7 @@ async function handleRequest(req, res) {
             }
           });
         }
+        _notifyParentPending({ type: 'ask-hook-pending', questions });
 
         // Handle ask-bridge.js disconnection (use res instead of req — Node.js v24+ fires req 'close' immediately after body is read)
         res.on('close', () => {
@@ -2037,6 +2409,7 @@ async function handleRequest(req, res) {
                 if (c.readyState === 1) try { c.send(tmsg); } catch {}
               });
             }
+            _notifyParentPending({ type: 'ask-hook-timeout' });
           }
         });
       } catch {
@@ -2189,27 +2562,70 @@ async function handleRequest(req, res) {
         }
         // 用 named event 'stream-progress' 避免混入 data: 流与 dedup 冲突
         // 精简 payload：前端只需要 timestamp/url/content 渲染 Live overlay
-        sendEventToClients(clients, 'stream-progress', {
+        const _streamChunkPayload = {
           timestamp: entry.timestamp,
           url: entry.url,
           content: entry.response?.body?.content || [],
           model: entry.body?.model,
-        });
+        };
+        sendEventToClients(clients, 'stream-progress', _streamChunkPayload);
+        runParallelHook('onStreamChunk', _streamChunkPayload);
       } catch {}
       try { res.writeHead(204); res.end(); } catch {}
     });
     return;
   }
 
-  // 读取文件内容 API
+  // 读取文件内容 API —— 走 file-access-policy 统一校验
+  // 历史 isEditorSession 后门已收敛:绝对路径全部走 policy(allowlist 已含 ~/.claude/、CCV_PROJECT_DIR、
+  // 已注册 workspaces、上传/持久化目录),前端无需再传 editorSession=true。
   if (url === '/api/file-content' && method === 'GET') {
     const reqPath = parsedUrl.searchParams.get('path');
-    const isEditorSession = parsedUrl.searchParams.get('editorSession') === 'true';
     const cwd = process.env.CCV_PROJECT_DIR || process.cwd();
     try {
-      const result = readFileContent(cwd, reqPath, isEditorSession);
+      if (!reqPath) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid path' }));
+        return;
+      }
+      // 相对路径含 .. → 直接拒(历史契约;绕过项目目录的明确攻击)
+      const isAbs = /^([a-zA-Z]:[\\/]|[\\/])/.test(reqPath);
+      if (!isAbs && reqPath.includes('..')) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid path' }));
+        return;
+      }
+      // 相对路径在项目目录拼接;绝对路径直接送 policy
+      const absPath = isAbs ? reqPath : resolve(cwd, reqPath);
+      const policy = isReadAllowed(absPath);
+      if (!policy.ok) {
+        const status = reasonToStatus(policy.reason);
+        const errLabel = status === 404 ? 'File not found'
+          : status === 400 ? 'Invalid path'
+          : 'Forbidden';
+        const body = { error: errLabel, reason: policy.reason };
+        if (policy.allowedRoots) body.allowedRoots = policy.allowedRoots;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(body));
+        return;
+      }
+      // 用 policy 返回的 real 读,杜绝 TOCTOU
+      const real = policy.real;
+      const st = statSync(real);
+      if (!st.isFile()) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not a file' }));
+        return;
+      }
+      if (st.size > 5 * 1024 * 1024) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'File too large' }));
+        return;
+      }
+      const content = readFileSync(real, 'utf-8');
+      // path 字段回返原始入参,前端用它做路径展示与后续 POST 引用
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(result));
+      res.end(JSON.stringify({ path: reqPath, content, size: st.size }));
     } catch (err) {
       const status = ERROR_STATUS_MAP[err.code] || 500;
       const message = status === 500 ? `Cannot read file: ${err.message}` : err.message;
@@ -2219,47 +2635,114 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // 返回文件原始二进制内容（用于图片预览等）
+  // 当前项目「持久记忆」入口/明细 —— 路径编码: cwd 中所有非 [a-zA-Z0-9-] 字符替换为 -
+  // 编码方案与 Claude Code 写入 ~/.claude/projects/<encoded>/memory/ 时使用的一致(实地比对验证)。
+  // 不带参 → 返回 MEMORY.md 入口; ?file=<basename> → 返回同目录下指定 .md 明细。
+  // 安全分层: 1) basename 形态校验(单段 + .md) 2) realpath 必须严格在 memoryDir 之内 3) isReadAllowed 政策(~/.claude/ allowlist)。
+  if (url === '/api/project-memory' && method === 'GET') {
+    // 本端点内 helper:8 处响应去重(端点局部,不跨文件)
+    const respondJson = (status, body) => {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+    try {
+      const cwdRaw = process.env.CCV_PROJECT_DIR || process.cwd();
+      const cwd = cwdRaw.replace(/[/\\]+$/, '');
+      const encoded = cwd.replace(/[^a-zA-Z0-9-]/g, '-');
+      const dir = join(getClaudeConfigDir(), 'projects', encoded, 'memory');
+      const fileParam = parsedUrl.searchParams.get('file');
+      const MAX_BYTES = 512 * 1024;
+
+      // 入口文件
+      if (!fileParam) {
+        const indexPath = join(dir, 'MEMORY.md');
+        if (!existsSync(indexPath)) return respondJson(200, { exists: false, dir, indexPath });
+        const policy = isReadAllowed(indexPath);
+        if (!policy.ok) return respondJson(reasonToStatus(policy.reason), { error: 'Forbidden', reason: policy.reason });
+        const st = statSync(policy.real);
+        if (!st.isFile()) return respondJson(400, { error: 'Not a file' });
+        if (st.size > MAX_BYTES) return respondJson(413, { error: 'File too large' });
+        const content = readFileSync(policy.real, 'utf-8');
+        return respondJson(200, { exists: true, dir, indexPath, content });
+      }
+
+      // 明细文件: 仅接受单段 basename + .md 后缀
+      // 再次校验 realpath 严格在 memoryDir 内 —— policy 的 ~/.claude/ allowlist 范围比这里宽。
+      if (fileParam.includes('/') || fileParam.includes('\\') || fileParam.includes('\0') || fileParam === '..' || fileParam.startsWith('.')) {
+        return respondJson(400, { error: 'Invalid file name' });
+      }
+      if (!/\.md$/i.test(fileParam)) return respondJson(400, { error: 'Only .md files allowed' });
+      const detailPath = join(dir, fileParam);
+      if (!existsSync(detailPath)) return respondJson(404, { error: 'File not found' });
+      // realpath 收紧: 必须严格落在 realpath(dir) 内 —— 防 symlink 跳出 memoryDir
+      let realDir, realFile;
+      try {
+        realDir = realpathSync(dir);
+        realFile = realpathSync(detailPath);
+      } catch {
+        return respondJson(404, { error: 'File not found' });
+      }
+      const sep = realDir.endsWith('/') ? realDir : realDir + '/';
+      if (realFile !== realDir && !realFile.startsWith(sep)) {
+        return respondJson(403, { error: 'Path traversal not allowed' });
+      }
+      const policy = isReadAllowed(realFile);
+      if (!policy.ok) return respondJson(reasonToStatus(policy.reason), { error: 'Forbidden', reason: policy.reason });
+      const st = statSync(realFile);
+      if (!st.isFile()) return respondJson(400, { error: 'Not a file' });
+      if (st.size > MAX_BYTES) return respondJson(413, { error: 'File too large' });
+      const content = readFileSync(realFile, 'utf-8');
+      return respondJson(200, { name: fileParam, path: realFile, content });
+    } catch (err) {
+      // 与 /api/file-content 一致：已知 errno（ENOENT/EACCES 等）走 ERROR_STATUS_MAP 映射；
+      // 500 时不回显 err.message —— 可能含 ~/.claude/projects/<encoded>/memory/ 路径片段。
+      const status = ERROR_STATUS_MAP[err.code] || 500;
+      const message = status === 500 ? 'Internal error' : err.message;
+      respondJson(status, { error: message });
+    }
+    return;
+  }
+
+  // 返回文件原始二进制内容（用于图片预览等）—— 走 file-access-policy 统一校验
+  // 历史 isEditorSession 后门 + uploadPrefix/persistPrefix 硬编码豁免已收敛:
+  // policy 的 allowlist 已含 /tmp/cc-viewer-uploads/、tmpdir()/cc-viewer-uploads/、
+  // ~/.claude/cc-viewer/<project>/images/、CCV_PROJECT_DIR、~/.claude/、registered workspaces。
   if (url === '/api/file-raw' && (method === 'GET' || method === 'HEAD')) {
     const reqPath = parsedUrl.searchParams.get('path');
-    const isEditorSession = parsedUrl.searchParams.get('editorSession') === 'true';
     const cwd = process.env.CCV_PROJECT_DIR || process.cwd();
     try {
-      // 上传图片路径（/tmp/cc-viewer-uploads/ 或持久化目录）直接使用，跳过项目目录安全检查
-      const uploadPrefix = '/tmp/cc-viewer-uploads/';
-      const pName = _projectName || 'default';
-      const persistPrefix = join(getClaudeConfigDir(), 'cc-viewer', pName, 'images') + '/';
-      let targetFile;
-      if (reqPath && reqPath.startsWith(uploadPrefix)) {
-        targetFile = resolve(reqPath);
-        // 路径穿越防护：resolve 后必须仍在 upload 目录内
-        if (!targetFile.startsWith(uploadPrefix)) {
-          res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Path traversal denied' }));
-          return;
-        }
-        // /tmp 原文件不存在时，回退到持久化副本
-        if (!existsSync(targetFile)) {
-          const fileName = targetFile.split('/').pop();
-          const persistFile = join(persistPrefix, fileName);
-          if (existsSync(persistFile)) targetFile = persistFile;
-        }
-      } else if (reqPath && reqPath.startsWith(persistPrefix)) {
-        targetFile = resolve(reqPath);
-        // 路径穿越防护：resolve 后必须仍在持久化目录内
-        if (!targetFile.startsWith(persistPrefix)) {
-          res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Path traversal denied' }));
-          return;
-        }
-      } else {
-        targetFile = resolveFilePath(cwd, reqPath, isEditorSession);
-      }
-      if (!existsSync(targetFile)) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `File not found: ${targetFile}` }));
+      if (!reqPath) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid path' }));
         return;
       }
+      const isAbs = /^([a-zA-Z]:[\\/]|[\\/])/.test(reqPath);
+      const absPath = isAbs ? reqPath : resolve(cwd, reqPath);
+
+      // /tmp 原文件不存在时回退到持久化副本(保留原 fallback 语义,但用 policy 守卫)
+      let policy = isReadAllowed(absPath);
+      if (!policy.ok && policy.reason === 'realpath-failed' && isAbs) {
+        const pName = _projectName || 'default';
+        const persistPrefix = join(getClaudeConfigDir(), 'cc-viewer', pName, 'images');
+        const fileName = absPath.split('/').pop();
+        if (fileName) {
+          const persistFile = join(persistPrefix, fileName);
+          const fallbackPolicy = isReadAllowed(persistFile);
+          if (fallbackPolicy.ok) policy = fallbackPolicy;
+        }
+      }
+      if (!policy.ok) {
+        const status = reasonToStatus(policy.reason);
+        const errLabel = status === 404 ? 'File not found'
+          : status === 400 ? 'Invalid path'
+          : 'Forbidden';
+        const body = { error: errLabel, reason: policy.reason };
+        if (policy.allowedRoots) body.allowedRoots = policy.allowedRoots;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(body));
+        return;
+      }
+      const targetFile = policy.real;
       const stat = statSync(targetFile);
       if (!stat.isFile()) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -2310,11 +2793,74 @@ async function handleRequest(req, res) {
         return;
       }
       try {
-        const { path: reqPath, content, editorSession } = JSON.parse(body);
+        const { path: reqPath, content } = JSON.parse(body);
         const cwd = process.env.CCV_PROJECT_DIR || process.cwd();
-        const result = writeFileContent(cwd, reqPath, content, editorSession);
+        if (!reqPath) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid path' }));
+          return;
+        }
+        if (typeof content !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Content must be a string' }));
+          return;
+        }
+        const isAbs = /^([a-zA-Z]:[\\/]|[\\/])/.test(reqPath);
+        const absPath = isAbs ? reqPath : resolve(cwd, reqPath);
+
+        // 写路径同样走 policy(收敛 editorSession 后门):允许覆盖现有文件;
+        // 新文件场景递归向上找最近存在的祖先目录,只要它在 allowlist 内即放行。
+        // (旧实现只查 immediate parent,父目录也不存在时误拒嵌套新建。)
+        let targetReal;
+        const policy = isReadAllowed(absPath);
+        if (policy.ok) {
+          targetReal = policy.real;
+        } else if (policy.reason === 'realpath-failed') {
+          // 递归向上找最近存在的祖先;若 allowlist 命中即允许新建,从该祖先 real 重建目标路径。
+          let cursor = resolve(absPath, '..');
+          let ancestorPolicy = null;
+          let descent = [basename(absPath)];
+          for (let depth = 0; depth < 32; depth++) {
+            const ap = isReadAllowed(cursor);
+            if (ap.ok) { ancestorPolicy = ap; break; }
+            if (ap.reason !== 'realpath-failed') {
+              // sensitive-prefix / outside-allowlist 等明确拒绝 → 直接 403
+              ancestorPolicy = ap;
+              break;
+            }
+            // 当前祖先也不存在,继续上溯
+            const parent = resolve(cursor, '..');
+            if (parent === cursor) break; // 抵达根,停止
+            descent.unshift(basename(cursor));
+            cursor = parent;
+          }
+          if (!ancestorPolicy || !ancestorPolicy.ok) {
+            const reason = (ancestorPolicy && ancestorPolicy.reason) || 'outside-allowlist';
+            const status = reasonToStatus(reason);
+            const body = { error: 'Forbidden', reason };
+            if (ancestorPolicy && ancestorPolicy.allowedRoots) body.allowedRoots = ancestorPolicy.allowedRoots;
+            res.writeHead(status, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(body));
+            return;
+          }
+          // 在祖先 real 路径下重建目标。Denylist 已在祖先 prefix 层生效,
+          // 这里相信 allowlist 祖先的合法性(项目目录 / ~/.claude/cc-viewer 等)。
+          targetReal = join(ancestorPolicy.real, ...descent);
+          // 父目录可能不存在,递归 mkdir
+          try { mkdirSync(dirname(targetReal), { recursive: true }); } catch {}
+        } else {
+          const status = reasonToStatus(policy.reason);
+          const body = { error: 'Forbidden', reason: policy.reason };
+          if (policy.allowedRoots) body.allowedRoots = policy.allowedRoots;
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(body));
+          return;
+        }
+
+        writeFileSync(targetReal, content, 'utf-8');
+        const stat = statSync(targetReal);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, size: result.size }));
+        res.end(JSON.stringify({ ok: true, size: stat.size }));
       } catch (err) {
         const status = ERROR_STATUS_MAP[err.code] || 500;
         const message = status === 500 ? `Cannot save file: ${err.message}` : err.message;
@@ -3083,7 +3629,7 @@ export async function startViewer() {
           // interceptor.js runs in this same process (via proxy.js → setupInterceptor).
           // Inject live-port via module-level setter instead of process.env to avoid
           // polluting env of child_process.spawn descendants (Bash tools / MCP / Electron tabs).
-          setLivePort(port);
+          setLivePort(port, serverProtocol);
           const url = `${serverProtocol}://127.0.0.1:${port}`;
           if (!isCliMode) {
             console.error(t('server.started'));
@@ -3166,6 +3712,7 @@ export async function startViewer() {
                   const rmsg = JSON.stringify({ type: 'ask-hook-resolved' });
                   terminalWss.clients.forEach((c) => { if (c.readyState === 1) try { c.send(rmsg); } catch {} });
                 }
+                _notifyParentPending({ type: 'ask-hook-resolved' });
                 return true;
               },
               resolveSdkApproval: (...args) => _sdkResolveApproval?.(...args),
@@ -3192,10 +3739,26 @@ async function setupTerminalWebSocket(httpServer) {
   try {
     const { WebSocketServer } = await import('ws');
     const { writeToPty, writeToPtySequential, resizePty, onPtyData, onPtyExit, getPtyState, getOutputBuffer, getCurrentWorkspace, spawnShell } = await import('./pty-manager.js');
+    const {
+      spawnScratch,
+      writeScratch,
+      resizeScratch,
+      killScratch,
+      onScratchData,
+      onScratchExit,
+      getScratchState,
+      getScratchOutputBuffer,
+      getScratchShellBasename,
+      getScratchPtyCount,
+      hasScratchPty,
+    } = await import('./scratch-pty-manager.js');
+    const SCRATCH_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+    const MAX_SCRATCH_PTYS = 16;
     _writeToPty = writeToPty;
     _onPtyData = onPtyData;
     const wss = new WebSocketServer({ noServer: true });
     terminalWss = wss;
+    const wssScratch = new WebSocketServer({ noServer: true });
 
     // 多客户端共享 PTY 的尺寸冲突解决：
     // 移动端优先——只要有移动端在线，PTY 始终使用移动端尺寸，
@@ -3222,9 +3785,85 @@ async function setupTerminalWebSocket(httpServer) {
         wss.handleUpgrade(req, socket, head, (ws) => {
           wss.emit('connection', ws, req);
         });
+      } else if (pathname === '/ws/terminal-scratch') {
+        // 校验 id：缺失或非法 → destroy（避免 Map<id> 被注入空键 / 超长 / 特殊字符）
+        const scratchId = new URL(req.url, `${serverProtocol}://${req.headers.host}`).searchParams.get('id');
+        if (!scratchId || !SCRATCH_ID_RE.test(scratchId)) {
+          socket.destroy();
+          return;
+        }
+        // 硬上限基于后端 ptys Map 大小（含 running 与已退出未回收），
+        // 已有 id 走重连路径不计入新增配额；防止用户关浏览器后老 pty 仍存活、
+        // 新会话又能开 16 个导致总量翻番的累积膨胀
+        if (!hasScratchPty(scratchId) && getScratchPtyCount() >= MAX_SCRATCH_PTYS) {
+          socket.destroy();
+          return;
+        }
+        req.ccvScratchId = scratchId;
+        wssScratch.handleUpgrade(req, socket, head, (ws) => {
+          wssScratch.emit('connection', ws, req);
+        });
       } else {
         socket.destroy();
       }
+    });
+
+    // scratch 终端 WS：极简版，仅承载 input/resize/data/exit + 显式 kill；不掺杂 hook/SDK/preset
+    wssScratch.on('connection', async (ws, req) => {
+      const id = req.ccvScratchId;
+      // 懒启动 scratch shell（首次连接才 spawn）
+      try {
+        if (!getScratchState(id).running) {
+          await spawnScratch(id);
+        }
+      } catch (err) {
+        try { ws.send(JSON.stringify({ type: 'toast', message: `scratch spawn failed: ${err.message}` })); } catch {}
+      }
+
+      const state = getScratchState(id);
+      try { ws.send(JSON.stringify({ type: 'state', running: state.running, exitCode: state.exitCode, shellBasename: getScratchShellBasename() })); } catch {}
+
+      const buffer = getScratchOutputBuffer(id);
+      if (buffer) {
+        try { ws.send(JSON.stringify({ type: 'data', data: buffer })); } catch {}
+      }
+
+      const removeDataListener = onScratchData(id, (data) => {
+        if (ws.readyState === 1) {
+          try { ws.send(JSON.stringify({ type: 'data', data })); } catch {}
+        }
+      });
+
+      const removeExitListener = onScratchExit(id, (exitCode) => {
+        if (ws.readyState === 1) {
+          try { ws.send(JSON.stringify({ type: 'exit', exitCode })); } catch {}
+        }
+      });
+
+      ws.on('message', async (raw) => {
+        try {
+          const msg = JSON.parse(raw.toString());
+          if (msg.type === 'input') {
+            const s = getScratchState(id);
+            if (!s.running) {
+              try { await spawnScratch(id); } catch {}
+            }
+            writeScratch(id, msg.data);
+          } else if (msg.type === 'resize') {
+            resizeScratch(id, msg.cols, msg.rows);
+          } else if (msg.type === 'kill') {
+            // 用户主动关闭 tab：杀 pty（killScratch 内部 ptys.delete 后配额自动释放）；前端会随后 close ws
+            killScratch(id);
+          }
+        } catch {}
+      });
+
+      ws.on('close', () => {
+        removeDataListener();
+        removeExitListener();
+        // pty 本身**不杀**（保留以支持刷新重连），由 kill 消息或 /api/workspaces/stop 触发；
+        // 配额由 ptys Map 自身大小决定，不需在此手动维护连接集合
+      });
     });
 
     wss.on('connection', (ws) => {
@@ -3232,13 +3871,20 @@ async function setupTerminalWebSocket(httpServer) {
       const state = getPtyState();
       ws.send(JSON.stringify({ type: 'state', ...state }));
 
-      // 发送历史输出缓冲
+      // 发送历史输出缓冲(合并 ws 后 ChatView/TerminalPanel 共享一条;TerminalPanel 需要 buffer 来恢复 xterm,
+      // ChatView 自己 _onTerminalWsMessage 不处理 'data',浪费的 send 体积只在初次连接一次)。
       const buffer = getOutputBuffer();
       if (buffer) {
         ws.send(JSON.stringify({ type: 'data', data: buffer }));
       }
 
-      // PTY 输出 → WebSocket
+      // 兜底重绘标记：claude TUI 在 alternate-screen 下只在收到 SIGWINCH 时重绘整屏。
+      // 若前端首次 resize 与 PTY 当前尺寸恰好相等，pty.resize noop 不发 SIGWINCH → 前端空白。
+      // 该 ws 收到第一条 resize 时（见 ws.on('message')），抖动 (rows+1) → (rows) 触发 SIGWINCH。
+      // 注：仅 PTY 已运行时才需要兜底；shell 不在 alternate-screen 不需要。
+      let _needRedrawBootstrap = state.running === true;
+
+      // PTY 输出 → WebSocket(合并 ws 后客户端自行按 msg.type 分发,server 端不再 role 过滤)
       const removeDataListener = onPtyData((data) => {
         if (ws.readyState === 1) {
           ws.send(JSON.stringify({ type: 'data', data }));
@@ -3301,11 +3947,18 @@ async function setupTerminalWebSocket(httpServer) {
               try { await spawnShell(); } catch {}
             }
             const chunks = msg.chunks;
+            // 把 client 提供的 seq 透传回去 — 合并 ws 后多个发送方共享一条 ws,
+            // 只能靠 client 端按 seq 匹配自己发的请求(client 没传时也兼容,旧客户端不带 seq)。
+            const seq = msg.seq;
             if (Array.isArray(chunks) && chunks.length > 0) {
               writeToPtySequential(chunks, (ok) => {
                 try {
-                  ws.send(JSON.stringify({ type: 'input-sequential-done', ok }));
-                } catch {}
+                  const reply = { type: 'input-sequential-done', ok };
+                  if (seq !== undefined) reply.seq = seq;
+                  ws.send(JSON.stringify(reply));
+                } catch (e) {
+                  console.warn('[server] input-sequential-done send failed:', e?.message || e);
+                }
               }, { settleMs: msg.settleMs || 150 });
             }
           } else if (msg.type === 'ask-hook-answer') {
@@ -3330,6 +3983,7 @@ async function setupTerminalWebSocket(httpServer) {
                 if (c !== ws && c.readyState === 1) try { c.send(rmsg); } catch {}
               });
             }
+            if (askAnswered) _notifyParentPending({ type: 'ask-hook-resolved' });
           } else if (msg.type === 'perm-hook-answer') {
             // Permission approval — SDK mode (canUseTool) or PTY mode (hook bridge)
             let permAnswered = false;
@@ -3368,6 +4022,7 @@ async function setupTerminalWebSocket(httpServer) {
                 if (c !== ws && c.readyState === 1) try { c.send(rmsg); } catch {}
               });
             }
+            if (msg.id) _notifyParentPending({ type: 'sdk-ask-resolved', id: msg.id });
           } else if (msg.type === 'sdk-plan-answer') {
             // Plan approval in SDK mode
             if (_sdkResolveApproval) {
@@ -3410,6 +4065,17 @@ async function setupTerminalWebSocket(httpServer) {
             } else if (mobileClients.size === 0 && (activeWs === ws || activeWs === null)) {
               activeWs = ws;
               resizePty(msg.cols, msg.rows);
+            }
+            // 兜底：本 ws 首次 resize 时直接给 PTY 发 SIGWINCH，让 claude 重绘整屏。
+            // 之前用 (cols, rows+1)→(cols, rows) 抖动触发是因为 pty.resize 对相同尺寸 noop；
+            // 单次 process.kill(pid, 'SIGWINCH') 等价但更干净——claude 用现有 size 重绘，不需要
+            // 让 PTY 短暂处于错误尺寸再回滚（避免 50-100ms 闪烁）
+            if (_needRedrawBootstrap) {
+              _needRedrawBootstrap = false;
+              try {
+                const pid = getClaudePid();
+                if (pid && pid !== process.pid) process.kill(pid, 'SIGWINCH');
+              } catch {}
             }
           }
         } catch {}
@@ -3563,6 +4229,13 @@ export function broadcastWsMessage(msg) {
       if (c.readyState === 1) try { c.send(str); } catch {}
     });
   }
+  // 仅对 ask 类型转译给主进程；perm-hook-* / sdk-plan-* 维持 inline-only（红线）。
+  // 显式调用 _notifyParentPending 的分支（ask-hook-resolved 等）走 ws.send 不进这里，无重复触发。
+  if (msg && typeof msg === 'object' && typeof msg.type === 'string'
+      && (msg.type === 'sdk-ask-pending' || msg.type === 'sdk-ask-resolved' || msg.type === 'sdk-ask-timeout'
+          || msg.type === 'ask-hook-pending' || msg.type === 'ask-hook-resolved' || msg.type === 'ask-hook-timeout')) {
+    _notifyParentPending(msg);
+  }
 }
 
 /** Reference to sdk-manager's resolveApproval (set by cli.js after import). */
@@ -3592,9 +4265,12 @@ if (!isWorkspaceMode) {
         const busy = clients.length > 0 || ptyRunning || _sdkResolveApproval !== null;
         try {
           const result = await checkAndUpdate({ busy, portRange: [START_PORT, MAX_PORT] });
-          // major_available 和 deferred_busy 都是"有新版但这次不升级"——共用 update_major_available 事件渲染 banner。
-          if (result.status === 'major_available' || result.status === 'deferred_busy') {
-            const payload = JSON.stringify({ version: result.remoteVersion });
+          // major_available / deferred_busy / brew_managed 都是"有新版但这次不升级"——
+          // 共用 update_major_available 事件渲染 banner（前端不区分子类，命令在 i18n 文案里给）。
+          // brew_managed 走这里至关重要：否则 Electron / GUI 用户看不到升级提示，
+          // 仅 stderr 一行 console.error 在桌面模式下不可见。
+          if (result.status === 'major_available' || result.status === 'deferred_busy' || result.status === 'brew_managed') {
+            const payload = JSON.stringify({ version: result.remoteVersion, source: result.status });
             clients.forEach(client => {
               try { client.write(`event: update_major_available\ndata: ${payload}\n\n`); } catch { }
             });

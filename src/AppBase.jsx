@@ -5,7 +5,7 @@ import { isMobile, isPad } from './env';
 import WorkspaceList from './components/WorkspaceList';
 import OpenFolderIcon from './components/OpenFolderIcon';
 import { t, getLang, setLang } from './i18n';
-import { setClaudeConfigDir } from './utils/tClaude';
+import { SettingsContext } from './contexts/SettingsContext';
 import { formatTokenCount, filterRelevantRequests, isRelevantRequest, appendCacheLossMap, extractCachedContent } from './utils/helpers';
 import { isMainAgent, isPostClearCheckpoint } from './utils/contentFilter';
 import { apiUrl } from './utils/apiUrl';
@@ -13,7 +13,7 @@ import { saveEntries, loadEntries, clearEntries, getCacheMeta, saveSessionEntrie
 import { buildSessionIndex, splitHotCold, mergeSessionIndices, HOT_SESSION_COUNT } from './utils/sessionManager';
 import { mergeMainAgentSessions as _mergeMainAgentSessions } from './utils/sessionMerge';
 import { reconstructEntries, createIncrementalReconstructor } from '../lib/delta-reconstructor.js';
-import { createEntrySlimmer, createIncrementalSlimmer, restoreSlimmedEntry } from './utils/entry-slim.js';
+import { createEntrySlimmer, createIncrementalSlimmer, restoreSlimmedEntry, internEntryBigFields } from './utils/entry-slim.js';
 import { reinitializeMermaid } from './hooks/useMermaidRender';
 import styles from './App.module.css';
 
@@ -23,11 +23,46 @@ export const MAX_SESSIONS = (isMobile && !isPad) ? 30 : 100;
 // /clear 后乐观水位：把上下文血条压到这个百分比，下一次 context_window SSE 推送会自动覆盖回真实值
 export const OPTIMISTIC_CLEAR_PERCENT = 5;
 
+// AntD 主题配置：模块顶层冻结常量。
+// 旧实现是 getter 每次 render 返回新字面量，导致 antd cssinjs useTheme cache 永远 miss、
+// flattenToken 反复跑。顶层常量保证主题不变时引用稳定。
+const LIGHT_THEME_CONFIG = Object.freeze({
+  algorithm: theme.defaultAlgorithm,
+  token: Object.freeze({
+    colorPrimary: '#0969DA',
+    colorBgContainer: '#FFFFFF',
+    colorBgLayout: '#FAFAFA',
+    colorBgElevated: '#FFFFFF',
+    colorBorder: '#E0E0E0',
+    controlOutline: 'transparent',
+    controlOutlineWidth: 0,
+  }),
+});
+
+const DARK_THEME_CONFIG = Object.freeze({
+  algorithm: theme.darkAlgorithm,
+  token: Object.freeze({
+    colorPrimary: '#1668dc',
+    colorBgContainer: '#111',
+    colorBgLayout: '#0a0a0a',
+    colorBgElevated: '#1e1e1e',
+    colorBorder: '#2a2a2a',
+    controlOutline: 'transparent',
+    controlOutlineWidth: 0,
+  }),
+});
+
 /**
  * 共享基类：包含 PC 和 Mobile 通用的状态管理、SSE 通信、数据处理、偏好设置等逻辑。
  * 子类 App (PC) 和 Mobile 各自实现 render() 方法。
+ *
+ * settings 数据(claude-settings + preferences)集中由 SettingsContext 提供;
+ * setLang / setClaudeConfigDir 这两个全局副作用已搬到 SettingsProvider 的 fetch 回调。
+ * AppBase 仍保留本地 state 副本用于即时 UI 反馈,POST 写入走 this.context.updatePreferences。
  */
 class AppBase extends React.Component {
+  static contextType = SettingsContext;
+
   constructor(props) {
     super(props);
     // 从 localStorage 恢复缓存倒计时
@@ -58,7 +93,7 @@ class AppBase extends React.Component {
       resumeAutoChoice: null, // null | "continue" | "new"
       autoApproveSeconds: 0, // 自动审批倒计时秒数，0=关闭
       collapseToolResults: true,
-      expandThinking: true,
+      expandThinking: false,
       expandDiff: false,
       logDir: '',
       showFullToolContent: false,
@@ -88,6 +123,23 @@ class AppBase extends React.Component {
       proxyProfiles: [],
       activeProxyId: 'max',
       defaultConfig: null,
+      // ─── Approval modal global state ───
+      // approvalGlobal: { ptyPlan?, ask? } currently active in the (single) ChatView mounted in this app instance.
+      // Each entry carries { id, ..., handlers } as bubbled by ChatView.componentDidUpdate.
+      // Permission and SDK ExitPlanMode stay inline-only — they do NOT pop the global modal.
+      approvalGlobal: { ptyPlan: null, ask: null },
+      // approvalDismissedIds: pending ids the user has chosen to minimize. Reopens via bell / chip.
+      approvalDismissedIds: new Set(),
+      // approvalOtherTabs: aggregated state from other Electron tabs, pushed by main via tabBridge.onApprovalBroadcast.
+      approvalOtherTabs: [],
+      // approvalOwnPending: 当前 tab 在 main 进程聚合的 pending 计数（来自 approval-broadcast.ownPending）。
+      // 仅信息性使用（bell badge 显示「服务端记得有 N 条 pending」），不试图重写 approvalGlobal——
+      // approvalGlobal 含 questions / handlers 闭包无法跨 IPC 序列化，权威源是 ChatView 的 pendingAsk / pendingPtyPlan。
+      approvalOwnPending: { ask: 0, ptyPlan: 0 },
+      // ownTabId: numeric tab id pushed by main once on view init (electron only). null in pure web mode.
+      ownTabId: null,
+      // approvalPrefs: user toggles persisted to /api/preferences (defaults sized for least surprise).
+      approvalPrefs: { modalEnabled: true, soundEnabled: false, notifyOnlyWhenHidden: true },
     };
     this.eventSource = null;
     this._currentSessionId = null;
@@ -111,8 +163,10 @@ class AppBase extends React.Component {
     this._sseSlimmer = null; this._sseReconstructor = null;
   }
 
-  /** 批量剪枝 entries：清空旧 MainAgent 的 body.messages，保留最后一条完整 */
+  /** 批量剪枝 entries：清空旧 MainAgent 的 body.messages，保留最后一条完整。
+   *  v3: intern body.tools / body.system 让所有 entry 共享 pool 引用 */
   _batchSlim(entries) {
+    for (let i = 0; i < entries.length; i++) entries[i] = internEntryBigFields(entries[i]);
     const slimmer = createEntrySlimmer(isMainAgent);
     for (let i = 0; i < entries.length; i++) slimmer.process(entries[i], entries, i);
     slimmer.finalize(entries);
@@ -131,6 +185,18 @@ class AppBase extends React.Component {
     this._cacheLossMap = new Map();
     this._lastKvCacheContent = null;
     this._sseSlimmer = null; this._sseReconstructor = null;
+  }
+
+  // 给子组件(ChatView / TerminalPanel)一次性注入 SettingsContext 的所有字段。
+  // 不能直接给它们绑 contextType — 它们已绑 TerminalWsContext,class 一次只能一个。
+  _settingsProps() {
+    const ctx = this.context || {};
+    return {
+      claudeSettings: ctx.claudeSettings,
+      preferences: ctx.preferences,
+      onUpdatePreferences: ctx.updatePreferences,
+      onUpdateClaudeSettings: ctx.updateClaudeSettings,
+    };
   }
 
   /**
@@ -209,63 +275,98 @@ class AppBase extends React.Component {
   }
 
   componentDidMount() {
-    // 获取 claude settings（showThinkingSummaries 等）
-    fetch(apiUrl('/api/claude-settings')).then(r => r.json()).then(data => {
+    // claude-settings / preferences fetch 由 SettingsProvider 集中触发;
+    // 这里仅订阅其 Promise,把字段同步到本地 state(沿用现有 13+ 个 setState 消费链路)。
+    this.context._claudeSettingsReady.then(data => {
+      if (!data) return;
       if (data.showThinkingSummaries) this.setState({ showThinkingSummaries: true });
       if (data.claudeAvailable === false) this.setState({ claudeMissing: true });
-    }).catch(() => {});
+    });
 
-    // 获取用户偏好设置（包含 filterIrrelevant）
-    // 用 Promise 保存，供 initSSE 等待（resume_prompt 需要知道 resumeAutoChoice）
-    this._prefsReady = fetch(apiUrl('/api/preferences'))
-      .then(res => res.json())
-      .then(data => {
-        // Claude 配置目录注入 i18n 占位符缓存；必须在这里（无条件 fetch），
-        // 不能放在 ChatView._loadPresets 里——那个路径被 agentTeamEnabled 守卫挡住，
-        // 对没开 Agent Team 的用户永远不会 hydrate。
-        if (typeof data.claudeConfigDir === 'string') setClaudeConfigDir(data.claudeConfigDir);
-        if (data.lang) {
-          setLang(data.lang);
-          this.setState({ lang: data.lang });
-        }
-        if (data.collapseToolResults !== undefined) {
-          this.setState({ collapseToolResults: !!data.collapseToolResults });
-        }
-        if (data.expandThinking !== undefined) {
-          this.setState({ expandThinking: !!data.expandThinking });
-        }
-        if (data.expandDiff !== undefined) {
-          this.setState({ expandDiff: !!data.expandDiff });
-        }
-        if (data.showFullToolContent !== undefined) {
-          this.setState({ showFullToolContent: !!data.showFullToolContent });
-        }
-        if (data.resumeAutoChoice) {
-          this.setState({ resumeAutoChoice: data.resumeAutoChoice });
-        }
-        if (typeof data.autoApproveSeconds === 'number') {
-          this.setState({ autoApproveSeconds: data.autoApproveSeconds });
-        }
-        if (data.themeColor) {
-          this.setState({ themeColor: data.themeColor });
-          document.documentElement.setAttribute('data-theme', data.themeColor === 'light' ? 'light' : 'dark');
-        }
-        // filterIrrelevant 默认 true，showAll = !filterIrrelevant
-        const filterIrrelevant = data.filterIrrelevant !== undefined ? !!data.filterIrrelevant : true;
-        this.setState({ showAll: !filterIrrelevant });
-        if (data.logDir) {
-          this.setState({ logDir: data.logDir });
-        }
-        // URL 参数覆盖主题（白名单校验防 XSS）
-        const urlTheme = new URLSearchParams(window.location.search).get('theme');
-        if (urlTheme === 'light' || urlTheme === 'dark') {
-          this.setState({ themeColor: urlTheme });
-          document.documentElement.setAttribute('data-theme', urlTheme);
-        }
+    // ─── Approval modal: subscribe to electron main → tabBridge ──────────────────
+    // No-op when running in pure web mode — window.tabBridge is only injected by tab-content-preload.js.
+    // Subscription handles保存到 instance 以便 unmount 时卸载，避免 webContents reload 累加监听。
+    this._tabBridgeDisposers = [];
+    if (typeof window !== 'undefined' && window.tabBridge) {
+      try {
+        const offTabId = window.tabBridge.onTabIdInit?.((tabId) => {
+          this.setState({ ownTabId: tabId });
+        });
+        const offBroadcast = window.tabBridge.onApprovalBroadcast?.((payload) => {
+          if (!payload) return;
+          // ownPending 只取计数（main 进程的 ptyPlan/ask Map 序列化为 [{id, projectName, ...}]）。
+          // 不重写 approvalGlobal——闭包内的 handlers / questions 无法跨 IPC 还原，
+          // 权威源仍是 ChatView 的 pendingAsk / pendingPtyPlan（WS 重连服务端会重放）。
+          const op = payload.ownPending;
+          const ownPendingCount = (op && typeof op === 'object')
+            ? { ask: Array.isArray(op.ask) ? op.ask.length : 0, ptyPlan: Array.isArray(op.ptyPlan) ? op.ptyPlan.length : 0 }
+            : { ask: 0, ptyPlan: 0 };
+          this.setState((prev) => ({
+            ownTabId: payload.ownTabId != null ? payload.ownTabId : prev.ownTabId,
+            approvalOtherTabs: Array.isArray(payload.others) ? payload.others : [],
+            approvalOwnPending: ownPendingCount,
+          }));
+        });
+        if (typeof offTabId === 'function') this._tabBridgeDisposers.push(offTabId);
+        if (typeof offBroadcast === 'function') this._tabBridgeDisposers.push(offBroadcast);
+      } catch {}
+    }
 
-        return data;
-      })
-      .catch(() => ({}));
+    // 等 SettingsProvider 完成 /api/preferences fetch,把字段同步到本地 state。
+    // setLang / setClaudeConfigDir 已由 Provider 处理,这里不再重复。
+    // initSSE 仍可读 this._prefsReady(getter 代理到 context),resume_prompt 行为不变。
+    this.context._prefsReady.then(data => {
+      if (!data) return;
+      if (data.lang) this.setState({ lang: data.lang });
+      if (data.collapseToolResults !== undefined) {
+        this.setState({ collapseToolResults: !!data.collapseToolResults });
+      }
+      if (data.expandThinking !== undefined) {
+        this.setState({ expandThinking: !!data.expandThinking });
+      }
+      if (data.expandDiff !== undefined) {
+        this.setState({ expandDiff: !!data.expandDiff });
+      }
+      if (data.showFullToolContent !== undefined) {
+        this.setState({ showFullToolContent: !!data.showFullToolContent });
+      }
+      if (data.resumeAutoChoice) {
+        this.setState({ resumeAutoChoice: data.resumeAutoChoice });
+      }
+      if (typeof data.autoApproveSeconds === 'number') {
+        this.setState({ autoApproveSeconds: data.autoApproveSeconds });
+      }
+      // Approval modal preferences (defaults already in initial state — only override when persisted).
+      if (data.approvalModal && typeof data.approvalModal === 'object') {
+        this.setState(prev => {
+          const next = {
+            modalEnabled: data.approvalModal.modalEnabled !== undefined ? !!data.approvalModal.modalEnabled : prev.approvalPrefs.modalEnabled,
+            soundEnabled: data.approvalModal.soundEnabled !== undefined ? !!data.approvalModal.soundEnabled : prev.approvalPrefs.soundEnabled,
+            notifyOnlyWhenHidden: data.approvalModal.notifyOnlyWhenHidden !== undefined ? !!data.approvalModal.notifyOnlyWhenHidden : prev.approvalPrefs.notifyOnlyWhenHidden,
+          };
+          // 同步给 electron main 进程,让 maybeNotify 用最新的 notifyOnlyWhenHidden 决策。
+          // 非 electron 环境下 tabBridge 不存在,可选链跳过。
+          try { window.tabBridge?.setApprovalPref?.(next); } catch (e) { console.warn('[approvalPref IPC] hydrate sync failed:', e); }
+          return { approvalPrefs: next };
+        });
+      }
+      if (data.themeColor) {
+        this.setState({ themeColor: data.themeColor });
+        document.documentElement.setAttribute('data-theme', data.themeColor === 'light' ? 'light' : 'dark');
+      }
+      // filterIrrelevant 默认 true，showAll = !filterIrrelevant
+      const filterIrrelevant = data.filterIrrelevant !== undefined ? !!data.filterIrrelevant : true;
+      this.setState({ showAll: !filterIrrelevant });
+      if (data.logDir) {
+        this.setState({ logDir: data.logDir });
+      }
+      // URL 参数覆盖主题（白名单校验防 XSS）
+      const urlTheme = new URLSearchParams(window.location.search).get('theme');
+      if (urlTheme === 'light' || urlTheme === 'dark') {
+        this.setState({ themeColor: urlTheme });
+        document.documentElement.setAttribute('data-theme', urlTheme);
+      }
+    });
 
     // 获取系统用户头像和名字
     fetch(apiUrl('/api/user-profile'))
@@ -383,7 +484,23 @@ class AppBase extends React.Component {
     }
   }
 
+  componentDidUpdate(prevProps, prevState) {
+    // context.claudeSettings 后续变化(如 ChatMessage 触发的 showThinkingSummaries 启用)
+    // 同步到本地 state,让 props.showThinkingSummaries 下游消费方立即响应。
+    // contextType 不提供 prevContext,只能比对 context value 与本地 state。
+    const cs = this.context && this.context.claudeSettings;
+    if (cs && !!cs.showThinkingSummaries !== !!this.state.showThinkingSummaries) {
+      this.setState({ showThinkingSummaries: !!cs.showThinkingSummaries });
+    }
+  }
+
   componentWillUnmount() {
+    if (Array.isArray(this._tabBridgeDisposers)) {
+      for (const off of this._tabBridgeDisposers) {
+        try { off(); } catch {}
+      }
+      this._tabBridgeDisposers = null;
+    }
     if (this.eventSource) this.eventSource.close();
     if (this._localLogES) { this._localLogES.close(); this._localLogES = null; }
     if (this._autoSelectTimer) clearTimeout(this._autoSelectTimer);
@@ -485,10 +602,18 @@ class AppBase extends React.Component {
 
   async loadMoreHistory() {
     if (!this.state.hasMoreHistory || this._loadingMore) return;
+    // 防御 _hasMoreHistory=true 而 _oldestTs 为 null 的不一致状态：
+    // 没有锚点时间戳就别去拼 before=null，否则服务端 400。把 hasMoreHistory 同步
+    // 关掉避免上层 loader 反复触发。
+    if (!this._oldestTs) {
+      this.setState({ hasMoreHistory: false });
+      return;
+    }
     this._loadingMore = true;
     this.setState({ loadingMore: true });
     try {
       const res = await fetch(apiUrl(`/api/entries/page?before=${encodeURIComponent(this._oldestTs)}&limit=100`));
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (Array.isArray(data.entries) && data.entries.length > 0) {
         const reconstructed = reconstructEntries(data.entries);
@@ -518,14 +643,14 @@ class AppBase extends React.Component {
             requests: hotEntries,
             mainAgentSessions: allSessions,
             sessionIndex: fullIndex,
-            hasMoreHistory: !!data.hasMore,
+            hasMoreHistory: !!data.hasMore && !!data.oldestTimestamp,
             loadingMore: false,
           });
         } else {
           this.setState({
             requests: merged,
             mainAgentSessions,
-            hasMoreHistory: !!data.hasMore,
+            hasMoreHistory: !!data.hasMore && !!data.oldestTimestamp,
             loadingMore: false,
           });
           if (isMobile && this.state.projectName) {
@@ -538,6 +663,7 @@ class AppBase extends React.Component {
     } catch (e) {
       console.error('loadMoreHistory failed:', e);
       this.setState({ loadingMore: false });
+      message.error(t('ui.loadMoreHistoryFailed'));
     }
     this._loadingMore = false;
   }
@@ -608,7 +734,7 @@ class AppBase extends React.Component {
         try {
           const data = JSON.parse(event.data);
           // 等待偏好加载完成再判断是否跳过弹窗（避免竞态）
-          (this._prefsReady || Promise.resolve({})).then((prefs) => {
+          (this.context._prefsReady || Promise.resolve({})).then((prefs) => {
             if (prefs?.resumeAutoChoice) {
               // 自动跳过：直接发送选择到服务端，不触碰偏好设置（避免 setState 竞态清除偏好）
               fetch(apiUrl('/api/resume-choice'), {
@@ -732,7 +858,8 @@ class AppBase extends React.Component {
               fileLoadingCount: 0,
             };
             // 增量模式保留缓存恢复时设的 hasMoreHistory；非增量（limit）模式用服务端的值
-            if (!isIncremental) newState.hasMoreHistory = !!this._hasMoreHistory;
+            // hasMoreHistory 必须 AND 上 _oldestTs 非空，否则后续 loadMoreHistory() 会拼 before=null 触发 400
+            if (!isIncremental) newState.hasMoreHistory = !!this._hasMoreHistory && !!this._oldestTs;
             this.setState(newState);
           } else {
             const newState = {
@@ -742,7 +869,7 @@ class AppBase extends React.Component {
               fileLoading: false,
               fileLoadingCount: 0,
             };
-            if (!isIncremental) newState.hasMoreHistory = !!this._hasMoreHistory;
+            if (!isIncremental) newState.hasMoreHistory = !!this._hasMoreHistory && !!this._oldestTs;
             this.setState(newState);
             if (isMobile && this.state.projectName) {
               saveEntries(this.state.projectName, entries);
@@ -990,7 +1117,12 @@ class AppBase extends React.Component {
       }
 
       for (const rawEntry of batch) {
-        const entry = this._sseReconstructor.reconstruct(rawEntry);
+        // v3: intern body.tools / body.system → pool 共享引用，消除 fullEntry 累积
+        // v5: 同时 intern body.messages 内 tool_result block.content（lazy-clone 三层
+        //     messages/content/block）。下方 L1170-1175 mutate `messages[i]._timestamp`
+        //     的安全前提：浅 clone 仅 spread 顶层字段保留 _timestamp 写位；共享的
+        //     block.content 是 string primitive 不可变，跨 entry 共享 ref 不会串扰。
+        const entry = internEntryBigFields(this._sseReconstructor.reconstruct(rawEntry));
         const key = `${entry.timestamp}|${entry.url}`;
         const existingIndex = this._requestIndexMap.get(key);
 
@@ -1293,58 +1425,102 @@ class AppBase extends React.Component {
   handleLangChange = () => {
     const lang = getLang();
     this.setState({ lang });
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ lang }),
-    }).catch(() => { });
+    this.context.updatePreferences({ lang });
   };
 
   handleCollapseToolResultsChange = (checked) => {
     this.setState({ collapseToolResults: checked });
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ collapseToolResults: checked }),
-    }).catch(() => { });
+    this.context.updatePreferences({ collapseToolResults: checked });
   };
 
   handleExpandThinkingChange = (checked) => {
     this.setState({ expandThinking: checked });
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ expandThinking: checked }),
-    }).catch(() => { });
+    this.context.updatePreferences({ expandThinking: checked });
   };
 
   handleExpandDiffChange = (checked) => {
     this.setState({ expandDiff: checked });
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ expandDiff: checked }),
-    }).catch(() => { });
+    this.context.updatePreferences({ expandDiff: checked });
   };
 
   handleAutoApproveChange = (seconds) => {
     this.setState({ autoApproveSeconds: seconds });
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ autoApproveSeconds: seconds }),
-    }).catch(() => {});
+    this.context.updatePreferences({ autoApproveSeconds: seconds });
+  };
+
+  // ─── Approval modal: ChatView -> AppBase bubbling handlers ───────────────────────
+  // Inject projectName from AppBase state so the modal chip / Notification body have
+  // human-readable session context. ChatView itself doesn't track project name.
+  _injectProjectName = (data, slot) => {
+    if (!data) return data;
+    const projectName = this.state.projectName || '';
+    if (!projectName) return data;
+    const innerKey = slot; // 'ptyPlan' | 'ask'
+    if (data[innerKey] && data[innerKey].projectName === undefined) {
+      return { ...data, [innerKey]: { ...data[innerKey], projectName } };
+    }
+    return data;
+  };
+
+  // Generic transition helper that mirrors a kind in/out of approvalGlobal AND wipes stale
+  // dismissed entries for that kind. Used by both ask (static id reuse) and ptyPlan (timestamp ids
+  // could repeat after long sessions). PTY plan and ask share the same dismiss-on-transition policy.
+  _setApprovalKind = (kind, data) => {
+    const enriched = this._injectProjectName(data, kind);
+    this.setState(prev => {
+      const next = { ...prev.approvalGlobal };
+      if (enriched) next[kind] = enriched;
+      else next[kind] = null;
+      const dismissed = new Set(prev.approvalDismissedIds);
+      let changed = false;
+      for (const id of dismissed) {
+        if (id.startsWith(`${kind}:`)) { dismissed.delete(id); changed = true; }
+      }
+      return changed
+        ? { approvalGlobal: next, approvalDismissedIds: dismissed }
+        : { approvalGlobal: next };
+    });
+  };
+
+  handleApprovalAsk = (data) => this._setApprovalKind('ask', data);
+  handleApprovalPtyPlan = (data) => this._setApprovalKind('ptyPlan', data);
+
+  // Modal calls this when user presses ESC / clicks backdrop. Pending state untouched — only UI hides.
+  handleApprovalDismiss = (kind, id) => {
+    if (!kind || !id) return;
+    this.setState(prev => {
+      const next = new Set(prev.approvalDismissedIds);
+      next.add(`${kind}:${id}`);
+      return { approvalDismissedIds: next };
+    });
+  };
+
+  // Bell / chip click reopens minimised modal — clear all dismissed entries currently pending.
+  handleApprovalReopen = () => {
+    this.setState({ approvalDismissedIds: new Set() });
+  };
+
+  // Cross-tab jump (electron only). Renderer doesn't directly switch — main does it.
+  handleApprovalJumpTab = (tabId) => {
+    if (typeof window !== 'undefined' && window.tabBridge?.jumpToTab && tabId != null) {
+      try { window.tabBridge.jumpToTab(tabId); } catch {}
+    }
+  };
+
+  handleApprovalPrefsChange = (patch) => {
+    // 同源 next：setState + POST body 都用同一个 next，避免 rapid toggle 下第二次 POST 读到 stale state 漏 patch
+    const next = { ...this.state.approvalPrefs, ...patch };
+    this.setState({ approvalPrefs: next });
+    // 同步给 electron main 进程,maybeNotify 立即用新 notifyOnlyWhenHidden 决策。
+    try { window.tabBridge?.setApprovalPref?.(next); } catch (e) { console.warn('[approvalPref IPC] onChange sync failed:', e); }
+    this.context.updatePreferences({ approvalModal: next });
   };
 
   handleThemeColorChange = (value) => {
     this.setState({ themeColor: value });
     document.documentElement.setAttribute('data-theme', value === 'light' ? 'light' : 'dark');
     reinitializeMermaid();
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ themeColor: value }),
-    }).catch(() => { });
+    this.context.updatePreferences({ themeColor: value });
     // 切换主题后让终端获得焦点，便于用户看到 /theme 切换效果
     window.dispatchEvent(new CustomEvent('ccv-focus-terminal'));
   };
@@ -1354,22 +1530,15 @@ class AppBase extends React.Component {
     const trimmed = value.trim();
     if (!trimmed) return;
     this.setState({ logDir: trimmed });
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ logDir: trimmed }),
-    }).then(r => r.json()).then(data => {
-      if (data.logDir) this.setState({ logDir: data.logDir });
-    }).catch(() => { });
+    // logDir 服务端可能 normalize 后回写,read response.logDir 覆盖本地
+    this.context.updatePreferences({ logDir: trimmed }).then(data => {
+      if (data && data.logDir) this.setState({ logDir: data.logDir });
+    });
   };
 
   handleShowFullToolContentChange = (checked) => {
     this.setState({ showFullToolContent: checked });
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ showFullToolContent: checked }),
-    }).catch(() => { });
+    this.context.updatePreferences({ showFullToolContent: checked });
   };
 
   handleFilterIrrelevantChange = (checked) => {
@@ -1381,11 +1550,7 @@ class AppBase extends React.Component {
         selectedIndex: newFiltered.length > 0 ? newFiltered.length - 1 : null,
       };
     });
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filterIrrelevant: checked }),
-    }).catch(() => { });
+    this.context.updatePreferences({ filterIrrelevant: checked });
   };
 
   // ─── 日志管理 ──────────────────────────────────────────
@@ -1665,11 +1830,7 @@ class AppBase extends React.Component {
   handleResumeChoice = (choice) => {
     if (this.state.resumeRememberChoice) {
       this.setState({ resumeAutoChoice: choice });
-      fetch(apiUrl('/api/preferences'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ resumeAutoChoice: choice }),
-      }).catch(() => {});
+      this.context.updatePreferences({ resumeAutoChoice: choice });
     }
     fetch(apiUrl('/api/resume-choice'), {
       method: 'POST',
@@ -1681,20 +1842,12 @@ class AppBase extends React.Component {
   handleResumeAutoChoiceToggle = (enabled) => {
     const value = enabled ? 'continue' : null;
     this.setState({ resumeAutoChoice: value });
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ resumeAutoChoice: value }),
-    }).catch(() => {});
+    this.context.updatePreferences({ resumeAutoChoice: value });
   };
 
   handleResumeAutoChoiceChange = (value) => {
     this.setState({ resumeAutoChoice: value });
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ resumeAutoChoice: value }),
-    }).catch(() => {});
+    this.context.updatePreferences({ resumeAutoChoice: value });
   };
 
   _finishLocalLoad = (entries, fileNames) => {
@@ -1783,34 +1936,20 @@ class AppBase extends React.Component {
     );
   }
 
-  /** Ant Design 主题配置 (dark/light) */
+  /** Ant Design 主题配置 (dark/light)
+   *
+   * 历史尝试 `cssVar: true`（antd 5.14+）想砍 useToken/useGlobalCache 开销，但实测是性能
+   * 负优化：trace3 vs trace2 显示 cssinjs 自身耗时 +170%，`flattenToken` +1426%，GC +56%，
+   * 主线程 idle 从 16% 崩到 0.5%，dropped frames +64%。原因：启用 cssVar 后每个 token 多走
+   * 一层 CSSVarRegister.path + flattenToken；4 处 ConfigProvider + 主题切换 + 大量 antd
+   * 组件叠加，cache miss 路径被放大。antd 文档宣传的 20-35% 收益建立在「单 ConfigProvider
+   * + 主题不切换」理想场景，本仓库不符合。结论：保持 hash style，不要开 cssVar。
+   *
+   * 引用稳定性：返回模块顶层冻结常量（LIGHT_THEME_CONFIG / DARK_THEME_CONFIG），
+   * 主题不变时 React 每次 render 都拿到同一引用 → cssinjs useTheme useMemo 真正命中。
+   */
   get themeConfig() {
-    if (this.state.themeColor === 'light') {
-      return {
-        algorithm: theme.defaultAlgorithm,
-        token: {
-          colorPrimary: '#0969DA',
-          colorBgContainer: '#FFFFFF',
-          colorBgLayout: '#FAFAFA',
-          colorBgElevated: '#FFFFFF',
-          colorBorder: '#E0E0E0',
-          controlOutline: 'transparent',
-          controlOutlineWidth: 0,
-        },
-      };
-    }
-    return {
-      algorithm: theme.darkAlgorithm,
-      token: {
-        colorPrimary: '#1668dc',
-        colorBgContainer: '#111',
-        colorBgLayout: '#0a0a0a',
-        colorBgElevated: '#1e1e1e',
-        colorBorder: '#2a2a2a',
-        controlOutline: 'transparent',
-        controlOutlineWidth: 0,
-      },
-    };
+    return this.state.themeColor === 'light' ? LIGHT_THEME_CONFIG : DARK_THEME_CONFIG;
   }
 }
 

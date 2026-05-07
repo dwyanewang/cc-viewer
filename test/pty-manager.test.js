@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   spawnClaude,
   writeToPty,
+  writeToPtySequential,
   resizePty,
   killPty,
   _setPtyImportForTests,
@@ -386,6 +387,78 @@ describe('pty-manager: spawnClaude integration', () => {
     await new Promise(r => setTimeout(r, 30)); // 短暂额外等待确保不会有第二次 spawn
 
     assert.equal(spawned.length, 1, 'user-provided flag → no auto-retry');
+  });
+});
+
+// ─── writeToPtySequential delay rules ───
+
+describe('pty-manager: writeToPtySequential delay rules', () => {
+  let writeTimestamps = [];
+  let spawned = [];
+
+  beforeEach(() => {
+    writeTimestamps = [];
+    spawned = [];
+    _setPtyImportForTests(() => ({
+      spawn(command, args, opts) {
+        const inst = {
+          pid: 22000 + spawned.length,
+          command,
+          args,
+          opts,
+          write(data) {
+            writeTimestamps.push({ data, t: Date.now() });
+          },
+          resize() {},
+          kill() {},
+          onData() {},
+          onExit() {},
+        };
+        spawned.push(inst);
+        return inst;
+      },
+    }));
+  });
+
+  afterEach(() => {
+    killPty();
+    _setPtyImportForTests(null);
+  });
+
+  // 工具栏快捷按钮路径：[paste-end-chunk, '\r'] 写入 paste 块后必须等 settleMs
+  // 给 Ink TUI 完成 bracket-paste 状态切换，再写 \r 才能可靠触发提交。
+  it('paste-end chunk waits settleMs (not 80ms) before next chunk', async () => {
+    await spawnClaude(9999, process.cwd(), [], '/bin/echo');
+    writeTimestamps = []; // 清掉 spawn 注入的初始 write
+    await new Promise((resolve) => {
+      writeToPtySequential(
+        ['\x1b[200~/clear\x1b[201~', '\r'],
+        resolve,
+        { settleMs: 250 }
+      );
+    });
+    assert.equal(writeTimestamps.length, 2, 'two writes expected');
+    const gap = writeTimestamps[1].t - writeTimestamps[0].t;
+    assert.ok(gap >= 200, `expected paste-end → \\r gap >=200ms, got ${gap}ms`);
+    assert.ok(gap < 500, `expected paste-end → \\r gap <500ms, got ${gap}ms`);
+  });
+
+  // inquirer 路径回归：普通字符 chunk（非 paste-end / 非 toggle）仍走硬编码 80ms，
+  // 不被新加的 isPasteEnd 分支误命中。
+  it('regular char chunk still waits ~80ms (not settleMs)', async () => {
+    await spawnClaude(9999, process.cwd(), [], '/bin/echo');
+    writeTimestamps = [];
+    await new Promise((resolve) => {
+      writeToPtySequential(
+        ['a', 'b'],
+        resolve,
+        { settleMs: 500 } // 故意拉大 settleMs，验证普通 chunk 不受影响
+      );
+    });
+    assert.equal(writeTimestamps.length, 2);
+    const gap = writeTimestamps[1].t - writeTimestamps[0].t;
+    assert.ok(gap >= 50, `expected regular char gap >=50ms, got ${gap}ms`);
+    assert.ok(gap < 300, `expected regular char gap <300ms (not settleMs:500), got ${gap}ms`);
   });
 });
 

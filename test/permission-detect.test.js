@@ -67,7 +67,18 @@ function detectPrompt(rawBuf) {
 function isPlanApprovalPrompt(prompt) {
   if (!prompt || !prompt.question) return false;
   const q = prompt.question.toLowerCase();
-  return /plan/i.test(q) && (/approv/i.test(q) || /proceed/i.test(q) || /accept/i.test(q));
+  if (/plan/i.test(q) && (/approv/i.test(q) || /proceed/i.test(q) || /accept/i.test(q))) {
+    return true;
+  }
+  // Options 模式兜底（与 src/utils/promptClassifier.js 同步）
+  if (Array.isArray(prompt.options) && prompt.options.length === 3) {
+    const texts = prompt.options.map(o => (o.text || '').toLowerCase());
+    const hasApprove = texts.some(t => /\bapprov/i.test(t));
+    const hasEdit = texts.some(t => /\bedits?\b|\bmodify/i.test(t));
+    const hasReject = texts.some(t => /\breject\b|\bdeny\b|keep planning|\bno,/i.test(t));
+    if (hasApprove && hasEdit && hasReject) return true;
+  }
+  return false;
 }
 
 function isDangerousOperationPrompt(prompt) {
@@ -253,6 +264,36 @@ Esc to cancel · Tab to amend · ctrl+e to explain
       assert.ok(isPlanApprovalPrompt(result), 'Should classify as plan approval');
       assert.ok(!isDangerousOperationPrompt(result), 'Should NOT classify as dangerous');
       console.log('  ✓ Plan prompt correctly classified (not dangerous)');
+    });
+
+    it('E2: Plan approval via options fallback (no "plan" keyword in question)', () => {
+      // cliMode 下 Claude CLI 实际 plan inquirer prompt 文本变体（如 "Would you like to proceed?"）
+      // 不一定含 "plan" 关键字，靠 3 选项 Approve/Edit/Reject 模式识别。
+      const raw = `Would you like to proceed?
+  ❯ 1. Approve
+    2. Approve with edits
+    3. Reject
+`;
+      const result = detectPrompt(raw);
+      assert.ok(result, 'Should detect prompt');
+      assert.ok(isPlanApprovalPrompt(result), 'Should classify as plan via options fallback');
+      assert.ok(!isDangerousOperationPrompt(result), 'Should NOT classify as dangerous (plan early-return)');
+      console.log('  ✓ Options-fallback plan detection works');
+    });
+
+    it('E3: Plan approval with "keep planning" reject + "edits" plural', () => {
+      // 真实 Claude CLI 文案变体：reject 文本是 "No, keep planning"；
+      // edits 单复数兼容（\bedits?\b）。同时验证 question 不含 "plan" 时仍被 options 兜底识别。
+      const raw = `Do you want to proceed?
+  ❯ 1. Approve plan
+    2. Approve with edits
+    3. No, keep planning
+`;
+      const result = detectPrompt(raw);
+      assert.ok(result, 'Should detect prompt');
+      assert.ok(isPlanApprovalPrompt(result), 'Should classify as plan via options fallback');
+      assert.ok(!isDangerousOperationPrompt(result), 'Should NOT classify as dangerous');
+      console.log('  ✓ "No, keep planning" + edits-plural variant works');
     });
   });
 

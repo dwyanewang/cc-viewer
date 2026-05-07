@@ -1,12 +1,30 @@
 /**
  * Prompt classification utilities for PTY prompt detection.
  * Shared by ChatView.jsx and ChatMessage.jsx.
+ *
+ * NOTE: test/permission-detect.test.js 有 isPlanApprovalPrompt / isDangerousOperationPrompt
+ * 的内联副本，任何修改必须**双改保持同步**，否则 production 与 test 行为分裂。
  */
 
 export function isPlanApprovalPrompt(prompt) {
   if (!prompt || !prompt.question) return false;
   const q = prompt.question.toLowerCase();
-  return /plan/i.test(q) && (/approv/i.test(q) || /proceed/i.test(q) || /accept/i.test(q));
+  // 文本判定：question 含 "plan" + (approv/proceed/accept)
+  if (/plan/i.test(q) && (/approv/i.test(q) || /proceed/i.test(q) || /accept/i.test(q))) {
+    return true;
+  }
+  // Options 模式兜底：Claude CLI plan inquirer prompt 不一定带 "plan" 关键字
+  // （如 "Would you like to proceed?"），但典型有 3 选项 = Approve / Approve with edits / Reject。
+  // 通过这个模式识别，保证 cliMode 下 plan modal 能弹出。
+  // 与 isDangerousOperationPrompt 的 2 选项 allow/deny 兜底正交（dangerous L15 早退避免冲突）。
+  if (Array.isArray(prompt.options) && prompt.options.length === 3) {
+    const texts = prompt.options.map(o => (o.text || '').toLowerCase());
+    const hasApprove = texts.some(t => /\bapprov/i.test(t));
+    const hasEdit = texts.some(t => /\bedits?\b|\bmodify/i.test(t));
+    const hasReject = texts.some(t => /\breject\b|\bdeny\b|keep planning|\bno,/i.test(t));
+    if (hasApprove && hasEdit && hasReject) return true;
+  }
+  return false;
 }
 
 export function isDangerousOperationPrompt(prompt) {

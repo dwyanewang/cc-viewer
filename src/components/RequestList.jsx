@@ -144,6 +144,9 @@ class RequestList extends React.Component {
                           let dot;
                           if (loss) {
                             const allReasons = loss.reasons || [loss.reason];
+                            // 用 antd Tooltip 而非原生 title:原生 title 在移动端 (iOS/Android)
+                            // 完全无法触发,会让用户看不到 cache-loss reason。Tooltip 富内容仅在
+                            // 悬停/点击时渲染,数百个 dot 也只有可见的几个会创建 wrapper。
                             const tooltipText = allReasons.map(r => t(reasonI18nMap[r] || reasonI18nMap.key_change)).join('\n');
                             dot = <Tooltip title={<span className={styles.tooltipPreLine}>{tooltipText}</span>}><span className={`${styles.cacheDot} ${styles.cacheDotLoss}`} /></Tooltip>;
                           } else {

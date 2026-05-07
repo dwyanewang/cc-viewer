@@ -70,21 +70,34 @@
   line-height: 0;
 }
 
-/* Live monitoring tag */
+/* Live monitoring tag：仅在 portal slot 中渲染，高度跟 slot 走（terminalToolbar 26px / chatInputBottom 28px），
+   line-height 用 1，文本由 inline-flex 在垂直方向居中、水平方向左对齐（紧贴胶囊左边缘内 padding）。
+   border-radius 999 保证胶囊外形。 */
 .liveTag {
   position: relative;
   display: inline-flex;
   align-items: center;
-  border-radius: 12px;
+  justify-content: flex-start;
+  border-radius: 999px;
   border: 1px solid;
+  border-color: var(--ctx-color);
+  color: var(--ctx-color);
   padding: 0 10px;
-  height: 22px;
+  height: 100%;
   font-size: 12px;
-  line-height: 22px;
+  line-height: 1;
   overflow: hidden;
   transition: border-color 0.3s, color 0.3s;
   white-space: nowrap;
   background: var(--bg-base-pure);
+}
+
+/* 头部"当前项目:xxx"纯文本（血条迁移到 TerminalPanel/ChatInputBar 后留在原位的项目标识）：
+   无边框无背景，颜色继承默认文字色。 */
+.headerProjectName {
+  font-size: 12px;
+  color: inherit;
+  white-space: nowrap;
 }
 
 .liveTagFill {
@@ -92,6 +105,8 @@
   left: 0;
   top: 0;
   bottom: 0;
+  width: var(--ctx-percent, 0);
+  background-color: var(--ctx-color);
   opacity: 0.35;
   transition: width 0.5s ease, background-color 0.3s;
   pointer-events: none;
@@ -112,6 +127,7 @@
 
 .liveTagText {
   margin-left: 4px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Cache countdown */
@@ -572,8 +588,13 @@
 }
 
 .cacheScrollArea {
-  max-height: 450px;
+  /* 弹层尽量贴近视口高度（扣除 header ~30px / popover overlayInner padding 16 / 上下余量）。
+     antd Popover 默认 autoAdjustOverflow 仍会把超出视口的部分顶回来，矮窗口下不会贴边溢出。 */
+  max-height: calc(100vh - 140px);
   overflow-y: auto;
+  /* iOS 抽屉里也用此组件：开启原生惯性滚动，避免 body 弹性滚动穿透。 */
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 
 .cachePopoverTitle {
@@ -668,7 +689,7 @@
 }
 
 .cacheSectionTitle {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 2px;
   font-size: 12px;
@@ -680,7 +701,7 @@
   border: none;
   cursor: pointer;
   user-select: none;
-  flex: 1;
+  flex: 0 0 auto;
   text-align: left;
 }
 
@@ -763,101 +784,8 @@
 }
 
 /* Skill Manager Modal — 每条 skill 一个独立 bordered block，垂直排列 */
-.skillsList {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.skillCard {
-  border: 1px solid var(--border-secondary);
-  border-radius: 6px;
-  padding: 10px 12px;
-  background: var(--bg-container);
-}
-
-.skillCardHeader {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 6px;
-}
-
-.skillCardName {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-primary);
-  word-break: break-word;
-  flex: 1;
-}
-
-.skillCardActions {
-  flex-shrink: 0;
-  /* 预留未来操作按钮位置（⋯ 菜单：禁用 / 删除 / 编辑），现状为空 */
-}
-
-.skillCardDesc {
-  font-size: 13px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: var(--text-secondary);
-}
-
-.skillsEmpty {
-  padding: 32px 12px;
-  text-align: center;
-  color: var(--text-muted);
-  font-style: italic;
-}
-
-/* 不可切换 skill 区（Plugin / Builtin）：分隔线上方是可切的 card 列表，下方 chip grid 行 */
-.skillsReadonlySection {
-  margin-top: 16px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border-secondary);
-}
-
-.skillsReadonlyLabel {
-  font-size: 12px;
-  color: var(--text-muted);
-  margin-bottom: 6px;
-}
-
-/* Skill 管理 Modal 里的卡片 disabled 状态 + 来源徽章 */
-.skillCardDisabled {
-  opacity: 0.55;
-  background: var(--bg-elevated, var(--bg-surface));
-}
-.skillCardDisabled .skillCardName {
-  text-decoration: line-through;
-}
-.skillCardTitleRow {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: 1;
-  min-width: 0;
-}
-.skillSourceBadge {
-  font-size: 10px;
-  font-weight: 600;
-  padding: 1px 6px;
-  border-radius: 3px;
-  letter-spacing: 0.3px;
-  flex-shrink: 0;
-  white-space: nowrap;
-  text-transform: uppercase;
-}
-.skillSource_user    { background: #e6f4ff; color: #0958d9; }
-.skillSource_project { background: #f6ffed; color: #389e0d; }
-.skillSource_plugin  { background: #fff7e6; color: #d46b08; }
-.skillSource_builtin { background: #f9f0ff; color: #531dab; }
-[data-theme="dark"] .skillSource_user    { background: #111d2c; color: #69b1ff; }
-[data-theme="dark"] .skillSource_project { background: #162312; color: #73d13d; }
-[data-theme="dark"] .skillSource_plugin  { background: #2b1d11; color: #ffa940; }
-[data-theme="dark"] .skillSource_builtin { background: #1a1325; color: #b37feb; }
+/* skill-* 类（skillsList / skillCard* / skillsEmpty / skillsReadonly* / skillSource_*）已搬到
+   src/components/SkillsManagerModal.module.css，避免 SkillsManagerModal 跨文件硬引用 AppHeader 私有样式。 */
 
 .cacheCodeBlock {
   white-space: pre-wrap;
@@ -962,6 +890,14 @@
   text-align: left;
 }
 
+/* Cache popover "上下文消耗：" prefix label (standard primary text, not bold) */
+.cacheUsageLabel {
+  font-size: 13px;
+  color: var(--text-primary);
+  font-weight: 400;
+  margin-right: 4px;
+}
+
 /* Cache popover context percent (blood-bar mirror) */
 .cachePercent {
   font-size: 13px;
@@ -978,9 +914,9 @@
   white-space: nowrap;
 }
 
-/* Calibration model select */
+/* Calibration model select：选项简化为 auto/1M/200K 后内容很短，宽度从 160 砍半到 80 */
 .calibrationSelect {
-  width: 160px;
+  width: 80px;
   flex-shrink: 0;
 }
 
@@ -1078,17 +1014,49 @@
   outline-offset: 1px;
 }
 
-/* SVG icon vertical alignment */
-/* Mirror icon horizontally */
-.iconMirror {
-  transform: scaleX(-1);
+/* Approval bell button — 持久重开 ApprovalModal 入口（dismiss 后用户手动唤起） */
+.approvalBell {
+  position: relative;
+  width: 30px;
+  height: 30px;
+  padding: 6px;
+  box-sizing: border-box;
+  color: var(--color-warning, #faad14);
+  cursor: pointer;
+  border-radius: 6px;
+  transition: color 0.15s ease, background-color 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  background: none;
+  border: none;
+}
+.approvalBell:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+}
+.approvalBell:focus-visible {
+  outline: 2px solid var(--primary-color, #1677ff);
+  outline-offset: 1px;
+}
+.approvalBellBadge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  box-sizing: border-box;
+  background: var(--color-error, #ff4d4f);
+  color: #fff;
+  font-size: 9px;
+  line-height: 14px;
+  border-radius: 7px;
+  text-align: center;
+  font-weight: 600;
 }
 
-
-.disabledMenuItem {
-  color: var(--text-disabled);
-  cursor: not-allowed;
-}
 
 .currentProcessBtn {
   color: var(--color-success);
@@ -1321,5 +1289,108 @@
   border: 1px solid var(--border-hover);
   border-radius: 6px;
   line-height: 1;
+}
+
+/* ─── 持久记忆区块 ────────────────────────────────
+   入口 MEMORY.md 内联渲染：复用 marked + DOMPurify 管线（src/utils/markdown.js）。
+   Modal（明细）也使用同一 className，因此样式一份代替两份。
+
+   设计要点：
+   - 字号 12.5px，比工具 chip(11px) 略大，方便阅读但不会和上方 MCP/Skill 抢视觉重心；
+   - 段落/列表与项目其它 markdown 渲染（如 ConceptHelp Modal）保持一致的 line-height: 1.55；
+   - 链接颜色复用 --primary-color，鼠标悬停 underline，明确"可点击"暗示；
+   - 代码块走 var(--bg-surface) + 无边框，避免在 popover 里分量过重。
+*/
+.memoryMarkdown {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-primary);
+  word-break: break-word;
+}
+
+.memoryMarkdown p {
+  margin: 0 0 6px 0;
+}
+
+.memoryMarkdown ul,
+.memoryMarkdown ol {
+  margin: 4px 0 6px 0;
+  padding-left: 20px;
+}
+
+.memoryMarkdown li {
+  margin: 2px 0;
+}
+
+.memoryMarkdown h1,
+.memoryMarkdown h2,
+.memoryMarkdown h3,
+.memoryMarkdown h4 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 8px 0 4px 0;
+  color: var(--text-primary);
+}
+
+.memoryMarkdown h1 { font-size: 14px; }
+
+.memoryMarkdown a {
+  color: var(--primary-color, #1677ff);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.memoryMarkdown a:hover {
+  text-decoration: underline;
+}
+
+.memoryMarkdown code {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+}
+
+.memoryMarkdown pre {
+  margin: 6px 0;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: var(--bg-surface);
+  overflow-x: auto;
+}
+
+.memoryMarkdown pre code {
+  padding: 0;
+  background: transparent;
+  font-size: 12px;
+}
+
+.memoryMarkdown blockquote {
+  margin: 4px 0;
+  padding: 2px 8px;
+  border-left: 3px solid var(--border-hover);
+  color: var(--text-secondary);
+}
+
+.memoryMarkdown hr {
+  margin: 8px 0;
+  border: none;
+  border-top: 1px solid var(--border-secondary);
+}
+
+/* 加载/空态/错误三态共享：减小内边距、灰一点字 */
+.memoryStatus {
+  padding: 6px 4px;
+}
+
+.memoryDirHint {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  margin-top: 4px;
+  word-break: break-all;
+  user-select: text;
 }
 

@@ -1,19 +1,27 @@
 import React from 'react';
-import { ConfigProvider, Spin, Button, Badge, Switch, Select, Modal, message } from 'antd';
+import { ConfigProvider, Spin, Button, Badge, Switch, Select, Modal, message, Radio } from 'antd';
 import { BranchesOutlined, DownloadOutlined, DeleteOutlined, RollbackOutlined, ReloadOutlined, UploadOutlined } from '@ant-design/icons';
 import AppBase, { styles, OPTIMISTIC_CLEAR_PERCENT } from './AppBase';
 import { isIOS, isPad, setViewMode } from './env';
 import { isMainAgent, isSystemText, classifyUserContent } from './utils/contentFilter';
-import { getModelMaxTokens, getEffectiveModel } from './utils/helpers';
+import { getModelMaxTokens, getEffectiveModel, AUTO_COMPACT_USABLE_RATIO } from './utils/helpers';
 import ChatView from './components/ChatView';
 import TerminalPanel, { uploadFileAndGetPath } from './components/TerminalPanel';
+import { TerminalWsProvider } from './components/TerminalWsContext';
 import ToolApprovalPanel from './components/ToolApprovalPanel';
+import ApprovalModal from './components/ApprovalModal';
 import MobileGitDiff from './components/MobileGitDiff';
 import MobileFileExplorer from './components/MobileFileExplorer';
 import MobileStats from './components/MobileStats';
+import CachePopoverContent from './components/CachePopoverContent';
+import MemoryDetailModal from './components/MemoryDetailModal';
+import SkillsManagerModal from './components/SkillsManagerModal';
 import OpenFolderIcon from './components/OpenFolderIcon';
-import { t } from './i18n';
+import appConfig from './config.json';
+import { t, getLang, setLang, LANG_OPTIONS } from './i18n';
 import { apiUrl } from './utils/apiUrl';
+
+const CALIBRATION_MODELS = appConfig.calibrationModels;
 
 class Mobile extends AppBase {
   constructor(props) {
@@ -29,14 +37,241 @@ class Mobile extends AppBase {
       mobilePromptVisible: false,
       mobileTerminalVisible: false,
       mobileFileExplorerVisible: false,
+      mobileCachePanelVisible: false,  // 手机模式：点击血条划出的侧边抽屉
       globalPermission: null,     // { permission, handlers } — 全局权限审批浮层
       globalPlanApproval: null,   // { plan, handlers } — 全局计划审批浮层
       autoApproveSeconds: 0,
       hasGit: true,
       terminalPendingImages: [],  // 终端面板独立的 pending 图片/文件
+      // ─── 血条 popover/抽屉用的状态（与 AppHeader 同语义）─────────
+      // null=loading / false=失败 / 数组=加载结果。workspace 切换由 componentDidUpdate + seq 控制。
+      _fsSkills: null,
+      _memory: null,
+      _memoryRefreshing: false,
+      _memoryDetail: null,
+      // 与 AppHeader._skillsModal 同结构；toggling 用 Set 跟踪正在切换的 skill key。
+      _skillsModal: { open: false, loading: false, skills: [], error: null, toggling: new Set() },
+      calibrationModel: (v => CALIBRATION_MODELS.some(m => m.value === v) ? v : 'auto')(localStorage.getItem('ccv_calibrationModel') || 'auto'),
     });
     this._lastContextPercent = 0;
+    this._fsSkillsSeq = 0;
+    this._memorySeq = 0;
+    this._memoryDetailSeq = 0;
   }
+
+  // 关掉所有移动端互斥 overlay。每次打开任一 overlay 时先调用此方法，
+  // 避免 9+ 处 setState 漏键导致两个 overlay 叠加（review 反馈：closeAll helper 比逐处加 key 安全）。
+  _closeAllMobileOverlays() {
+    return {
+      mobileMenuVisible: false,
+      mobileStatsVisible: false,
+      mobileGitDiffVisible: false,
+      mobileChatVisible: false,
+      mobileLogMgmtVisible: false,
+      mobileSettingsVisible: false,
+      mobilePromptVisible: false,
+      mobileTerminalVisible: false,
+      mobileFileExplorerVisible: false,
+      mobileCachePanelVisible: false,
+    };
+  }
+
+  handleCalibrationModelChange = (value) => {
+    this.setState({ calibrationModel: value });
+    localStorage.setItem('ccv_calibrationModel', value);
+  };
+
+  // 与 AppHeader.reloadFsSkills 同实现（短期接受重复，TODO 后续抽 src/utils/cacheFetch.js）。
+  // 三态契约 null/false/数组；seq 防 workspace 切换时旧回包污染。
+  reloadFsSkills = async () => {
+    if (this._isLocalLog) return { ok: false, reason: 'local_log' };
+    const seq = ++this._fsSkillsSeq;
+    try {
+      const r = await fetch(apiUrl('/api/skills'));
+      const data = await r.json();
+      if (seq !== this._fsSkillsSeq) return { ok: false, reason: 'stale' };
+      if (!r.ok || !data.ok || !Array.isArray(data.skills)) {
+        const reason = (data && data.error) || `http:${r.status}`;
+        this.setState(prev => ({ _fsSkills: Array.isArray(prev._fsSkills) ? prev._fsSkills : false }));
+        return { ok: false, reason };
+      }
+      this.setState({ _fsSkills: data.skills });
+      return { ok: true, skills: data.skills };
+    } catch (e) {
+      if (seq === this._fsSkillsSeq) {
+        this.setState(prev => ({ _fsSkills: Array.isArray(prev._fsSkills) ? prev._fsSkills : false }));
+      }
+      return { ok: false, reason: e.message || 'network' };
+    }
+  };
+
+  // 打开 skills 管理 modal。同时关闭 cache 抽屉避免两个 overlay 叠加。
+  // 与 AppHeader.handleOpenSkillsModal 同语义；区别只在于关闭 cache UI 的字段名（mobileCachePanelVisible vs _cachePopoverOpen）。
+  handleOpenSkillsModal = async () => {
+    const cached = this.state._fsSkills;
+    const needFetch = !Array.isArray(cached);
+    this.setState(prev => ({
+      _skillsModal: {
+        open: true,
+        loading: needFetch,
+        skills: Array.isArray(cached) ? cached : [],
+        error: null,
+        toggling: prev._skillsModal?.toggling || new Set(),
+      },
+      mobileCachePanelVisible: false,
+    }), () => this._onCachePanelOpenChange(false));
+    if (needFetch) {
+      const result = await this.reloadFsSkills();
+      this.setState(prev => ({
+        _skillsModal: {
+          ...prev._skillsModal,
+          loading: false,
+          skills: result.ok ? result.skills : [],
+          error: result.ok ? null : result.reason,
+        },
+      }));
+    }
+  };
+
+  // 切换 skill 启用状态，乐观更新 + 失败回滚（与 AppHeader.handleToggleSkill 同实现）
+  handleToggleSkill = async (skill) => {
+    const key = `${skill.source}-${skill.name}`;
+    if (this.state._skillsModal?.toggling?.has(key)) return;
+    const enable = !skill.enabled;
+    const flipEnabled = (target) => (s) =>
+      (s.source === skill.source && s.name === skill.name) ? { ...s, enabled: target } : s;
+    this.setState(prev => {
+      const next = new Set(prev._skillsModal.toggling); next.add(key);
+      return {
+        _skillsModal: {
+          ...prev._skillsModal,
+          toggling: next,
+          skills: prev._skillsModal.skills.map(flipEnabled(enable)),
+        },
+      };
+    });
+    try {
+      const r = await fetch(apiUrl('/api/skills/toggle'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source: skill.source, name: skill.name, enable }),
+      });
+      const data = await r.json();
+      if (!r.ok) {
+        this.setState(prev => ({
+          _skillsModal: {
+            ...prev._skillsModal,
+            skills: prev._skillsModal.skills.map(flipEnabled(!enable)),
+          },
+        }));
+        if (data.code === 'DEST_CONFLICT') {
+          message.error(t('ui.skillToggleConflict', { name: skill.name }));
+        } else {
+          message.error(t('ui.skillToggleFailed', { reason: data.error || 'unknown' }));
+        }
+        return;
+      }
+      // 切换成功不弹 toast：Switch 状态本身已反馈
+      this.setState(prev => ({
+        _fsSkills: Array.isArray(prev._fsSkills)
+          ? prev._fsSkills.map(s => (s.source === skill.source && s.name === skill.name) ? { ...s, enabled: enable } : s)
+          : prev._fsSkills,
+      }));
+      // 重拉对齐权威数据，但保持 modal 显示顺序避免 toggle 后 card 跳位（与 AppHeader 同语义）
+      const result = await this.reloadFsSkills();
+      if (result.ok) {
+        this.setState(prev => {
+          const orderMap = new Map(prev._skillsModal.skills.map((s, i) => [`${s.source}-${s.name}`, i]));
+          const merged = [...result.skills].sort((a, b) => {
+            const ai = orderMap.get(`${a.source}-${a.name}`);
+            const bi = orderMap.get(`${b.source}-${b.name}`);
+            if (ai === undefined && bi === undefined) return 0;
+            if (ai === undefined) return 1;
+            if (bi === undefined) return -1;
+            return ai - bi;
+          });
+          return { _skillsModal: { ...prev._skillsModal, skills: merged } };
+        });
+      }
+    } catch (e) {
+      this.setState(prev => ({
+        _skillsModal: {
+          ...prev._skillsModal,
+          skills: prev._skillsModal.skills.map(flipEnabled(!enable)),
+        },
+      }));
+      message.error(t('ui.skillToggleFailed', { reason: e.message }));
+    } finally {
+      this.setState(prev => {
+        const next = new Set(prev._skillsModal.toggling); next.delete(key);
+        return { _skillsModal: { ...prev._skillsModal, toggling: next } };
+      });
+    }
+  };
+
+  loadMemory = async () => {
+    const seq = ++this._memorySeq;
+    try {
+      const r = await fetch(apiUrl('/api/project-memory'));
+      const data = await r.json();
+      if (seq !== this._memorySeq) return;
+      if (!r.ok) { this.setState({ _memory: false }); return; }
+      this.setState({ _memory: data });
+    } catch {
+      if (seq === this._memorySeq) this.setState({ _memory: false });
+    }
+  };
+
+  // 与 AppHeader.handleRefreshMemory 同语义：用户主动刷新带 toast 反馈，
+  // stale（workspace 中途切换）保持静默不误报失败。
+  handleRefreshMemory = async () => {
+    if (this.state._memoryRefreshing) return;
+    this.setState({ _memoryRefreshing: true });
+    const seq = ++this._memorySeq;
+    let ok = false;
+    let stale = false;
+    try {
+      const r = await fetch(apiUrl('/api/project-memory'));
+      const data = await r.json();
+      if (seq !== this._memorySeq) { stale = true; }
+      else if (!r.ok) { this.setState({ _memory: false }); }
+      else { this.setState({ _memory: data }); ok = true; }
+    } catch {
+      if (seq !== this._memorySeq) stale = true;
+      else this.setState({ _memory: false });
+    } finally {
+      if (!stale) this.setState({ _memoryRefreshing: false });
+    }
+    if (stale) return;
+    if (ok) message.success(t('ui.memoryRefreshSuccess'));
+    else message.error(t('ui.memoryRefreshFailed'), 5);
+  };
+
+  loadMemoryDetail = async (name) => {
+    const seq = ++this._memoryDetailSeq;
+    this.setState({ _memoryDetail: { name, loading: true } });
+    try {
+      const r = await fetch(apiUrl(`/api/project-memory?file=${encodeURIComponent(name)}`));
+      const data = await r.json();
+      if (seq !== this._memoryDetailSeq) return;
+      if (!r.ok) {
+        this.setState({ _memoryDetail: { name, error: data.error || `http:${r.status}` } });
+        return;
+      }
+      this.setState({ _memoryDetail: { name, content: data.content || '' } });
+    } catch (e) {
+      if (seq === this._memoryDetailSeq) {
+        this.setState({ _memoryDetail: { name, error: e.message || 'network' } });
+      }
+    }
+  };
+
+  // 抽屉打开瞬间懒加载（iPad / 手机点击血条的 onClick 都会调用）。
+  // 仅在 open=true 且数据未加载（null）时触发 fetch，与 AppHeader.onOpenChange 同语义。
+  _onCachePanelOpenChange = (open) => {
+    if (open && this.state._fsSkills === null && !this._isLocalLog) this.reloadFsSkills();
+    if (open && this.state._memory === null) this.loadMemory();
+  };
 
   componentDidMount() {
     super.componentDidMount();
@@ -100,7 +335,23 @@ class Mobile extends AppBase {
       this._modeSwitchDialog.destroy();
       this._modeSwitchDialog = null;
     }
+    // 与 AppHeader.componentWillUnmount 对齐：让在途 reloadFsSkills / loadMemory /
+    // handleRefreshMemory / loadMemoryDetail 的回包 seq 校验失败 → 不会 setState 到
+    // 已卸载组件，也不会触发 toast。
+    this._fsSkillsSeq++;
+    this._memorySeq++;
+    this._memoryDetailSeq++;
     super.componentWillUnmount();
+  }
+
+  componentDidUpdate(prevProps, prevState) {
+    if (super.componentDidUpdate) super.componentDidUpdate(prevProps, prevState);
+    // workspace 切换：projectName 变了 → 旧的 _fsSkills/_memory 属于旧项目，作废 + 刷 seq
+    if (prevState.projectName !== this.state.projectName) {
+      this._fsSkillsSeq++;
+      this._memorySeq++;
+      this.setState({ _fsSkills: null, _memory: null, _memoryDetail: null, _memoryRefreshing: false });
+    }
   }
 
   // ─── 对话中文件路径点击 → 打开移动端文件浏览器 ────────────
@@ -108,15 +359,9 @@ class Mobile extends AppBase {
     // local log 模式下不打开文件浏览器
     if (this.state.localLogFile) return;
     this.setState({
+      ...this._closeAllMobileOverlays(),
       mobileFileExplorerVisible: true,
       mobileFileExplorerTarget: { file: filePath, ancestors: ancestors || [] },
-      mobileGitDiffVisible: false,
-      mobileTerminalVisible: false,
-      mobileStatsVisible: false,
-      mobileLogMgmtVisible: false,
-      mobileSettingsVisible: false,
-      mobilePromptVisible: false,
-      mobileChatVisible: false,
     });
   };
 
@@ -254,11 +499,7 @@ class Mobile extends AppBase {
 
   handleAutoApproveChange = (seconds) => {
     this.setState({ autoApproveSeconds: seconds });
-    fetch(apiUrl('/api/preferences'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ autoApproveSeconds: seconds }),
-    }).catch(() => {});
+    this.context.updatePreferences({ autoApproveSeconds: seconds });
   };
 
   // ─── 拖拽上传（iPad / Mobile） ────────────────────────────
@@ -344,7 +585,53 @@ class Mobile extends AppBase {
       if (isMainAgent(filteredRequests[i]) && effective) { mobileModelName = effective; break; }
     }
 
+    // contextPercent 计算抽到 render 顶部：header 血条 + 抽屉里的 CachePopoverContent 都要用同一份。
+    // 与原 IIFE 同语义；side effect（_lastContextPercent 更新）也搬上来一次性做完。
+    // 反向找最后一条带 usage 的 MainAgent 一次，contextPercent 与 mobileContextTokens 共用
+    // （以前 mobileContextTokens 单独扫 + fallback 分支再扫，是 2*O(N)）
+    let mobileContextPercent = 0;
+    let mobileContextTokens = 0;
+    if (!mobileIsLocalLog) {
+      const contextWindow = this.state.contextWindow;
+      let lastMainAgent = null;
+      if (filteredRequests.length > 0) {
+        for (let i = filteredRequests.length - 1; i >= 0; i--) {
+          if (isMainAgent(filteredRequests[i]) && filteredRequests[i].response?.body?.usage) {
+            lastMainAgent = filteredRequests[i];
+            const u = lastMainAgent.response.body.usage;
+            mobileContextTokens = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+            break;
+          }
+        }
+      }
+      if (contextWindow?.used_percentage != null) {
+        mobileContextPercent = Math.min(100, Math.max(0, Math.round(contextWindow.used_percentage / AUTO_COMPACT_USABLE_RATIO)));
+      } else if (lastMainAgent) {
+        const maxTokens = contextWindow?.context_window_size || getModelMaxTokens(getEffectiveModel(lastMainAgent) || this.state.settingsModel);
+        const usable = maxTokens * AUTO_COMPACT_USABLE_RATIO;
+        if (usable > 0 && mobileContextTokens > 0) mobileContextPercent = Math.min(100, Math.max(0, Math.round(mobileContextTokens / usable * 100)));
+      }
+      if (mobileContextPercent === 0 && this._lastContextPercent > 0) mobileContextPercent = this._lastContextPercent;
+      else this._lastContextPercent = mobileContextPercent;
+      if (this.state.contextBarOptimistic) mobileContextPercent = OPTIMISTIC_CLEAR_PERCENT;
+    }
+
+    // 单条 /ws/terminal 的开启条件:与 App 同款,回退到「非本地日志 + 非 SDK 模式都连」,
+    // 修 mobile 隐藏终端时 ChatView 的 hook bridge / PTY 提交失败回归(参看 App.jsx:305 注释)。
+    const wsOpen = !mobileIsLocalLog && !this.state.sdkMode;
+
     return (
+      <TerminalWsProvider open={wsOpen}>
+      <ApprovalModal
+        enabled={isPad && this.state.approvalPrefs.modalEnabled}
+        soundEnabled={this.state.approvalPrefs.soundEnabled}
+        approvalGlobal={this.state.approvalGlobal}
+        dismissedIds={this.state.approvalDismissedIds}
+        onDismiss={this.handleApprovalDismiss}
+        onJumpTab={this.handleApprovalJumpTab}
+        otherTabs={this.state.approvalOtherTabs}
+      >
+      <ConfigProvider theme={this.themeConfig}>
       <div className={styles.mobileCLIRoot} ref={this._layoutRef} onDragOver={this._onDragOver} onDragLeave={this._onDragLeave} onDrop={this._onDrop}>
         {this.state.isDragging && (
           <div className={styles.dragOverlay}>
@@ -368,37 +655,42 @@ class Mobile extends AppBase {
               </svg>
             </button>
             {!mobileIsLocalLog ? (() => {
-              // 移动端（含 iPad）：渲染与 PC 一致的上下文血条
-              const contextWindow = this.state.contextWindow;
-              let contextPercent = 0;
-              if (contextWindow?.used_percentage != null) {
-                contextPercent = Math.min(100, Math.max(0, Math.round(contextWindow.used_percentage / 83.5 * 100)));
-              } else if (filteredRequests.length > 0) {
-                for (let i = filteredRequests.length - 1; i >= 0; i--) {
-                  if (isMainAgent(filteredRequests[i]) && filteredRequests[i].response?.body?.usage) {
-                    const u = filteredRequests[i].response.body.usage;
-                    const total = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
-                    const maxTokens = contextWindow?.context_window_size || getModelMaxTokens(getEffectiveModel(filteredRequests[i]) || this.state.settingsModel);
-                    const usable = maxTokens * 0.835;
-                    if (usable > 0 && total > 0) contextPercent = Math.min(100, Math.max(0, Math.round(total / usable * 100)));
-                    break;
-                  }
-                }
-              }
-              if (contextPercent === 0 && this._lastContextPercent > 0) contextPercent = this._lastContextPercent;
-              else this._lastContextPercent = contextPercent;
-              // /clear 后立即把血条压到乐观水位；下一次 SSE context_window 推送会取消这个覆盖
-              if (this.state.contextBarOptimistic) contextPercent = OPTIMISTIC_CLEAR_PERCENT;
+              // 移动端（含 iPad）：渲染与 PC 一致的上下文血条。contextPercent 已在 render 顶部计算。
+              const contextPercent = mobileContextPercent;
               const ctxColor = contextPercent >= 80 ? 'var(--color-error-light)' : contextPercent >= 60 ? 'var(--color-warning-light)' : 'var(--color-success)';
               const ctxLabel = `${t('ui.liveMonitoring')}${this.state.projectName ? `: ${this.state.projectName}` : ''}`;
-              return (
-                <span className={styles.mobileCtxTag} style={{ borderColor: ctxColor, color: ctxColor }} title={ctxLabel}>
+              // 血条本体——iPad 与手机一致，作为按钮触发左侧抽屉（mobileCachePanelOverlay）。
+              // mobileCachePanelVisible=true 时才 mount CachePopoverContent，维持 commit 0914cc5
+              // 的"打开才解析 200 条"性能修复。
+              const ctxTag = (
+                <span
+                  className={styles.mobileCtxTag}
+                  style={{ borderColor: ctxColor, color: ctxColor, cursor: 'pointer' }}
+                  title={ctxLabel}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={t('ui.openCachePanel')}
+                  onClick={() => this.setState(prev => ({
+                    ...this._closeAllMobileOverlays(),
+                    mobileCachePanelVisible: !prev.mobileCachePanelVisible,
+                  }), () => this._onCachePanelOpenChange(this.state.mobileCachePanelVisible))}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      this.setState(prev => ({
+                        ...this._closeAllMobileOverlays(),
+                        mobileCachePanelVisible: !prev.mobileCachePanelVisible,
+                      }), () => this._onCachePanelOpenChange(this.state.mobileCachePanelVisible));
+                    }
+                  }}
+                >
                   <span className={styles.mobileCtxTagFill} style={{ width: `${contextPercent}%`, backgroundColor: ctxColor }} />
                   <span className={styles.mobileCtxTagContent}>
                     {ctxLabel}
                   </span>
                 </span>
               );
+              return ctxTag;
             })() : (
               <>
                 <Badge status="processing" color="green" />
@@ -422,7 +714,7 @@ class Mobile extends AppBase {
                 type="text"
                 size="small"
                 icon={<BranchesOutlined />}
-                onClick={() => this.setState(prev => ({ mobileGitDiffVisible: !prev.mobileGitDiffVisible, mobileChatVisible: false, mobileTerminalVisible: false, mobileStatsVisible: false, mobileLogMgmtVisible: false, mobileSettingsVisible: false, mobilePromptVisible: false, mobileFileExplorerVisible: false }))}
+                onClick={() => this.setState(prev => ({ ...this._closeAllMobileOverlays(), mobileGitDiffVisible: !prev.mobileGitDiffVisible }))}
                 style={{ color: this.state.mobileGitDiffVisible ? 'var(--color-primary)' : 'var(--text-tertiary)', fontSize: 12 }}
               >
                 {this.state.mobileGitDiffVisible ? t('ui.mobileGitDiffExit') : t('ui.mobileGitDiffBrowse')}
@@ -433,7 +725,7 @@ class Mobile extends AppBase {
                 type="text"
                 size="small"
                 icon={<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="4 17 10 11 4 5" /><line x1="12" y1="19" x2="20" y2="19" /></svg>}
-                onClick={() => this.setState(prev => ({ mobileTerminalVisible: !prev.mobileTerminalVisible, mobileGitDiffVisible: false, mobileStatsVisible: false, mobileLogMgmtVisible: false, mobileSettingsVisible: false, mobilePromptVisible: false, mobileFileExplorerVisible: false }))}
+                onClick={() => this.setState(prev => ({ ...this._closeAllMobileOverlays(), mobileTerminalVisible: !prev.mobileTerminalVisible }))}
                 style={{ color: this.state.mobileTerminalVisible ? 'var(--color-primary)' : 'var(--text-tertiary)', fontSize: 12 }}
               >
                 {this.state.mobileTerminalVisible ? t('ui.mobileTerminalExit') : t('ui.mobileTerminalBrowse')}
@@ -446,7 +738,7 @@ class Mobile extends AppBase {
               <div className={styles.mobileMenuDropdown}>
                 <button
                   className={styles.mobileMenuItem}
-                  onClick={() => { this.setState({ mobileMenuVisible: false, mobileLogMgmtVisible: true, mobileStatsVisible: false, mobileGitDiffVisible: false, mobileChatVisible: false, mobileTerminalVisible: false, mobileSettingsVisible: false, mobilePromptVisible: false, mobileFileExplorerVisible: false }); this.handleImportLocalLogs(); }}
+                  onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), mobileLogMgmtVisible: true }); this.handleImportLocalLogs(); }}
                 >
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
@@ -458,7 +750,7 @@ class Mobile extends AppBase {
                 </button>
                 <button
                   className={styles.mobileMenuItem}
-                  onClick={() => { this.setState({ mobileMenuVisible: false, mobileStatsVisible: true, mobileGitDiffVisible: false, mobileChatVisible: false, mobileTerminalVisible: false, mobileLogMgmtVisible: false, mobileSettingsVisible: false, mobilePromptVisible: false, mobileFileExplorerVisible: false }); }}
+                  onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), mobileStatsVisible: true }); }}
                 >
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <rect x="3" y="3" width="7" height="7" />
@@ -470,7 +762,7 @@ class Mobile extends AppBase {
                 </button>
                 <button
                   className={styles.mobileMenuItem}
-                  onClick={() => { this.setState({ mobileMenuVisible: false, mobileSettingsVisible: true, mobileStatsVisible: false, mobileGitDiffVisible: false, mobileChatVisible: false, mobileTerminalVisible: false, mobileLogMgmtVisible: false, mobilePromptVisible: false, mobileFileExplorerVisible: false }); }}
+                  onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), mobileSettingsVisible: true }); }}
                 >
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <circle cx="12" cy="12" r="3" />
@@ -481,7 +773,7 @@ class Mobile extends AppBase {
                 {!mobileIsLocalLog && (
                 <button
                   className={styles.mobileMenuItem}
-                  onClick={() => { this.setState({ mobileMenuVisible: false, mobileFileExplorerVisible: true, mobileStatsVisible: false, mobileGitDiffVisible: false, mobileChatVisible: false, mobileTerminalVisible: false, mobileLogMgmtVisible: false, mobileSettingsVisible: false, mobilePromptVisible: false }); }}
+                  onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), mobileFileExplorerVisible: true }); }}
                 >
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
@@ -491,7 +783,7 @@ class Mobile extends AppBase {
                 )}
                 <button
                   className={styles.mobileMenuItem}
-                  onClick={() => { this.setState({ mobileMenuVisible: false, mobilePromptVisible: true, mobileStatsVisible: false, mobileGitDiffVisible: false, mobileChatVisible: false, mobileTerminalVisible: false, mobileLogMgmtVisible: false, mobileSettingsVisible: false, mobileFileExplorerVisible: false }); }}
+                  onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), mobilePromptVisible: true }); }}
                 >
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
@@ -515,9 +807,9 @@ class Mobile extends AppBase {
                   <div className={styles.mobileLoadingLabel}>{t('ui.loadingChat')}{fileLoadingCount > 0 ? ` (${fileLoadingCount})` : ''}</div>
                 </div>
               )}
-              <ConfigProvider theme={this.themeConfig}>
                 <div className={styles.mobileChatInner}>
                   <ChatView
+                    {...this._settingsProps()}
                     requests={filteredRequests}
                     mainAgentSessions={mainAgentSessions}
                     streamingLatest={this.state.streamingLatest}
@@ -542,18 +834,23 @@ class Mobile extends AppBase {
                     onLoadSession={(sid) => this.loadSession(sid)}
                     onPendingPermission={this.handlePendingPermission}
                     onPendingPlanApproval={this.handlePendingPlanApproval}
+                    onPendingAsk={this.handleApprovalAsk}
+                    onPendingPtyPlan={this.handleApprovalPtyPlan}
+                    ownTabId={this.state.ownTabId}
+                    projectName={this.state.projectName}
+                    suppressInlineApprovalPanels={true}
                     pendingUploadPaths={this.state.pendingUploadPaths}
                     onUploadPathsConsumed={this.handleUploadPathsConsumed}
                     onMobileOpenFile={this._handleMobileOpenFile}
                     onClearContextOptimistic={this.handleClearContextOptimistic}
                   />
                 </div>
-              </ConfigProvider>
             </>
           )}
           {!mobileIsLocalLog && (
             <div className={`${styles.mobileChatOverlay} ${this.state.mobileTerminalVisible ? styles.mobileChatOverlayVisible : ''}`}>
               <TerminalPanel
+                {...this._settingsProps()}
                 modelName={mobileModelName}
                 onFilePath={this._handleTerminalFilePath}
                 pendingImages={this.state.terminalPendingImages}
@@ -568,6 +865,59 @@ class Mobile extends AppBase {
               <MobileGitDiff visible={this.state.mobileGitDiffVisible} onClose={() => this.setState({ mobileGitDiffVisible: false })} />
             </div>
           </div>
+          {/* 移动端（含 iPad）血条点击 → 从左侧划出的 cache popover 抽屉。
+              内层 zoom 0.6 在 :global(html.pad-mode) 下被覆写为 1（见 App.module.css）。
+              visible 时才 mount CachePopoverContent 以保留懒加载语义；关闭按钮放标题行右侧。 */}
+          <div className={`${styles.mobileCachePanelOverlay} ${this.state.mobileCachePanelVisible ? styles.mobileCachePanelOverlayVisible : ''}`}>
+            <div className={styles.mobileCachePanelInner}>
+              <div className={styles.mobileCachePanelHeader}>
+                <span className={styles.mobileCachePanelTitle}>{t('ui.contextManagement')}</span>
+                <button
+                  className={styles.mobileCachePanelClose}
+                  onClick={() => this.setState({ mobileCachePanelVisible: false }, () => this._onCachePanelOpenChange(false))}
+                  aria-label={t('ui.closeCachePanel')}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                    <line x1="18" y1="6" x2="6" y2="18" />
+                    <line x1="6" y1="6" x2="18" y2="18" />
+                  </svg>
+                </button>
+              </div>
+              <div className={styles.mobileCachePanelBody}>
+                {this.state.mobileCachePanelVisible && (
+                  <CachePopoverContent
+                    requests={filteredRequests}
+                    serverCachedContent={this.state.serverCachedContent}
+                    contextPercent={mobileContextPercent}
+                    contextTokens={mobileContextTokens}
+                    fsSkills={this.state._fsSkills}
+                    onSkillImported={this.reloadFsSkills}
+                    onOpenSkillsModal={this.handleOpenSkillsModal}
+                    memory={this.state._memory}
+                    memoryRefreshing={this.state._memoryRefreshing}
+                    calibrationModel={this.state.calibrationModel}
+                    onCalibrationModelChange={this.handleCalibrationModelChange}
+                    onOpenMemoryDetail={this.loadMemoryDetail}
+                    onRefreshMemory={this.handleRefreshMemory}
+                  />
+                )}
+              </div>
+            </div>
+          </div>
+          <MemoryDetailModal
+            detail={this.state._memoryDetail}
+            onClose={() => this.setState({ _memoryDetail: null })}
+            onOpenMemoryDetail={this.loadMemoryDetail}
+          />
+          <SkillsManagerModal
+            open={this.state._skillsModal?.open || false}
+            loading={this.state._skillsModal?.loading || false}
+            error={this.state._skillsModal?.error || null}
+            skills={this.state._skillsModal?.skills || []}
+            toggling={this.state._skillsModal?.toggling}
+            onToggle={(s) => this.handleToggleSkill(s)}
+            onClose={() => this.setState(prev => ({ _skillsModal: { ...prev._skillsModal, open: false } }))}
+          />
           <div className={`${styles.mobileFileExplorerOverlay} ${this.state.mobileFileExplorerVisible ? styles.mobileFileExplorerOverlayVisible : ''}`}>
             <div className={styles.mobileFileExplorerInner}>
               <MobileFileExplorer visible={this.state.mobileFileExplorerVisible} onClose={() => this.setState({ mobileFileExplorerVisible: false, mobileFileExplorerTarget: null })} targetFile={this.state.mobileFileExplorerTarget} />
@@ -633,11 +983,9 @@ class Mobile extends AppBase {
                   );
                 }
                 return (
-                  <ConfigProvider theme={this.themeConfig}>
                   <div className={styles.logListContainer}>
                     {this.renderLogTable(currentLogs, true)}
                   </div>
-                  </ConfigProvider>
                 );
               })()}
             </div>
@@ -653,59 +1001,130 @@ class Mobile extends AppBase {
               </button>
             </div>
             <div className={styles.mobileSettingsBody}>
-              <div className={styles.mobileSettingsSectionTitle}>{t('ui.chatDisplaySwitches')}</div>
-              <div className={styles.mobileSettingsRow}>
-                <span className={styles.mobileSettingsLabel}>{t('ui.collapseToolResults')}</span>
-                <Switch
-                  checked={!!this.state.collapseToolResults}
-                  onChange={this.handleCollapseToolResultsChange}
-                />
+              <div className={styles.mobileSettingsGroup}>
+                <div className={styles.mobileSettingsSectionTitle}>{t('ui.chatDisplay')}</div>
+                <div className={styles.mobileSettingsRow}>
+                  <span className={styles.mobileSettingsLabel}>{t('ui.permission.autoApprove.setting')}</span>
+                  <Select
+                    size="small"
+                    value={this.state.autoApproveSeconds || 0}
+                    onChange={this.handleAutoApproveChange}
+                    options={[
+                      { label: t('ui.permission.autoApprove.off'), value: 0 },
+                      { label: '3s', value: 3 },
+                      { label: '5s', value: 5 },
+                      { label: '10s', value: 10 },
+                      { label: '15s', value: 15 },
+                      { label: '20s', value: 20 },
+                      { label: '30s', value: 30 },
+                      { label: '60s', value: 60 },
+                    ]}
+                    style={{ width: 100 }}
+                  />
+                </div>
+                {isPad && this.state.approvalPrefs && (
+                  <>
+                    <div className={styles.mobileSettingsRow}>
+                      <span className={styles.mobileSettingsLabel}>{t('ui.approval.settings.modalEnabled')}</span>
+                      <Switch
+                        checked={this.state.approvalPrefs.modalEnabled !== false}
+                        onChange={(checked) => this.handleApprovalPrefsChange({ modalEnabled: checked })}
+                      />
+                    </div>
+                    <div className={styles.mobileSettingsRow}>
+                      <span className={styles.mobileSettingsLabel}>{t('ui.approval.settings.soundEnabled')}</span>
+                      <Switch
+                        checked={!!this.state.approvalPrefs.soundEnabled}
+                        onChange={(checked) => this.handleApprovalPrefsChange({ soundEnabled: checked })}
+                      />
+                    </div>
+                    {/* notifyOnlyWhenHidden 依赖 electron main 进程的 OS Notification + 窗口聚焦判断,
+                        纯 web 模式下 main.js 路径不存在,开关无效果 → 仅 electron 启动模式显示。 */}
+                    {typeof window !== 'undefined' && window.tabBridge && (
+                      <div className={styles.mobileSettingsRow}>
+                        <span className={styles.mobileSettingsLabel}>{t('ui.approval.settings.notifyOnlyWhenHidden')}</span>
+                        <Switch
+                          checked={this.state.approvalPrefs.notifyOnlyWhenHidden !== false}
+                          onChange={(checked) => this.handleApprovalPrefsChange({ notifyOnlyWhenHidden: checked })}
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+                <div className={styles.mobileSettingsRow}>
+                  <span className={styles.mobileSettingsLabel}>{t('ui.expandThinking')}</span>
+                  <Switch
+                    checked={!!this.state.expandThinking}
+                    onChange={this.handleExpandThinkingChange}
+                  />
+                </div>
+                <div className={styles.mobileSettingsRow}>
+                  <span className={styles.mobileSettingsLabel}>{t('ui.showFullToolContent')}</span>
+                  <Switch
+                    checked={!!this.state.showFullToolContent}
+                    onChange={this.handleShowFullToolContentChange}
+                  />
+                </div>
+                {this.state.showFullToolContent && (
+                  <div className={styles.mobileSettingsRow}>
+                    <span className={styles.mobileSettingsLabel}>{t('ui.collapseToolResults')}</span>
+                    <Switch
+                      checked={!!this.state.collapseToolResults}
+                      onChange={this.handleCollapseToolResultsChange}
+                    />
+                  </div>
+                )}
               </div>
-              <div className={styles.mobileSettingsRow}>
-                <span className={styles.mobileSettingsLabel}>{t('ui.expandThinking')}</span>
-                <Switch
-                  checked={!!this.state.expandThinking}
-                  onChange={this.handleExpandThinkingChange}
-                />
+              <div className={styles.mobileSettingsGroup}>
+                <div className={styles.mobileSettingsSectionTitle}>{t('ui.logSettings')}</div>
+                <div className={styles.mobileSettingsRow}>
+                  <span className={styles.mobileSettingsLabel}>{t('ui.resumeAutoChoice')}</span>
+                  <Switch
+                    checked={!!this.state.resumeAutoChoice}
+                    onChange={this.handleResumeAutoChoiceToggle}
+                  />
+                </div>
+                {this.state.resumeAutoChoice && (
+                  <div className={styles.mobileSettingsRow}>
+                    <Radio.Group
+                      value={this.state.resumeAutoChoice}
+                      onChange={(e) => this.handleResumeAutoChoiceChange(e.target.value)}
+                      size="small"
+                    >
+                      <Radio value="continue">{t('ui.resumeAutoChoice.continue')}</Radio>
+                      <Radio value="new">{t('ui.resumeAutoChoice.new')}</Radio>
+                    </Radio.Group>
+                  </div>
+                )}
               </div>
-              <div className={styles.mobileSettingsRow}>
-                <span className={styles.mobileSettingsLabel}>{t('ui.showFullToolContent')}</span>
-                <Switch
-                  checked={!!this.state.showFullToolContent}
-                  onChange={this.handleShowFullToolContentChange}
-                />
-              </div>
-              <div className={styles.mobileSettingsSectionTitle}>{t('ui.themeColor')}</div>
-              <div className={styles.mobileSettingsRow}>
-                <Select
-                  size="small"
-                  value={this.state.themeColor || 'dark'}
-                  onChange={this.handleThemeColorChange}
-                  options={[
-                    { label: t('ui.themeColor.dark'), value: 'dark' },
-                    { label: t('ui.themeColor.light'), value: 'light' },
-                  ]}
-                  style={{ width: 140 }}
-                />
-              </div>
-              <div className={styles.mobileSettingsSectionTitle}>{t('ui.permission.autoApprove.setting')}</div>
-              <div className={styles.mobileSettingsRow}>
-                <Select
-                  size="small"
-                  value={this.state.autoApproveSeconds || 0}
-                  onChange={this.handleAutoApproveChange}
-                  options={[
-                    { label: t('ui.permission.autoApprove.off'), value: 0 },
-                    { label: '3s', value: 3 },
-                    { label: '5s', value: 5 },
-                    { label: '10s', value: 10 },
-                    { label: '15s', value: 15 },
-                    { label: '20s', value: 20 },
-                    { label: '30s', value: 30 },
-                    { label: '60s', value: 60 },
-                  ]}
-                  style={{ width: 100 }}
-                />
+              <div className={styles.mobileSettingsGroup}>
+                <div className={styles.mobileSettingsSectionTitle}>{t('ui.themeStyle')}</div>
+                <div className={styles.mobileSettingsRow}>
+                  <span className={styles.mobileSettingsLabel}>{t('ui.themeColor')}</span>
+                  <Select
+                    size="small"
+                    value={this.state.themeColor || 'dark'}
+                    onChange={this.handleThemeColorChange}
+                    options={[
+                      { label: t('ui.themeColor.dark'), value: 'dark' },
+                      { label: t('ui.themeColor.light'), value: 'light' },
+                    ]}
+                    style={{ width: 140 }}
+                  />
+                </div>
+                <div className={styles.mobileSettingsRow}>
+                  <span className={styles.mobileSettingsLabel}>{t('ui.languageSettings')}</span>
+                  <Select
+                    size="small"
+                    value={getLang()}
+                    onChange={(value) => {
+                      setLang(value);
+                      this.handleLangChange();
+                    }}
+                    options={LANG_OPTIONS.map(o => ({ label: o.label, value: o.value }))}
+                    style={{ width: 140 }}
+                  />
+                </div>
               </div>
             </div>
           </div>
@@ -789,6 +1208,9 @@ class Mobile extends AppBase {
           />
         )}
       </div>
+      </ConfigProvider>
+      </ApprovalModal>
+      </TerminalWsProvider>
     );
   }
 }

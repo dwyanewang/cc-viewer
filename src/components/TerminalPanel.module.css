@@ -1,40 +1,51 @@
 .terminalPanel {
   height: 100%;
+  /* 作为 .terminalPanelWrap 的 flex item，min-height:0 解除 default min-height:auto，
+     允许内部 .terminalContainer + toolbar + scratch 总高度下被正常分配，不撑大祖先 */
+  min-height: 0;
   display: flex;
   flex-direction: column;
   background: var(--bg-base-alt);
-  border: 4px solid transparent;
-  transition: border-color 0.3s ease-out, box-shadow 0.3s ease-out;
 }
 
-.terminalPanelFocused {
-  border-color: var(--border-secondary);
-  box-shadow: 0 0 8px var(--color-primary-bg-light);
-  animation: terminalFocusIn 0.3s ease-out;
-}
-
-@keyframes terminalFocusIn {
-  from { border-color: transparent; box-shadow: none; }
-  to { border-color: var(--border-secondary); box-shadow: 0 0 8px var(--color-primary-bg-light); }
-}
-
-:global([data-theme="light"]) .terminalPanelFocused {
-  border-color: rgba(217, 119, 87, 0.15);
-  box-shadow: none;
-  animation-name: terminalFocusInLight;
-}
-
-@keyframes terminalFocusInLight {
-  from { border-color: transparent; box-shadow: none; }
-  to { border-color: rgba(217, 119, 87, 0.15); box-shadow: none; }
-}
-
+/* ========== 主 terminal (Claude Code TUI 渲染区) — 归属 TerminalPanel.jsx ==========
+   focus 边框用 inset box-shadow 替代 outline：
+   - outline 在 stacking 上属于元素自身装饰，绘制在 children 之下 → xterm 内部 absolute
+     子元素 (.xterm-decoration-container 等) 在临界 layout 下会盖住 focus 边线
+   - inset box-shadow 在 padding-box 边缘内画，stacking 高于 children，不会被遮 */
 .terminalContainer {
   flex: 1;
+  /* 必需：xterm 内部 viewport (rows × charHeight) 作为 flex item 的 min-content，
+     若不显式设 min-height:0，临界窗口高度下会撑大父容器，挤压底部 toolbar */
+  min-height: 0;
   overflow: hidden;
   padding: 4px 8px;
+  /* flex container：让内层 .terminalHost 走 flex:1 撑满，并以 margin-bottom 留出 buffer */
+  display: flex;
+  flex-direction: column;
+  transition: box-shadow 0.3s ease-out;
   touch-action: none;
   overscroll-behavior: contain;
+}
+
+/* 主 terminal 的 xterm 实际父容器 (terminal.open() 接的 ref)：
+   margin-bottom 4px 让它比 .terminalContainer 内容区少 4px，fitAddon 通过
+   getComputedStyle().height 拿到的初始/refit 高度始终 -4px，cellHeight × rows
+   余数 + layout 抖动都被这层 buffer 兜住，xterm-screen 接触不到下方 toolbar 边线。
+   注意：scratch (小) terminal 用的是 .scratchInner + .scratchHost，不要混淆 */
+.terminalHost {
+  flex: 1;
+  min-height: 0;
+  margin-bottom: 4px;
+  overflow: hidden;
+}
+
+.terminalContainerFocused {
+  box-shadow: inset 0 0 0 4px var(--border-secondary), 0 0 8px var(--color-primary-bg-light);
+}
+
+:global([data-theme="light"]) .terminalContainerFocused {
+  box-shadow: inset 0 0 0 4px rgba(217, 119, 87, 0.15), 0 0 6px rgba(217, 119, 87, 0.08);
 }
 
 [data-theme="light"] .terminalContainer { background: #FFF; }
@@ -157,6 +168,10 @@
   gap: 4px;
   border-top: 1px solid var(--border-primary);
   background: var(--bg-base-alt);
+  /* 兜底：即使 xterm 内部 absolute 元素跳出 .terminalContainer 的 overflow:hidden
+     边界（罕见但可能发生），z-index 保证 toolbar 视觉上始终在 xterm 渲染层之上 */
+  position: relative;
+  z-index: 1;
 }
 
 .toolbarBtn {
@@ -434,8 +449,257 @@
   margin-bottom: 10px;
 }
 
-.toolbarBtnRight {
+/* 终端工具栏 3 段式：
+   - .toolbarLeft 紧贴左边界，按内容宽度
+   - .ctxBarSlot 中段，flex-basis 200 + flex-shrink 1：左右两端控件之间剩余空间都让给 slot，封顶 200px
+   - .toolbarRight 用 margin-left:auto 抢占 slot 之后的剩余空间贴右边界
+   slot 内 `> *` 让 LiveTagPopover 的 .liveTag 撑满整个 slot 宽度（否则血条只显示成内容宽度的小段） */
+.toolbarLeft,
+.toolbarRight {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.toolbarRight {
   margin-left: auto;
+}
+.ctxBarSlot {
+  flex: 0 1 200px;
+  max-width: 200px;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  height: 26px;
+}
+.ctxBarSlot > * {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.toolbarBtnActive {
+  background: var(--color-primary);
+  color: #fff;
+  border-color: var(--color-primary);
+}
+.toolbarBtnActive:hover {
+  background: var(--color-primary);
+  color: #fff;
+  border-color: var(--color-primary);
+}
+
+/* scratch 终端容器：高度由 React 通过 ref 直写 .style.height（避免 JSX inline style 在拖拽中途被无关 setState 覆盖）。
+   多 tab 改造后改为 flex-direction: row：左 .scratchTabs + 右 .scratchPanes。
+   focus 边框收窄到 .scratchPanes（只圈白色 xterm 区域），灰色 tab 栏不参与 focus 视觉，更干净。 */
+.scratchWrap {
+  flex-shrink: 0;
+  min-height: 100px;
+  max-height: 600px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: row;
+}
+
+/* tab 侧栏 */
+.scratchTabs {
+  flex-shrink: 0;
+  width: 95px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-base-alt);
+  border-right: 1px solid var(--border-primary);
+  overflow-y: auto;
+  padding: 4px;
+  gap: 2px;
+}
+
+.scratchTab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 12px;
+  user-select: none;
+  flex-shrink: 0;
+}
+.scratchTab:hover {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+.scratchTabActive {
+  background: var(--color-primary-bg-light);
+  color: var(--text-primary);
+}
+.scratchTabActive:hover {
+  background: var(--color-primary-bg-light);
+}
+
+.scratchTabIcon {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+.scratchTabIcon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.scratchTabLabel {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scratchTabClose {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 3px;
+  padding: 0;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s;
+}
+.scratchTab:hover .scratchTabClose,
+.scratchTabActive .scratchTabClose {
+  opacity: 1;
+}
+.scratchTabClose:hover {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+}
+/* 触摸设备无 hover 事件，× 始终显示，避免要先点击激活 tab 才能看到关闭按钮 */
+@media (hover: none) {
+  .scratchTabClose {
+    opacity: 1;
+  }
+}
+
+.scratchTabAdd {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 26px;
+  margin-top: 2px;
+  border: 1px dashed var(--border-secondary);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.scratchTabAdd:hover {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  border-color: var(--text-disabled);
+}
+.scratchTabAdd:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* tab 对应的 xterm pane 容器：仅承担 box-shadow glow；4px focus 视觉已迁移到 .scratchInner border。
+   原方案 outline + outline-offset:-4px 是 paint-only，xterm-screen 顶/底会把 outline 像素带盖白（用户实测）；
+   改成 .scratchInner 自身的 border:4px 后，box model 强制预留 4px 像素带，xterm fitAddon 读 content-box
+   高度时自动减掉 border，xterm canvas 物理上无法再画进 focus 像素带。 */
+.scratchPanes {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  transition: box-shadow 0.3s ease-out;
+}
+
+.scratchPanesFocused {
+  box-shadow: 0 0 8px var(--color-primary-bg-light);
+}
+
+:global([data-theme="light"]) .scratchPanesFocused {
+  box-shadow: none;
+}
+
+.scratchPane {
+  flex: 1;
+  min-height: 0;
+  display: none;
+  flex-direction: column;
+}
+.scratchPaneActive {
+  display: flex;
+}
+
+
+/* 工具栏与 scratch 面板之间的水平拖拽条 — .vResizer (ChatView) 的横向镜像，统一拖拽线视觉 */
+.scratchResizer {
+  flex-shrink: 0;
+  height: 5px;
+  cursor: row-resize;
+  background: var(--bg-elevated);
+  border-top: 1px solid var(--border-primary);
+  border-bottom: 1px solid var(--border-primary);
+  transition: background 0.15s;
+  touch-action: none;
+}
+.scratchResizer:hover {
+  background: var(--border-secondary);
+}
+.scratchResizerDragging {
+  background: var(--border-secondary);
+}
+
+[data-theme="light"] .scratchWrap { background: #FFF; }
+[data-theme="dark"] .scratchWrap { background: #000; }
+
+/* ========== scratch (小) terminal — 归属 ScratchTerminal.jsx ==========
+   工具栏下方的多 tab 临时 shell 面板，区别于上面的主 .terminalContainer */
+.scratchInner {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  /* 4px transparent border = focus 出血带 (focused 时切主题色) */
+  border: 4px solid transparent;
+  /* flex container：让内层 .scratchHost 走 flex:1 撑满，并以 margin-bottom 留出 buffer */
+  display: flex;
+  flex-direction: column;
+  touch-action: none;
+  overscroll-behavior: contain;
+  transition: border-color 0.3s ease-out;
+}
+
+/* scratch (小) terminal 的 xterm 实际父容器 (terminal.open() 接的 ref)：
+   margin-bottom 4px 让它比 .scratchInner 内容区少 4px，fitAddon 通过
+   getComputedStyle().height 拿到的初始/refit 高度始终 -4px。
+   .scratchHost 自身无 padding/border，绕开 antd 注入的 :where() box-sizing:border-box 影响。
+   注意：主 terminal 用的是 .terminalContainer + .terminalHost，不要混淆 */
+.scratchHost {
+  flex: 1;
+  min-height: 0;
+  margin-bottom: 4px;
+  overflow: hidden;
+}
+
+.scratchPanesFocused .scratchPane.scratchPaneActive .scratchInner {
+  border-color: var(--border-secondary);
+}
+
+:global([data-theme="light"]) .scratchPanesFocused .scratchPane.scratchPaneActive .scratchInner {
+  border-color: rgba(217, 119, 87, 0.15);
+}
+
+.scratchInner :global(.xterm-helper-textarea) {
+  caret-color: #00000000;
 }
 
 .presetSectionHeader {
@@ -622,17 +886,6 @@
 }
 .ultraplanRoleBtnActive:hover {
   color: #fff;
-}
-
-.ultraplanContextWarning {
-  margin: 0 14px 8px;
-  padding: 6px 10px;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--warning-text, #b45309);
-  background: var(--warning-bg, #fef3c7);
-  border: 1px solid var(--warning-border, #fde68a);
-  border-radius: 6px;
 }
 
 .ultraplanTextarea {

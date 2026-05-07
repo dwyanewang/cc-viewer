@@ -21,6 +21,11 @@ export default defineConfig(() => {
     },
     build: {
       outDir: 'dist',
+      // 本地排查性能 / 异常时打开：CCV_SOURCEMAP=1 npm run build（或直接 npm run build:sourcemap）。
+      // 默认关 —— 体积 + 安全考虑（不希望 .map 跟 npm 包一起发布；package.json files 已加
+      // `!dist/**/*.map` 兜底）。生成 .map 后 Chrome DevTools 会自动加载，性能 trace
+      // 里 antd / cc-viewer 的栈帧能从 dk/ck 之类还原到可读名 + 真实源码位置。
+      sourcemap: process.env.CCV_SOURCEMAP === '1',
       // xterm.js 6.0.0 的 InputHandler.requestMode 被 identifier mangler 误处理
       // 导致生产构建抛 ReferenceError（issue #5800）。Vite 默认的 esbuild minify
       // 无法细粒度关闭 identifier mangling（顶层 esbuild 选项只作用于 transform
