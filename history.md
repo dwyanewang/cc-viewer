@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.6.247 (2026-05-07)
+
+- chore(perm-bridge): `git commit` / `git push` 退出硬拦截白名单，仅 `npm publish` 仍走 Web UI 强制审批
+  - `lib/perm-bridge.js` 正则从 `/git\s+(commit|push)|npm\s+publish/i` → `/npm\s+publish/i`；commit 可重写、push 可 force-push 回退，blast radius 局部；npm publish 不可撤销才走硬闸
+  - `test/perm-bridge.test.js` 加 3 个 bypass-mode 契约 case：`git commit` / `git push` 在 `CCV_BYPASS_PERMISSIONS=1` 下被自动 allow；`npm publish` 仍 forward-to-server
+- feat(mobile-menu): 移动端菜单顺序对齐 PC 端
+  - `Mobile.jsx` 菜单 5 → 8 项；项目文件夹（mobile 独有）置顶、其余按 PC 顺序：日志管理 → 用户 Prompt → 插件管理 → CCV进程管理 → 代理热切换 → divider → 数据统计 → 偏好设置
+  - `_closeAllMobileOverlays` 扩展含新 3 个 modal flag；汉堡按钮加 `aria-expanded`/`aria-haspopup`；i18n 复用 PC 既有 `ui.pluginManagement` / `ui.processManagement` / `ui.proxySwitch` 18 语全译
+  - `App.module.css` `.mobileMenuDropdown` overflow 改 `max-height + overflow-y:auto` 防 iPhone SE 等小屏溢出；新增 `.mobileMenuDivider`（语义 token，无 `!important`）
+- refactor(modals): 插件管理 / CCV进程管理 / 代理热切换 抽到独立组件 PC + mobile 共用
+  - 新增 `src/components/{Plugin,Process,Proxy}Modal.jsx`；FC + hooks 实现，三种受控风格（self-contained / 半受控）的判定原则见 PluginModal 头注释
+  - `AppHeader.jsx` 删 inline JSX + 17 个 handler + 11 个 state 字段，净减 ~390 行；删 8 个抽离后无引用的 antd / icon import
+  - `Mobile.jsx` mount 3 个组件；ProxyModal 通过继承 AppBase 直接读 `proxyProfiles` / `activeProxyId` / `defaultConfig`；PC 与 mobile 共用同一份 fetch 逻辑
+  - `ProcessModal` kill 确认 + `ProxyModal` 删除确认 + `PluginModal` 删除/CDN 子 modal 全部用受控 `<Modal>` 替代 `Modal.confirm` —— 父 modal 关闭时通过 `useEffect(!open)` 联动关闭，避免外层关了内层确认仍在屏的孤儿态；mobile zoom 0.6 容器下也能正确缩放
+- feat(cache-popover): 在 "持久记忆" 上方新增 CLAUDE.md 入口分区
+  - 新 `lib/claude-md-discovery.js`：从 cwd realpath 起向上 walk 父链至 `.git` / `$HOME` / fs root / 8 层封顶（任一即停），加上 `~/.claude/CLAUDE.md`，组合成候选清单；`basename(real) === 'CLAUDE.md'` 拒 symlink-name swap，按 `realpath` 去重，每条候选 id = `sha1(realpath).slice(0,12)`（48 bit，候选数 <20 时碰撞概率 ≈ 10⁻⁹）
+  - 新 `GET /api/claude-md` 端点：不带参 → entries 数组（仅 `{id, scope, tail, mtimeMs}`，不暴露 realPath）；`?id=<hex12>` → 重算候选 + `basename` 二次校验 + 走 `isReadAllowed`（拿 `policy.real` 做 fd-based read，闭 TOCTOU 窗口）+ 512KB cap，输出 `{scope, tail, content}`
+  - `CachePopoverContent.jsx` 新增 chip 列表分区，位于持久记忆**上方**（CLAUDE.md 是规则、记忆是产物，规则在前）；空候选时整段隐藏（不像 MEMORY.md 总在）；chip = `[项目]/[全局]` 徽章 + 路径尾段（`title=` 全路径），点击 → 复用 `MemoryDetailModal` 渲染 markdown
+  - `MemoryDetailModal` 加 `linkMode` prop（`'memory'` 默认 / `'passthrough'`）：passthrough 模式下 `https?://` 链接 `window.open(_, '_blank', 'noopener,noreferrer')`，相对路径 / 其他协议（含 `javascript:`）一律 `preventDefault()`；MEMORY.md 流程不变
+  - `AppHeader.jsx` / `Mobile.jsx` 双端各自 own `_claudeMd` / `_claudeMdDetail` 槽 + `_claudeMdSeq` / `_claudeMdDetailSeq` 计数器（与 `_memorySeq` 同语义防快慢回包乱序），workspace 切换 / 卸载都 bump 计数器作废在途请求；分槽避免与 `_memoryDetail` 交叉污染
+  - CSS 用 `--color-primary-bg-light` / `--color-success-bg-light` 等语义 token，自动适配 dark/light 主题；无 `!important`
+  - i18n 18 语：`ui.claudeMdSection`（CLAUDE.md 字面值跨所有语言）/ `ui.claudeMdScopeProject` / `ui.claudeMdScopeGlobal`
+  - Windows 当前仅返回全局候选（POSIX 父链语义在 win 上未独立验证，留给 v2）
+  - 测试 +20：`test/claude-md-discovery.test.js` 13 case（基本 + .git 终止 + 去重 + symlink basename 拒 + dir-not-file + readCandidateById 五态）+ `test/api-claude-md.test.js` 8 case（list/detail/400/404/200/413 + HTTP 层 symlink basename swap 防御）；1625/1625 pass
+
 ## 1.6.246 (2026-05-07)
 
 - feat(chat): 流式 spinner 升级为 Claude 官方 SVG 动画（从 claude.ai webpack chunk 抠出 8 个 sprite-sheet）

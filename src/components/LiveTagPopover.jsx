@@ -26,9 +26,11 @@ function LiveTagPopover({
   fsSkills,
   memory,
   memoryRefreshing,
+  claudeMd,
   calibrationModel,
   onCalibrationModelChange,
   onOpenMemoryDetail,
+  onOpenClaudeMd,
   onOpenSkillsModal,
   onRefreshMemory,
   projectName,
@@ -58,9 +60,11 @@ function LiveTagPopover({
           fsSkills={fsSkills}
           memory={memory}
           memoryRefreshing={memoryRefreshing}
+          claudeMd={claudeMd}
           calibrationModel={calibrationModel}
           onCalibrationModelChange={onCalibrationModelChange}
           onOpenMemoryDetail={onOpenMemoryDetail}
+          onOpenClaudeMd={onOpenClaudeMd}
           onOpenSkillsModal={onOpenSkillsModal}
           onSkillImported={onSkillImported}
           onRefreshMemory={onRefreshMemory}

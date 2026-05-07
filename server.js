@@ -51,6 +51,7 @@ import { countLogEntries, streamRawEntriesAsync, readPagedEntries } from './lib/
 import { awaitDrainOrClose } from './lib/sse-backpressure.js';
 import { enrichRawIfNeeded } from './lib/enrich-plan-input.js';
 import { buildTeamStatusResponse } from './lib/team-runtime.js';
+import { discoverClaudeMdCandidates, readCandidateById } from './lib/claude-md-discovery.js';
 
 
 // 动态获取 getPrefsFile()（LOG_DIR 可能在运行时被 setLogDir 修改）
@@ -2696,6 +2697,62 @@ async function handleRequest(req, res) {
     } catch (err) {
       // 与 /api/file-content 一致：已知 errno（ENOENT/EACCES 等）走 ERROR_STATUS_MAP 映射；
       // 500 时不回显 err.message —— 可能含 ~/.claude/projects/<encoded>/memory/ 路径片段。
+      const status = ERROR_STATUS_MAP[err.code] || 500;
+      const message = status === 500 ? 'Internal error' : err.message;
+      respondJson(status, { error: message });
+    }
+    return;
+  }
+
+  // CLAUDE.md 入口：列出 cwd 父链 + ~/.claude/CLAUDE.md，按 sha1(realpath).slice(0,12) 给稳定 id；
+  // 不带参 → 返回候选清单(无 content)；?id=<hex12> → 二次校验 basename + isReadAllowed 后吐内容。
+  // 设计要点：客户端永远只传 id，path resolution 由 server 独占；id 由 realpath 派生 → swap 即变 id。
+  if (url === '/api/claude-md' && method === 'GET') {
+    const respondJson = (status, body) => {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+    try {
+      const cwd = process.env.CCV_PROJECT_DIR || process.cwd();
+      const claudeConfigDir = getClaudeConfigDir();
+      // 注入 isReadAllowed 做发现阶段预过滤: 不在 allowlist 内的祖先候选不进列表 ——
+      // 否则 UI 会渲染出点击必 403 的"看得见点不开"chip。
+      const candidates = discoverClaudeMdCandidates({
+        cwd,
+        claudeConfigDir,
+        isReadAllowedFn: isReadAllowed,
+      });
+      const idParam = parsedUrl.searchParams.get('id');
+      const MAX_BYTES = 512 * 1024;
+
+      if (!idParam) {
+        // 列表: 不暴露 realPath / mtimeMs, 仅返回 {id, scope, tail}。mtimeMs 前端未使用,
+        // 去掉以收敛信息泄露面 (perf-sec review P2-C)。
+        return respondJson(200, {
+          entries: candidates.map(c => ({
+            id: c.id,
+            scope: c.scope,
+            tail: c.tail,
+          })),
+        });
+      }
+
+      const r = readCandidateById(candidates, idParam, {
+        maxBytes: MAX_BYTES,
+        isReadAllowedFn: isReadAllowed,
+      });
+      if (!r.ok) {
+        // policy 失败时让 reasonToStatus 统一映射，与 /api/project-memory 一致
+        const status = r.reason ? reasonToStatus(r.reason) : r.status;
+        return respondJson(status, { error: r.error, reason: r.reason });
+      }
+      return respondJson(200, {
+        id: idParam,
+        scope: r.scope,
+        tail: r.tail,
+        content: r.content,
+      });
+    } catch (err) {
       const status = ERROR_STATUS_MAP[err.code] || 500;
       const message = status === 500 ? 'Internal error' : err.message;
       respondJson(status, { error: message });

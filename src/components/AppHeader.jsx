@@ -1,7 +1,7 @@
 import React from 'react';
 import { createPortal } from 'react-dom';
-import { Space, Tag, Button, Dropdown, Popover, Modal, Collapse, Drawer, Switch, Radio, Tabs, Spin, Input, Table, Select, message } from 'antd';
-import { MessageOutlined, FileTextOutlined, ImportOutlined, DashboardOutlined, ExportOutlined, DownloadOutlined, SettingOutlined, BarChartOutlined, CodeOutlined, CopyOutlined, ApiOutlined, DeleteOutlined, ReloadOutlined, PlusOutlined, CloudDownloadOutlined, SwapOutlined, EditOutlined, CheckOutlined, CloseOutlined } from '@ant-design/icons';
+import { Space, Tag, Button, Dropdown, Popover, Modal, Collapse, Drawer, Switch, Radio, Tabs, Spin, Input, Select, message } from 'antd';
+import { MessageOutlined, FileTextOutlined, ImportOutlined, DashboardOutlined, ExportOutlined, DownloadOutlined, SettingOutlined, BarChartOutlined, CodeOutlined, CopyOutlined, ApiOutlined, SwapOutlined } from '@ant-design/icons';
 import { QRCodeCanvas } from 'qrcode.react';
 import { formatTokenCount, computeTokenStats, computeCacheRebuildStats, computeToolUsageStats, computeSkillUsageStats, resolveCalibrationTokens, AUTO_COMPACT_USABLE_RATIO } from '../utils/helpers';
 import { isSystemText, classifyUserContent, isMainAgent } from '../utils/contentFilter';
@@ -16,6 +16,9 @@ import CachePopoverContent from './CachePopoverContent';
 import LiveTagPopover from './LiveTagPopover';
 import MemoryDetailModal from './MemoryDetailModal';
 import SkillsManagerModal from './SkillsManagerModal';
+import PluginModal from './PluginModal';
+import ProcessModal from './ProcessModal';
+import ProxyModal from './ProxyModal';
 import appConfig from '../config.json';
 import { OPTIMISTIC_CLEAR_PERCENT } from '../AppBase';
 const CALIBRATION_MODELS = appConfig.calibrationModels;
@@ -44,7 +47,7 @@ class AppHeader extends React.Component {
 
   constructor(props) {
     super(props);
-    this.state = { countdownText: '', promptModalVisible: false, promptData: [], promptViewMode: 'original', settingsDrawerVisible: false, globalSettingsVisible: false, projectStatsVisible: false, projectStats: null, projectStatsLoading: false, localUrl: '', pluginModalVisible: false, pluginsList: [], pluginsDir: '', deleteConfirmVisible: false, deleteTarget: null, processModalVisible: false, processList: [], processLoading: false, logoDropdownOpen: false, cacheHighlightIdx: null, cacheHighlightFading: false, cdnModalVisible: false, cdnUrl: '', cdnLoading: false, calibrationModel: readCalibrationModel(), proxyModalVisible: false, editingProxy: null, editForm: { name: '', baseURL: '', apiKey: '', models: '', activeModel: '' }, logDirDraft: null, qrPopoverOpen: false, _skillsModal: { open: false, loading: false, skills: [], error: null, toggling: new Set() },
+    this.state = { countdownText: '', promptModalVisible: false, promptData: [], promptViewMode: 'original', settingsDrawerVisible: false, globalSettingsVisible: false, projectStatsVisible: false, projectStats: null, projectStatsLoading: false, localUrl: '', pluginModalVisible: false, processModalVisible: false, logoDropdownOpen: false, cacheHighlightIdx: null, cacheHighlightFading: false, calibrationModel: readCalibrationModel(), proxyModalVisible: false, logDirDraft: null, qrPopoverOpen: false, _skillsModal: { open: false, loading: false, skills: [], error: null, toggling: new Set() },
       // 文件系统权威的 skill 列表（/api/skills 返回）；live-tail 下作为 popover chip 和管理弹窗的共享数据源。
       // null=未加载 / false=失败 / [] 或 Array=加载结果。workspace 切换由 componentDidUpdate + seq 控制。
       _fsSkills: null,
@@ -55,12 +58,21 @@ class AppHeader extends React.Component {
       // null 是 lazy-load 空态（按钮 disabled），_memoryRefreshing 是用户触发的显式刷新。
       _memoryRefreshing: false,
       // 点击记忆链接时拉起的明细 Modal 状态：null=关 / { name, content?, error?, loading? }
-      _memoryDetail: null };
+      _memoryDetail: null,
+      // CLAUDE.md 候选清单：null=未加载 / false=拉取失败 / [] 隐藏整段 / [{id,scope,tail,...}]
+      _claudeMd: null,
+      // CLAUDE.md 明细 Modal：与 _memoryDetail 分槽，避免 memory 链接点击与 CLAUDE 链接点击交叉污染
+      _claudeMdDetail: null,
+    };
     this._countdownTimer = null;
     this._expiredTimer = null;
     this._fsSkillsSeq = 0;
     this._memorySeq = 0;
     this._memoryDetailSeq = 0;
+    // 与 _memorySeq 同语义：list-load 与 detail-load 共享一个 seq counter，保证 workspace
+    // 切换/快速重开 popover 时旧回包不会污染新状态（参考 _memorySeq 模式）
+    this._claudeMdSeq = 0;
+    this._claudeMdDetailSeq = 0;
     this.updateCountdown = this.updateCountdown.bind(this);
   }
 
@@ -92,6 +104,10 @@ class AppHeader extends React.Component {
       // _memory 同样作废 —— 沿用 _fsSkills 的失效策略，下次 popover 打开时按需重拉。
       this._memorySeq++;
       this.setState({ _memory: null, _memoryDetail: null, _memoryRefreshing: false });
+      // _claudeMd 候选随项目变化（cwd 父链不同），同步作废
+      this._claudeMdSeq++;
+      this._claudeMdDetailSeq++;
+      this.setState({ _claudeMd: null, _claudeMdDetail: null });
     }
   }
 
@@ -166,13 +182,55 @@ class AppHeader extends React.Component {
     else message.error(t('ui.memoryRefreshFailed'), 5);
   };
 
-  // 血条 Popover 开关:打开时按需拉 _fsSkills / _memory(避免页面初始化就发两条请求)。
+  // 血条 Popover 开关:打开时按需拉 _fsSkills / _memory / _claudeMd(避免页面初始化就发请求)。
   // 提取为 class field 后引用稳定,LiveTagPopover memo 不会因 callback 引用变化而失效。
   handleCachePopoverOpenChange = (open) => {
     this.setState({ _cachePopoverOpen: open });
     if (!open) this._cacheScrollInited = false;
     if (open && this.state._fsSkills === null && !this.props.isLocalLog) this.reloadFsSkills();
     if (open && this.state._memory === null) this.loadMemory();
+    if (open && this.state._claudeMd === null) this.loadClaudeMdList();
+  };
+
+  // CLAUDE.md 列表懒加载。三态契约: null/false/[]/[...].
+  // 与 loadMemory 同语义: lazy-load 失败静默回退 false; 不打扰用户。
+  loadClaudeMdList = async () => {
+    const seq = ++this._claudeMdSeq;
+    try {
+      const r = await fetch(apiUrl('/api/claude-md'));
+      const data = await r.json();
+      if (seq !== this._claudeMdSeq) return;
+      if (!r.ok || !Array.isArray(data.entries)) {
+        this.setState({ _claudeMd: false });
+        return;
+      }
+      this.setState({ _claudeMd: data.entries });
+    } catch {
+      if (seq === this._claudeMdSeq) this.setState({ _claudeMd: false });
+    }
+  };
+
+  // 点击 CLAUDE.md chip 触发: 拉取明细到 _claudeMdDetail, MemoryDetailModal(linkMode=passthrough) 渲染。
+  // tail / scope 提前注入到 detail.name 用作 Modal 标题, 避免等 server 回包再拼。
+  loadClaudeMdDetail = async (id, tail, scope) => {
+    const seq = ++this._claudeMdDetailSeq;
+    const scopeLabel = scope === 'global' ? t('ui.claudeMdScopeGlobal') : t('ui.claudeMdScopeProject');
+    const title = `${scopeLabel} · ${tail}`;
+    this.setState({ _claudeMdDetail: { name: title, loading: true } });
+    try {
+      const r = await fetch(apiUrl(`/api/claude-md?id=${encodeURIComponent(id)}`));
+      const data = await r.json();
+      if (seq !== this._claudeMdDetailSeq) return;
+      if (!r.ok) {
+        this.setState({ _claudeMdDetail: { name: title, error: data.error || `http:${r.status}` } });
+        return;
+      }
+      this.setState({ _claudeMdDetail: { name: title, content: data.content || '' } });
+    } catch (e) {
+      if (seq === this._claudeMdDetailSeq) {
+        this.setState({ _claudeMdDetail: { name: title, error: e.message || 'network' } });
+      }
+    }
   };
 
   // 加载明细文件：name 必须是单段 .md basename（前端先校验，server 再校验一遍）。
@@ -251,6 +309,8 @@ class AppHeader extends React.Component {
     this._fsSkillsSeq++;
     this._memorySeq++;
     this._memoryDetailSeq++;
+    this._claudeMdSeq++;
+    this._claudeMdDetailSeq++;
   }
 
   startCountdown() {
@@ -862,214 +922,12 @@ class AppHeader extends React.Component {
       .catch(() => this.setState({ projectStats: null, projectStatsLoading: false }));
   };
 
-  fetchPlugins = () => {
-    return fetch(apiUrl('/api/plugins')).then(r => {
-      if (!r.ok) throw new Error(r.status);
-      return r.json();
-    }).then(data => {
-      this.setState({ pluginsList: data.plugins || [], pluginsDir: data.pluginsDir || '' });
-    }).catch(() => {});
-  };
+  // plugin / process / proxy 三个 modal 已抽到独立组件 (PluginModal/ProcessModal/ProxyModal)
+  // 自持 fetch + state + handlers; AppHeader 仅保留 *ModalVisible boolean 控制 open/close
 
-  handleShowPlugins = () => {
-    this.setState({ pluginModalVisible: true });
-    this.fetchPlugins();
-  };
-
-  handleTogglePlugin = (name, enabled) => {
-    // 等 SettingsProvider 完成首次 fetch,避免冷启动 RMW 把已持久化的 disabledPlugins 兜底成 []
-    this.context._prefsReady.then(() => {
-      const prefs = this.context.preferences || {};
-      let disabledPlugins = Array.isArray(prefs.disabledPlugins) ? [...prefs.disabledPlugins] : [];
-      if (enabled) {
-        disabledPlugins = disabledPlugins.filter(n => n !== name);
-      } else {
-        if (!disabledPlugins.includes(name)) disabledPlugins.push(name);
-      }
-      return this.context.updatePreferences({ disabledPlugins })
-        .then(() => fetch(apiUrl('/api/plugins/reload'), { method: 'POST' }))
-        .then(r => {
-          if (!r.ok) throw new Error(r.status);
-          return r.json();
-        })
-        .then(data => {
-          this.setState({ pluginsList: data.plugins || [], pluginsDir: data.pluginsDir || '' });
-        });
-    }).catch(() => {});
-  };
-
-  handleDeletePlugin = (file, name) => {
-    this.setState({ deleteConfirmVisible: true, deleteTarget: { file, name } });
-  };
-
-  handleDeletePluginConfirm = () => {
-    const { file } = this.state.deleteTarget || {};
-    if (!file) return;
-    this.setState({ deleteConfirmVisible: false, deleteTarget: null });
-    fetch(apiUrl(`/api/plugins?file=${encodeURIComponent(file)}`), { method: 'DELETE' })
-      .then(r => {
-        if (!r.ok) throw new Error(r.status);
-        return r.json();
-      })
-      .then(data => {
-        if (data.plugins) {
-          this.setState({ pluginsList: data.plugins, pluginsDir: data.pluginsDir || '' });
-        }
-      }).catch(() => {});
-  };
-
-  handleReloadPlugins = () => {
-    fetch(apiUrl('/api/plugins/reload'), { method: 'POST' })
-      .then(r => {
-        if (!r.ok) throw new Error(r.status);
-        return r.json();
-      })
-      .then(data => {
-        this.setState({ pluginsList: data.plugins || [], pluginsDir: data.pluginsDir || '' });
-      }).catch(() => {});
-  };
-
-  handleAddPlugin = () => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.js,.mjs';
-    input.multiple = true;
-    input.onchange = () => {
-      const fileHandles = input.files;
-      if (!fileHandles || fileHandles.length === 0) return;
-      for (const f of fileHandles) {
-        if (!f.name.endsWith('.js') && !f.name.endsWith('.mjs')) {
-          message.error(t('ui.plugins.invalidFile'));
-          return;
-        }
-      }
-      // 用 FileReader 读取所有文件内容，以 JSON 发送
-      const readPromises = Array.from(fileHandles).map(f => {
-        return new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve({ name: f.name, content: reader.result });
-          reader.onerror = () => reject(new Error(`Failed to read ${f.name}`));
-          reader.readAsText(f);
-        });
-      });
-      Promise.all(readPromises).then(files => {
-        return fetch(apiUrl('/api/plugins/upload'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ files }),
-        });
-      }).then(r => {
-        if (!r.ok) {
-          return r.text().then(text => {
-            try { const j = JSON.parse(text); return j; } catch { throw new Error(t('ui.plugins.serverError', { status: r.status })); }
-          });
-        }
-        return r.json();
-      }).then(data => {
-        if (data.error) {
-          message.error(t('ui.plugins.addFailed', { reason: data.error }));
-        } else if (data.plugins) {
-          this.setState({ pluginsList: data.plugins, pluginsDir: data.pluginsDir || '' });
-          message.success(t('ui.plugins.addSuccess'));
-        }
-      }).catch(err => {
-        message.error(err.message);
-      });
-    };
-    input.click();
-  };
-
-  handleShowCdnModal = () => {
-    this.setState({ cdnModalVisible: true, cdnUrl: '', cdnLoading: false });
-  };
-
-  handleCdnUrlChange = (e) => {
-    this.setState({ cdnUrl: e.target.value });
-  };
-
-  handleCdnInstall = () => {
-    const { cdnUrl } = this.state;
-    if (!cdnUrl.trim()) {
-      message.error(t('ui.plugins.cdnUrlRequired'));
-      return;
-    }
-    try {
-      new URL(cdnUrl);
-    } catch {
-      message.error(t('ui.plugins.cdnInvalidUrl'));
-      return;
-    }
-    this.setState({ cdnLoading: true });
-    fetch(apiUrl('/api/plugins/install-from-url'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: cdnUrl.trim() }),
-    })
-      .then(r => r.json())
-      .then(data => {
-        if (data.error) {
-          message.error(t('ui.plugins.cdnInstallFailed', { reason: data.error }));
-        } else {
-          message.success(t('ui.plugins.cdnInstallSuccess'));
-          if (data.plugins) {
-            this.setState({ pluginsList: data.plugins, pluginsDir: data.pluginsDir || '' });
-          }
-          this.setState({ cdnModalVisible: false, cdnUrl: '' });
-        }
-      })
-      .catch((err) => {
-        message.error(t('ui.plugins.cdnInstallFailed', { reason: err.message || 'Network error' }));
-      })
-      .finally(() => {
-        this.setState({ cdnLoading: false });
-      });
-  };
-
-  handleCdnCancel = () => {
-    this.setState({ cdnModalVisible: false, cdnUrl: '', cdnLoading: false });
-  };
-
-  fetchProcesses = () => {
-    this.setState({ processLoading: true });
-    fetch(apiUrl('/api/ccv-processes'))
-      .then(r => r.json())
-      .then(data => {
-        this.setState({ processList: data.processes || [], processLoading: false });
-      })
-      .catch(() => {
-        this.setState({ processList: [], processLoading: false });
-      });
-  };
-
-  handleShowProcesses = () => {
-    this.setState({ processModalVisible: true });
-    this.fetchProcesses();
-  };
-
-  handleKillProcess = (pid) => {
-    Modal.confirm({
-      title: t('ui.processManagement.killConfirm'),
-      onOk: () => {
-        fetch(apiUrl('/api/ccv-processes/kill'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pid }),
-        })
-          .then(r => r.json())
-          .then(data => {
-            if (data.ok) {
-              message.success(t('ui.processManagement.killed'));
-              this.fetchProcesses();
-            } else {
-              message.error(data.error || t('ui.processManagement.killFailed'));
-            }
-          })
-          .catch(() => {
-            message.error(t('ui.processManagement.killFailed'));
-          });
-      },
-    });
-  };
+  // 菜单 item onClick 简化:打开 modal,组件内部 useEffect 自动 fetch
+  handleShowPlugins = () => this.setState({ pluginModalVisible: true });
+  handleShowProcesses = () => this.setState({ processModalVisible: true });
 
   renderProjectStatsContent() {
     const { projectStats, projectStatsLoading } = this.state;
@@ -1251,9 +1109,11 @@ class AppHeader extends React.Component {
         fsSkills={this.state._fsSkills}
         memory={this.state._memory}
         memoryRefreshing={this.state._memoryRefreshing}
+        claudeMd={this.state._claudeMd}
         calibrationModel={this.state.calibrationModel}
         onCalibrationModelChange={this.handleCalibrationModelChange}
         onOpenMemoryDetail={this.loadMemoryDetail}
+        onOpenClaudeMd={this.loadClaudeMdDetail}
         onOpenSkillsModal={this.handleOpenSkillsModal}
         onRefreshMemory={this.handleRefreshMemory}
         projectName={projectName}
@@ -1501,6 +1361,11 @@ class AppHeader extends React.Component {
           onClose={() => this.setState({ _memoryDetail: null })}
           onOpenMemoryDetail={this.loadMemoryDetail}
         />
+        <MemoryDetailModal
+          detail={this.state._claudeMdDetail}
+          onClose={() => this.setState({ _claudeMdDetail: null })}
+          linkMode="passthrough"
+        />
         <Modal
           title={`${t('ui.userPrompt')} (${this.state.promptData.length}${t('ui.promptCountUnit')})`}
           open={this.state.promptModalVisible}
@@ -1732,148 +1597,23 @@ class AppHeader extends React.Component {
         >
           {this.renderProjectStatsContent()}
         </Drawer>
-        <Modal
-          title={<span><ApiOutlined className={styles.titleIcon} />{t('ui.pluginManagement')}</span>}
+        {/* 插件 / 进程 / 代理三个 modal 已抽到独立组件，详见 PluginModal/ProcessModal/ProxyModal */}
+        <PluginModal
           open={this.state.pluginModalVisible}
-          onCancel={() => this.setState({ pluginModalVisible: false })}
-          footer={
-            <div className={styles.pluginModalFooter}>
-              <div className={styles.pluginModalFooterLeft}>
-                <Button icon={<PlusOutlined />} onClick={this.handleAddPlugin}>{t('ui.plugins.add')}</Button>
-                <Button icon={<CloudDownloadOutlined />} onClick={this.handleShowCdnModal}>{t('ui.plugins.cdnInstall')}</Button>
-              </div>
-              <Button icon={<ReloadOutlined />} onClick={this.handleReloadPlugins}>{t('ui.plugins.reload')}</Button>
-            </div>
-          }
-          width={560}
-        >
-          {this.state.pluginsDir && (
-            <div className={styles.pluginDirHint}>
-              <span className={styles.pluginDirLabel}>{t('ui.plugins.pluginsDir')}:</span>{' '}
-              <code
-                className={styles.pluginDirPath}
-                onClick={() => {
-                  navigator.clipboard.writeText(this.state.pluginsDir).then(() => {
-                    message.success(t('ui.copied'));
-                  }).catch(() => {});
-                }}
-              >
-                {this.state.pluginsDir}
-              </code>
-            </div>
-          )}
-          {this.state.pluginsList.length === 0 ? (
-            <div className={styles.pluginEmpty}>
-              <div className={styles.pluginEmptyTitle}>{t('ui.plugins.empty')}</div>
-              <div className={styles.pluginEmptyHint}>{t('ui.plugins.emptyHint')}</div>
-            </div>
-          ) : (
-            <div className={styles.pluginList}>
-              {this.state.pluginsList.map(p => (
-                <div key={p.file} className={styles.pluginItem}>
-                  <div className={styles.pluginInfo}>
-                    <span className={styles.pluginName}>{p.name}</span>
-                    <span className={styles.pluginFile}>{p.file}</span>
-                    {p.hooks.length > 0 && (
-                      <span className={styles.pluginHooks}>
-                        {p.hooks.map(h => <span key={h} className={styles.pluginHookTag}>{h}</span>)}
-                      </span>
-                    )}
-                  </div>
-                  <div className={styles.pluginActions}>
-                    <Switch
-                      size="small"
-                      checked={p.enabled}
-                      onChange={(checked) => this.handleTogglePlugin(p.name, checked)}
-                    />
-                    <Button
-                      type="text"
-                      size="small"
-                      danger
-                      icon={<DeleteOutlined />}
-                      onClick={() => this.handleDeletePlugin(p.file, p.name)}
-                    />
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </Modal>
-        <Modal
-          title={t('ui.plugins.delete')}
-          open={this.state.deleteConfirmVisible}
-          onCancel={() => this.setState({ deleteConfirmVisible: false, deleteTarget: null })}
-          onOk={this.handleDeletePluginConfirm}
-          okType="danger"
-          okText="OK"
-          cancelText="Cancel"
-        >
-          <p>{this.state.deleteTarget ? t('ui.plugins.deleteConfirm', { name: this.state.deleteTarget.name }) : ''}</p>
-        </Modal>
-        <Modal
-          title={<span><CloudDownloadOutlined className={styles.titleIcon} />{t('ui.plugins.cdnInstall')}</span>}
-          open={this.state.cdnModalVisible}
-          onCancel={this.handleCdnCancel}
-          onOk={this.handleCdnInstall}
-          confirmLoading={this.state.cdnLoading}
-          okText={t('ui.plugins.cdnInstallBtn')}
-          cancelText={t('ui.cancel')}
-          width={480}
-        >
-          <div>
-            <div className={styles.cdnUrlLabel}>{t('ui.plugins.cdnUrl')}</div>
-            <Input
-              placeholder={t('ui.plugins.cdnUrlPlaceholder')}
-              value={this.state.cdnUrl}
-              onChange={this.handleCdnUrlChange}
-              onPressEnter={this.handleCdnInstall}
-              className={styles.cdnInput}
-            />
-          </div>
-        </Modal>
-        <Modal
-          title={<span><DashboardOutlined className={styles.titleIcon} />{t('ui.processManagement')}</span>}
+          onClose={() => this.setState({ pluginModalVisible: false })}
+        />
+        <ProcessModal
           open={this.state.processModalVisible}
-          onCancel={() => this.setState({ processModalVisible: false })}
-          footer={
-            <Button icon={<ReloadOutlined />} onClick={this.fetchProcesses} loading={this.state.processLoading}>
-              {t('ui.processManagement.refresh')}
-            </Button>
-          }
-          width={780}
-        >
-          <Table
-            dataSource={this.state.processList}
-            rowKey="pid"
-            loading={this.state.processLoading}
-            size="middle"
-            pagination={false}
-            columns={[
-              { title: t('ui.processManagement.port'), dataIndex: 'port', width: 80, render: (text) => text ? <a href={`${window.location.protocol}//127.0.0.1:${text}`} target="_blank" rel="noopener noreferrer">{text}</a> : '' },
-              { title: 'PID', dataIndex: 'pid', width: 80 },
-              { title: t('ui.processManagement.command'), dataIndex: 'command', ellipsis: true },
-              { title: t('ui.processManagement.startTime'), dataIndex: 'startTime', width: 200 },
-              {
-                title: t('ui.processManagement.action'),
-                width: 100,
-                render: (_, record) => record.isCurrent
-                  ? <Button size="small" className={styles.currentProcessBtn}>{t('ui.processManagement.current')}</Button>
-                  : <Button size="small" danger onClick={() => this.handleKillProcess(record.pid)}>{t('ui.processManagement.kill')}</Button>,
-              },
-            ]}
-          />
-        </Modal>
-
-        {/* Proxy Profile Modal */}
-        <Modal
-          title={<span><OpenFolderIcon apiEndpoint={apiUrl('/api/open-profile-dir')} title={t('ui.proxy.openConfigDir')} size={16} /> {t('ui.proxySwitch')} <ConceptHelp doc="ProxySwitch" zIndex={1100} /></span>}
+          onClose={() => this.setState({ processModalVisible: false })}
+        />
+        <ProxyModal
           open={this.state.proxyModalVisible}
-          onCancel={() => this.setState({ proxyModalVisible: false, editingProxy: null })}
-          footer={null}
-          width={520}
-        >
-          {this.renderProxyProfileList()}
-        </Modal>
+          onClose={() => this.setState({ proxyModalVisible: false })}
+          proxyProfiles={this.props.proxyProfiles}
+          activeProxyId={this.props.activeProxyId}
+          defaultConfig={this.props.defaultConfig}
+          onProxyProfileChange={this.props.onProxyProfileChange}
+        />
 
         {/* Skills Manager Modal — 从 AppHeader popover「已载入 Skill」→「管理」按钮打开 */}
         {this.renderSkillsManagerModal()}
@@ -2003,140 +1743,6 @@ class AppHeader extends React.Component {
         onToggle={(s) => this.handleToggleSkill(s)}
         onClose={() => this.setState(prev => ({ _skillsModal: { ...prev._skillsModal, open: false } }))}
       />
-    );
-  }
-
-  // ─── Proxy Profile Modal 内容 ───────────────────────────
-
-  renderProxyProfileList() {
-    const profiles = this.props.proxyProfiles || [];
-    const activeId = this.props.activeProxyId || 'max';
-    const { editingProxy, editForm } = this.state;
-
-    return (
-      <div>
-        <div className={styles.proxyWarning}>⚠️ {t('ui.proxy.maxWarning')}</div>
-        <div className={styles.proxyList}>
-          {profiles.map(p => (
-            <div key={p.id} className={`${styles.proxyItem} ${p.id === activeId ? styles.proxyItemActive : ''}`}>
-              <div className={styles.proxyItemMain} onClick={() => {
-                if (p.id !== activeId) {
-                  const data = { active: p.id, profiles };
-                  this.props.onProxyProfileChange(data);
-                }
-              }}>
-                <Radio checked={p.id === activeId} style={{ marginRight: 8 }} />
-                <div className={styles.proxyItemInfo}>
-                  <div className={styles.proxyItemNameRow}>
-                    <span className={styles.proxyItemName}>{p.name}</span>
-                    {p.id === 'max' && <Tag className={styles.proxyBuiltinTag}>{t('ui.proxy.builtin')}</Tag>}
-                  </div>
-                  {p.id === 'max' && this.props.defaultConfig && (
-                    <div className={styles.proxyItemDetail}>
-                      {(() => { try { return new URL(this.props.defaultConfig.origin).host; } catch { return this.props.defaultConfig.origin; } })()}
-                      {this.props.defaultConfig.authType ? ` · ${this.props.defaultConfig.authType}` : ''}
-                      {this.props.defaultConfig.apiKey ? ` · ${this.props.defaultConfig.apiKey}` : ''}
-                      {this.props.defaultConfig.model ? ` · ${this.props.defaultConfig.model}` : ''}
-                    </div>
-                  )}
-                  {p.id !== 'max' && p.baseURL && (
-                    <div className={styles.proxyItemDetail}>
-                      {(() => { try { return new URL(p.baseURL).host; } catch { return p.baseURL; } })()}
-                      {p.activeModel ? ` · ${p.activeModel}` : (p.models?.length ? ` · ${p.models[0]}` : '')}
-                    </div>
-                  )}
-                </div>
-              </div>
-              {p.id !== 'max' && (
-                <div className={styles.proxyItemActions}>
-                  <Button type="text" size="small" icon={<EditOutlined />} onClick={() => this.setState({
-                    editingProxy: p.id,
-                    editForm: { name: p.name || '', baseURL: p.baseURL || '', apiKey: p.apiKey || '', models: (p.models || []).join(', '), activeModel: p.activeModel || '' }
-                  })} />
-                  <Button type="text" size="small" danger icon={<DeleteOutlined />} onClick={() => {
-                    Modal.confirm({
-                      title: t('ui.proxy.deleteProxy'),
-                      content: t('ui.proxy.deleteConfirm', { name: p.name }),
-                      okType: 'danger',
-                      onOk: () => {
-                        const newProfiles = profiles.filter(x => x.id !== p.id);
-                        const newActive = activeId === p.id ? 'max' : activeId;
-                        this.props.onProxyProfileChange({ active: newActive, profiles: newProfiles });
-                      }
-                    });
-                  }} />
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-
-        {/* 编辑/新增表单 */}
-        {editingProxy && (
-          <div className={styles.proxyEditForm}>
-            <div className={styles.proxyEditRow}>
-              <label>{t('ui.proxy.name')} <span className={styles.proxyRequired}>*</span></label>
-              <Input size="small" value={editForm.name} onChange={e => { const v = e.target.value; this.setState(prev => ({ editForm: { ...prev.editForm, name: v } })); }} />
-            </div>
-            <div className={styles.proxyEditRow}>
-              <label>{t('ui.proxy.baseURL')} <span className={styles.proxyRequired}>*</span></label>
-              <Input size="small" value={editForm.baseURL} onChange={e => { const v = e.target.value; this.setState(prev => ({ editForm: { ...prev.editForm, baseURL: v } })); }} placeholder="https://api.example.com" />
-            </div>
-            <div className={styles.proxyEditRow}>
-              <label>{t('ui.proxy.apiKey')} <span className={styles.proxyRequired}>*</span></label>
-              <Input.Password size="small" value={editForm.apiKey} onChange={e => { const v = e.target.value; this.setState(prev => ({ editForm: { ...prev.editForm, apiKey: v } })); }} placeholder="sk-..." />
-            </div>
-            <div className={styles.proxyEditDivider} />
-            <div className={styles.proxyEditRow}>
-              <label>{t('ui.proxy.models')}</label>
-              <Input size="small" value={editForm.models} onChange={e => { const v = e.target.value; this.setState(prev => ({ editForm: { ...prev.editForm, models: v } })); }} placeholder="model-1, model-2" />
-            </div>
-            <div className={styles.proxyEditRow}>
-              <label>{t('ui.proxy.activeModel')}</label>
-              <Select size="small" className={styles.fullWidthSelect} value={editForm.activeModel || undefined} onChange={v => this.setState(prev => ({ editForm: { ...prev.editForm, activeModel: v } }))} placeholder={t('ui.proxy.activeModel')}>
-                {(editForm.models || '').split(',').map(m => m.trim()).filter(Boolean).map(m => (
-                  <Select.Option key={m} value={m}>{m}</Select.Option>
-                ))}
-              </Select>
-            </div>
-            <div className={styles.proxyEditBtns}>
-              <Button size="small" icon={<CheckOutlined />} type="primary" onClick={() => {
-                if (!editForm.name?.trim() || !editForm.baseURL?.trim() || !editForm.apiKey?.trim()) {
-                  message.warning(t('ui.proxy.requiredFields'));
-                  return;
-                }
-                const models = (editForm.models || '').split(',').map(m => m.trim()).filter(Boolean);
-                const updated = {
-                  id: editingProxy === '__new__' ? `proxy_${Date.now()}` : editingProxy,
-                  name: editForm.name.trim(),
-                  baseURL: editForm.baseURL.trim(),
-                  apiKey: editForm.apiKey.trim(),
-                  models,
-                  activeModel: editForm.activeModel || models[0] || '',
-                };
-                let newProfiles;
-                if (editingProxy === '__new__') {
-                  newProfiles = [...profiles, updated];
-                } else {
-                  newProfiles = profiles.map(p => p.id === editingProxy ? { ...p, ...updated, id: p.id } : p);
-                }
-                this.props.onProxyProfileChange({ active: activeId, profiles: newProfiles });
-                this.setState({ editingProxy: null });
-              }}>{t('ui.proxy.save')}</Button>
-              <Button size="small" icon={<CloseOutlined />} onClick={() => this.setState({ editingProxy: null })}>{t('ui.proxy.cancel')}</Button>
-            </div>
-          </div>
-        )}
-
-        {!editingProxy && (
-          <Button block type="dashed" icon={<PlusOutlined />} style={{ marginTop: 12 }} onClick={() => this.setState({
-            editingProxy: '__new__',
-            editForm: { name: '', baseURL: '', apiKey: '', models: '', activeModel: '' }
-          })}>
-            {t('ui.proxy.addProxy')}
-          </Button>
-        )}
-      </div>
     );
   }
 }

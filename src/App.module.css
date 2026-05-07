@@ -587,7 +587,9 @@
   box-shadow: 0 4px 12px var(--overlay-dark-light);
   min-width: 160px;
   z-index: 1000;
-  overflow: hidden;
+  /* 8 项 + 1 divider 在 iPhone SE (568px viewport) 边缘可能溢屏外，必须可滚 */
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
 }
 
 .mobileMenuItem {
@@ -606,6 +608,13 @@
 
 .mobileMenuItem:active {
   background: var(--overlay-light-medium);
+}
+
+/* PC 端在「代理热切换」与「项目统计」之间的分隔线在 mobile 也保留视觉一致 */
+.mobileMenuDivider {
+  height: 1px;
+  background: var(--border-primary);
+  margin: 4px 0;
 }
 
 .mobileStatsOverlay {

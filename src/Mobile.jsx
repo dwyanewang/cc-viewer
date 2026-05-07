@@ -16,6 +16,9 @@ import MobileStats from './components/MobileStats';
 import CachePopoverContent from './components/CachePopoverContent';
 import MemoryDetailModal from './components/MemoryDetailModal';
 import SkillsManagerModal from './components/SkillsManagerModal';
+import PluginModal from './components/PluginModal';
+import ProcessModal from './components/ProcessModal';
+import ProxyModal from './components/ProxyModal';
 import OpenFolderIcon from './components/OpenFolderIcon';
 import appConfig from './config.json';
 import { t, getLang, setLang, LANG_OPTIONS } from './i18n';
@@ -49,6 +52,14 @@ class Mobile extends AppBase {
       _memory: null,
       _memoryRefreshing: false,
       _memoryDetail: null,
+      // CLAUDE.md 候选清单 + 明细（与 AppHeader 等价；分槽避免与 _memoryDetail 交叉）
+      _claudeMd: null,
+      _claudeMdDetail: null,
+      // 与 PC 端对齐:插件管理 / CCV进程管理 / 代理热切换 modal 仅持 open 状态;
+      // 实际数据 + handler 都在 PluginModal/ProcessModal/ProxyModal 内部
+      pluginModalVisible: false,
+      processModalVisible: false,
+      proxyModalVisible: false,
       // 与 AppHeader._skillsModal 同结构；toggling 用 Set 跟踪正在切换的 skill key。
       _skillsModal: { open: false, loading: false, skills: [], error: null, toggling: new Set() },
       calibrationModel: (v => CALIBRATION_MODELS.some(m => m.value === v) ? v : 'auto')(localStorage.getItem('ccv_calibrationModel') || 'auto'),
@@ -57,6 +68,8 @@ class Mobile extends AppBase {
     this._fsSkillsSeq = 0;
     this._memorySeq = 0;
     this._memoryDetailSeq = 0;
+    this._claudeMdSeq = 0;
+    this._claudeMdDetailSeq = 0;
   }
 
   // 关掉所有移动端互斥 overlay。每次打开任一 overlay 时先调用此方法，
@@ -73,6 +86,10 @@ class Mobile extends AppBase {
       mobileTerminalVisible: false,
       mobileFileExplorerVisible: false,
       mobileCachePanelVisible: false,
+      // PC-aligned modals: 也纳入互斥关闭, 避免点击其他菜单项时这 3 个仍残留
+      pluginModalVisible: false,
+      processModalVisible: false,
+      proxyModalVisible: false,
     };
   }
 
@@ -271,6 +288,46 @@ class Mobile extends AppBase {
   _onCachePanelOpenChange = (open) => {
     if (open && this.state._fsSkills === null && !this._isLocalLog) this.reloadFsSkills();
     if (open && this.state._memory === null) this.loadMemory();
+    if (open && this.state._claudeMd === null) this.loadClaudeMdList();
+  };
+
+  // CLAUDE.md 列表懒加载：与 AppHeader.loadClaudeMdList 同语义。
+  loadClaudeMdList = async () => {
+    const seq = ++this._claudeMdSeq;
+    try {
+      const r = await fetch(apiUrl('/api/claude-md'));
+      const data = await r.json();
+      if (seq !== this._claudeMdSeq) return;
+      if (!r.ok || !Array.isArray(data.entries)) {
+        this.setState({ _claudeMd: false });
+        return;
+      }
+      this.setState({ _claudeMd: data.entries });
+    } catch {
+      if (seq === this._claudeMdSeq) this.setState({ _claudeMd: false });
+    }
+  };
+
+  // 点击 chip → 拉明细到 _claudeMdDetail；标题用"<scope> · <tail>"组合。
+  loadClaudeMdDetail = async (id, tail, scope) => {
+    const seq = ++this._claudeMdDetailSeq;
+    const scopeLabel = scope === 'global' ? t('ui.claudeMdScopeGlobal') : t('ui.claudeMdScopeProject');
+    const title = `${scopeLabel} · ${tail}`;
+    this.setState({ _claudeMdDetail: { name: title, loading: true } });
+    try {
+      const r = await fetch(apiUrl(`/api/claude-md?id=${encodeURIComponent(id)}`));
+      const data = await r.json();
+      if (seq !== this._claudeMdDetailSeq) return;
+      if (!r.ok) {
+        this.setState({ _claudeMdDetail: { name: title, error: data.error || `http:${r.status}` } });
+        return;
+      }
+      this.setState({ _claudeMdDetail: { name: title, content: data.content || '' } });
+    } catch (e) {
+      if (seq === this._claudeMdDetailSeq) {
+        this.setState({ _claudeMdDetail: { name: title, error: e.message || 'network' } });
+      }
+    }
   };
 
   componentDidMount() {
@@ -341,16 +398,27 @@ class Mobile extends AppBase {
     this._fsSkillsSeq++;
     this._memorySeq++;
     this._memoryDetailSeq++;
+    this._claudeMdSeq++;
+    this._claudeMdDetailSeq++;
     super.componentWillUnmount();
   }
 
   componentDidUpdate(prevProps, prevState) {
     if (super.componentDidUpdate) super.componentDidUpdate(prevProps, prevState);
-    // workspace 切换：projectName 变了 → 旧的 _fsSkills/_memory 属于旧项目，作废 + 刷 seq
+    // workspace 切换：projectName 变了 → 旧的 _fsSkills/_memory/_claudeMd 属于旧项目，作废 + 刷 seq
     if (prevState.projectName !== this.state.projectName) {
       this._fsSkillsSeq++;
       this._memorySeq++;
-      this.setState({ _fsSkills: null, _memory: null, _memoryDetail: null, _memoryRefreshing: false });
+      this._claudeMdSeq++;
+      this._claudeMdDetailSeq++;
+      this.setState({
+        _fsSkills: null,
+        _memory: null,
+        _memoryDetail: null,
+        _memoryRefreshing: false,
+        _claudeMd: null,
+        _claudeMdDetail: null,
+      });
     }
   }
 
@@ -647,6 +715,8 @@ class Mobile extends AppBase {
               className={styles.mobileMenuBtn}
               onClick={() => this.setState(prev => ({ mobileMenuVisible: !prev.mobileMenuVisible }))}
               aria-label={t('ui.mobileMenu')}
+              aria-expanded={this.state.mobileMenuVisible}
+              aria-haspopup="menu"
             >
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
                 <line x1="3" y1="6" x2="21" y2="6" />
@@ -736,6 +806,19 @@ class Mobile extends AppBase {
             <>
               <div className={styles.mobileMenuOverlay} onClick={() => this.setState({ mobileMenuVisible: false })} />
               <div className={styles.mobileMenuDropdown}>
+                {/* 1. 项目文件夹 (mobile 独有, 置顶, 仅在非 local-log 模式可见) */}
+                {!mobileIsLocalLog && (
+                <button
+                  className={styles.mobileMenuItem}
+                  onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), mobileFileExplorerVisible: true }); }}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                  </svg>
+                  {t('ui.projectFolder')}
+                </button>
+                )}
+                {/* 2. 日志管理 — 对应 PC 「日志管理工具」 */}
                 <button
                   className={styles.mobileMenuItem}
                   onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), mobileLogMgmtVisible: true }); this.handleImportLocalLogs(); }}
@@ -748,39 +831,7 @@ class Mobile extends AppBase {
                   </svg>
                   {t('ui.logManagement')}
                 </button>
-                <button
-                  className={styles.mobileMenuItem}
-                  onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), mobileStatsVisible: true }); }}
-                >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <rect x="3" y="3" width="7" height="7" />
-                    <rect x="14" y="3" width="7" height="7" />
-                    <rect x="3" y="14" width="7" height="7" />
-                    <rect x="14" y="14" width="7" height="7" />
-                  </svg>
-                  {t('ui.tokenStats')}
-                </button>
-                <button
-                  className={styles.mobileMenuItem}
-                  onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), mobileSettingsVisible: true }); }}
-                >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <circle cx="12" cy="12" r="3" />
-                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-                  </svg>
-                  {t('ui.settings')}
-                </button>
-                {!mobileIsLocalLog && (
-                <button
-                  className={styles.mobileMenuItem}
-                  onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), mobileFileExplorerVisible: true }); }}
-                >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                  </svg>
-                  {t('ui.projectFolder')}
-                </button>
-                )}
+                {/* 3. 用户 Prompt — 对应 PC 「查看用户 Prompt」 */}
                 <button
                   className={styles.mobileMenuItem}
                   onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), mobilePromptVisible: true }); }}
@@ -793,6 +844,75 @@ class Mobile extends AppBase {
                     <line x1="12" y1="12" x2="15" y2="15" />
                   </svg>
                   {t('ui.userPrompt')}
+                </button>
+                {/* 4. 插件管理 — 与 PC AppHeader.jsx:1342 同 i18n key */}
+                <button
+                  className={styles.mobileMenuItem}
+                  onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), pluginModalVisible: true }); }}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="9" y="2" width="6" height="6" rx="1" />
+                    <rect x="2" y="9" width="6" height="6" rx="1" />
+                    <rect x="16" y="9" width="6" height="6" rx="1" />
+                    <rect x="9" y="16" width="6" height="6" rx="1" />
+                  </svg>
+                  {t('ui.pluginManagement')}
+                </button>
+                {/* 5. CCV 进程管理 */}
+                <button
+                  className={styles.mobileMenuItem}
+                  onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), processModalVisible: true }); }}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M12 2v4" />
+                    <path d="M12 18v4" />
+                    <path d="m4.93 4.93 2.83 2.83" />
+                    <path d="m16.24 16.24 2.83 2.83" />
+                    <path d="M2 12h4" />
+                    <path d="M18 12h4" />
+                    <path d="m4.93 19.07 2.83-2.83" />
+                    <path d="m16.24 7.76 2.83-2.83" />
+                  </svg>
+                  {t('ui.processManagement')}
+                </button>
+                {/* 6. 代理热切换 */}
+                <button
+                  className={styles.mobileMenuItem}
+                  onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), proxyModalVisible: true }); }}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="17 1 21 5 17 9" />
+                    <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+                    <polyline points="7 23 3 19 7 15" />
+                    <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+                  </svg>
+                  {t('ui.proxySwitch')}
+                </button>
+                {/* 7-8 块前的 divider — 与 PC 「代理热切换」与「项目统计」之间分隔线一致 */}
+                <div className={styles.mobileMenuDivider} />
+                {/* 7. 数据统计 — 对应 PC 「项目统计」 */}
+                <button
+                  className={styles.mobileMenuItem}
+                  onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), mobileStatsVisible: true }); }}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="3" y="3" width="7" height="7" />
+                    <rect x="14" y="3" width="7" height="7" />
+                    <rect x="3" y="14" width="7" height="7" />
+                    <rect x="14" y="14" width="7" height="7" />
+                  </svg>
+                  {t('ui.tokenStats')}
+                </button>
+                {/* 8. 偏好设置 — mobile 独有 drawer (mobileSettingsVisible),不引入 PC 的 viewMode 条件 */}
+                <button
+                  className={styles.mobileMenuItem}
+                  onClick={() => { this.setState({ ...this._closeAllMobileOverlays(), mobileSettingsVisible: true }); }}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="3" />
+                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                  </svg>
+                  {t('ui.settings')}
                 </button>
               </div>
             </>
@@ -895,9 +1015,11 @@ class Mobile extends AppBase {
                     onOpenSkillsModal={this.handleOpenSkillsModal}
                     memory={this.state._memory}
                     memoryRefreshing={this.state._memoryRefreshing}
+                    claudeMd={this.state._claudeMd}
                     calibrationModel={this.state.calibrationModel}
                     onCalibrationModelChange={this.handleCalibrationModelChange}
                     onOpenMemoryDetail={this.loadMemoryDetail}
+                    onOpenClaudeMd={this.loadClaudeMdDetail}
                     onRefreshMemory={this.handleRefreshMemory}
                   />
                 )}
@@ -909,6 +1031,11 @@ class Mobile extends AppBase {
             onClose={() => this.setState({ _memoryDetail: null })}
             onOpenMemoryDetail={this.loadMemoryDetail}
           />
+          <MemoryDetailModal
+            detail={this.state._claudeMdDetail}
+            onClose={() => this.setState({ _claudeMdDetail: null })}
+            linkMode="passthrough"
+          />
           <SkillsManagerModal
             open={this.state._skillsModal?.open || false}
             loading={this.state._skillsModal?.loading || false}
@@ -917,6 +1044,25 @@ class Mobile extends AppBase {
             toggling={this.state._skillsModal?.toggling}
             onToggle={(s) => this.handleToggleSkill(s)}
             onClose={() => this.setState(prev => ({ _skillsModal: { ...prev._skillsModal, open: false } }))}
+          />
+          {/* PC 端对齐的 3 个 modal —— 与 AppHeader 共用同款 self-contained 组件。
+              proxyProfiles / activeProxyId / defaultConfig / handleProxyProfileChange 由 AppBase 持有,
+              Mobile 继承直接读到。 */}
+          <PluginModal
+            open={this.state.pluginModalVisible}
+            onClose={() => this.setState({ pluginModalVisible: false })}
+          />
+          <ProcessModal
+            open={this.state.processModalVisible}
+            onClose={() => this.setState({ processModalVisible: false })}
+          />
+          <ProxyModal
+            open={this.state.proxyModalVisible}
+            onClose={() => this.setState({ proxyModalVisible: false })}
+            proxyProfiles={this.state.proxyProfiles}
+            activeProxyId={this.state.activeProxyId}
+            defaultConfig={this.state.defaultConfig}
+            onProxyProfileChange={this.handleProxyProfileChange}
           />
           <div className={`${styles.mobileFileExplorerOverlay} ${this.state.mobileFileExplorerVisible ? styles.mobileFileExplorerOverlayVisible : ''}`}>
             <div className={styles.mobileFileExplorerInner}>

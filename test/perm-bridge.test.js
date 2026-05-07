@@ -53,6 +53,27 @@ describe('perm-bridge.js', () => {
     assert.equal(output.hookSpecificOutput.permissionDecision, 'allow');
   });
 
+  // git commit / git push 不在硬拦截白名单 —— bypass 模式下应被自动放行（与普通 Bash 命令一致）
+  for (const cmd of ['git commit -m "x"', 'git push origin main']) {
+    it(`auto-allows "${cmd}" when CCV_BYPASS_PERMISSIONS is set (git 不在硬拦截内)`, async () => {
+      const input = JSON.stringify({ tool_name: 'Bash', tool_input: { command: cmd } });
+      const { code, stdout } = await runBridge(input, { CCVIEWER_PORT: '9999', CCV_BYPASS_PERMISSIONS: '1' });
+      assert.equal(code, 0);
+      const output = JSON.parse(stdout.trim());
+      assert.equal(output.hookSpecificOutput.permissionDecision, 'allow');
+    });
+  }
+
+  // npm publish 是唯一硬拦截 —— bypass 模式下也必须走 Web UI 审批（不可撤销的对外发布）
+  it('forwards npm publish to server even when CCV_BYPASS_PERMISSIONS is set (硬拦截)', async () => {
+    const input = JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'npm publish' } });
+    const { code, stdout } = await runBridge(input, { CCVIEWER_PORT: '19999', CCV_BYPASS_PERMISSIONS: '1' });
+    assert.equal(code, 0);
+    const output = JSON.parse(stdout.trim());
+    assert.equal(output.continue, true);
+    assert.notEqual(output.hookSpecificOutput?.permissionDecision, 'allow');
+  });
+
   it('exits 1 when toolName is missing', async () => {
     const input = JSON.stringify({ tool_input: { command: 'ls' } });
     const { code } = await runBridge(input, { CCVIEWER_PORT: '9999' });

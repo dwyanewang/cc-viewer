@@ -39,9 +39,11 @@ export default function CachePopoverContent({
   contextTokens = 0,
   fsSkills,
   memory,
+  claudeMd,
   calibrationModel = 'auto',
   onCalibrationModelChange,
   onOpenMemoryDetail,
+  onOpenClaudeMd,
   onOpenSkillsModal,
   onRefreshMemory,
   onSkillImported,
@@ -333,6 +335,41 @@ export default function CachePopoverContent({
     return set.size;
   })();
 
+  // CLAUDE.md 三态：null=loading / false=error / [] 隐藏整段 / [...] 渲染 chip 列表。
+  // 与 memory 不同：空列表（项目+全局都没有 CLAUDE.md）直接隐藏整个 section 减少视觉噪声。
+  const claudeMdVisible = claudeMd === null || claudeMd === false
+    || (Array.isArray(claudeMd) && claudeMd.length > 0);
+
+  const claudeMdBody = (() => {
+    if (claudeMd === null) return <div className={`${styles.cachePopoverEmpty} ${styles.memoryStatus}`}>{t('ui.memoryLoading')}</div>;
+    if (claudeMd === false) return <div className={`${styles.cachePopoverEmpty} ${styles.memoryStatus}`}>{t('ui.memoryLoadError')}</div>;
+    if (!Array.isArray(claudeMd) || claudeMd.length === 0) return null;
+    return (
+      <div className={styles.toolChipGrid}>
+        {claudeMd.map((entry) => {
+          const scopeLabel = entry.scope === 'global'
+            ? t('ui.claudeMdScopeGlobal')
+            : t('ui.claudeMdScopeProject');
+          const badgeClass = entry.scope === 'global'
+            ? `${styles.cacheChipBadge} ${styles.cacheChipBadgeGlobal}`
+            : `${styles.cacheChipBadge} ${styles.cacheChipBadgeProject}`;
+          return (
+            <button
+              key={entry.id}
+              type="button"
+              className={styles.claudeMdChip}
+              title={entry.tail}
+              onClick={() => onOpenClaudeMd?.(entry.id, entry.tail, entry.scope)}
+            >
+              <span className={badgeClass}>{scopeLabel}</span>
+              <span>{entry.tail}</span>
+            </button>
+          );
+        })}
+      </div>
+    );
+  })();
+
   const memoryBody = (() => {
     if (memory === null) return <div className={`${styles.cachePopoverEmpty} ${styles.memoryStatus}`}>{t('ui.memoryLoading')}</div>;
     if (memory === false) return <div className={`${styles.cachePopoverEmpty} ${styles.memoryStatus}`}>{t('ui.memoryLoadError')}</div>;
@@ -418,6 +455,16 @@ export default function CachePopoverContent({
               {skillsAction}
             </div>
             {skillsBody}
+          </div>
+        )}
+        {claudeMdVisible && (
+          <div className={`${styles.cacheSection} ${styles.cacheSectionBordered}`}>
+            <div className={styles.cacheSectionHeader}>
+              <div className={styles.cacheSectionLabel}>
+                {t('ui.claudeMdSection')}{Array.isArray(claudeMd) ? ` (${claudeMd.length})` : ''}
+              </div>
+            </div>
+            {claudeMdBody}
           </div>
         )}
         <div className={`${styles.cacheSection} ${styles.cacheSectionBordered}`}>

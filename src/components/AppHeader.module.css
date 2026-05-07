@@ -755,6 +755,57 @@
 
 /* 原 .cacheToolChipClickable 已退役 —— MCP/Skill chip 改走 hover Popover，无需点击高亮 */
 
+/* CLAUDE.md chip：复用 .cacheToolChip 字号/边框，叠加 button 语义（点击打开 Modal）+ 一个 badge 前缀
+   区分 scope（项目/全局）。徽章颜色用 background-color 指定，与 chip 同高，跨主题 token 自适配。 */
+.claudeMdChip {
+  /* button 元素重置 */
+  font-family: inherit;
+  appearance: none;
+  cursor: pointer;
+  /* 与 .cacheToolChip 视觉对齐 */
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 3px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  line-height: 18px;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 1px solid var(--border-primary);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.claudeMdChip:hover {
+  background: var(--bg-hover, var(--bg-surface));
+  color: var(--text-primary);
+}
+
+.cacheChipBadge {
+  font-size: 10px;
+  line-height: 14px;
+  padding: 0 5px;
+  border-radius: 2px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+}
+
+/* 用语义色 token 而非硬编码 hex —— 切换 [data-theme="light"] 时同步切。
+   project 走品牌主蓝（与 .liveTag 系一致）；global 走 success 绿区分 scope，
+   避开 error/warning 误读为告警。两者都用 *-light 作前景，*-bg-light 作底色。 */
+.cacheChipBadgeProject {
+  background: var(--color-primary-bg-light);
+  color: var(--color-primary-light);
+}
+
+.cacheChipBadgeGlobal {
+  background: var(--color-success-bg-light);
+  color: var(--color-success-light);
+}
+
 .chipDetailBody {
   margin: 0;
   font-family: inherit;
