@@ -168,7 +168,29 @@ const MAX_PORT = parseInt(process.env.CCV_MAX_PORT) || 7099;
 const HOST = '0.0.0.0';
 
 // 局域网访问 token（本地 127.0.0.1 免验证）
-const ACCESS_TOKEN = randomBytes(16).toString('hex');
+const TOKEN_PATH = join(getClaudeConfigDir(), 'cc-viewer', 'access-token.json');
+
+function _ensureTokenDir() {
+  const dir = dirname(TOKEN_PATH);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+}
+
+function _loadOrCreateToken() {
+  _ensureTokenDir();
+  if (existsSync(TOKEN_PATH)) {
+    try {
+      const data = JSON.parse(readFileSync(TOKEN_PATH, 'utf-8'));
+      if (data.token && /^[0-9a-f]{32}$/i.test(data.token)) return { token: data.token, persistent: true };
+    } catch { /* fallback to generate */ }
+  }
+  const token = randomBytes(16).toString('hex');
+  writeFileSync(TOKEN_PATH, JSON.stringify({ token, createdAt: Date.now() }, null, 2), { mode: 0o600 });
+  return { token, persistent: false };
+}
+
+const _tokenInit = _loadOrCreateToken();
+let ACCESS_TOKEN = _tokenInit.token;
+const IS_TOKEN_PERSISTENT = _tokenInit.persistent;
 
 let clients = [];
 let server;
@@ -2594,6 +2616,35 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // 返回当前 access token 信息
+  if (url === '/api/access-token' && method === 'GET') {
+    // 远程访问需要已有合法 token
+    if (!isLocal) {
+      const urlToken = parsedUrl.searchParams.get('token');
+      if (urlToken !== ACCESS_TOKEN) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Forbidden: invalid token' }));
+        return;
+      }
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ token: ACCESS_TOKEN, persistent: IS_TOKEN_PERSISTENT }));
+    return;
+  }
+
+  // 重置 access token（仅限本地访问）
+  if (url === '/api/access-token/reset' && method === 'POST') {
+    if (!isLocal) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Forbidden: remote reset not allowed' }));
+      return;
+    }
+    const newToken = resetAccessToken();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ token: newToken, persistent: true }));
+    return;
+  }
+
   // 列出本地日志文件（按项目分组，遍历项目子目录）
   if (url === '/api/local-logs' && method === 'GET') {
     try {
@@ -3041,6 +3092,7 @@ export async function startViewer() {
             for (const _ip of _ips) {
               console.error(t('server.startedNetwork', { protocol: serverProtocol, ip: _ip, port, token: ACCESS_TOKEN }));
             }
+            console.error(t(IS_TOKEN_PERSISTENT ? 'server.tokenLoaded' : 'server.tokenGenerated', { path: TOKEN_PATH }));
           }
           // v2.0.69 之前的版本会清空控制台，自动打开浏览器确保用户能看到界面
           try {
@@ -3406,6 +3458,14 @@ export function getAccessToken() {
   return ACCESS_TOKEN;
 }
 
+export function resetAccessToken() {
+  const newToken = randomBytes(16).toString('hex');
+  _ensureTokenDir();
+  writeFileSync(TOKEN_PATH, JSON.stringify({ token: newToken, createdAt: Date.now() }, null, 2), { mode: 0o600 });
+  ACCESS_TOKEN = newToken;
+  return newToken;
+}
+
 // 流式状态 SSE 推送定时器：检测 streamingState 变化并广播给所有客户端
 let _streamingStatusTimer = null;
 let _lastStreamingActive = false;
@@ -3461,6 +3521,10 @@ async function _doStop() {
     // 销毁所有活跃连接，防止 keep-alive 阻止进程退出
     server.closeAllConnections();
     server.close();
+  }
+  if (terminalWss) {
+    terminalWss.close();
+    terminalWss = null;
   }
   if (statsWorker) {
     statsWorker.terminate();
