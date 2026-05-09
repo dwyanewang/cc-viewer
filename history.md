@@ -1,5 +1,119 @@
 # Changelog
 
+## Unreleased
+
+- fix(sessionMerge): 反向锚点对齐替换正向 prefix-overlap，根治流式 mainAgent "复制"翻车（远端 ultraplan agent 的根因诊断 + 修复）
+  - 旧 `src/utils/sessionMerge.js` 三分支按 `newLen vs currentLen` 各走各的：① `newLen===curLen` tail-fp 异时走 1.6.245 的"正向 prefix-overlap"，O(K²) 线性递减找最大匹配 K；text/thinking 取 `slice(0,64)` 单条 fp 易碰撞（共有 `<system-reminder>...` / `<command-name>/...` 头部），算法挑最大 K 优先选错 → 真新增的尾部消息被切掉、流式过程实际丢消息。② `newLen>curLen` 盲推 `newMsgs[curLen..]`，假设严格前缀扩展；CLI Plan Mode 后偶发 "K 条与末尾重叠 + 后段新增" 但 newLen>curLen 的窗口会被当作新内容再 push 一遍 → 同对话出现两次相同消息，即用户报的"复制翻车"。③ `newLen<curLen` 仅尾部全等才保留，少一条不同就重建，长 session 偶尔被一条 race 拍没。
+  - 新算法：以 `newMessages[0]` 为锚点，从 `lastSession.messages` 末尾 `curLen-1` 反向扫，配合多块连续 fp 等价校验决定 append / no-op / rebuild。三分支收口到一个 `findReverseAnchor` 主路径，仅在 anchor 未命中且 `newLen<curLen` 时走 /compact rebuild、`newLen===curLen` 走整段 append（Plan Mode 2-msg 全替换窗口）、`newLen>curLen` 回退到旧"严格前缀扩展"语义保兼容。fp 加固：text / thinking / string content 从 `slice(0,64)` → `length + first32 + last32` 三元组，单条碰撞概率压到忽略量级；tool_use / tool_result 保留 API 强保证唯一的 id 主键不变。
+  - 流式热路径零分配：anchor.overlapLen===newLen 时不进 push 循环、不动 `messages` 引用，下游 `appendToolResultMap` WeakMap 缓存继续命中。复杂度：单候选 O(L)，最坏 O(curLen·newLen) 与旧 O(K²) 同阶；典型 K<200 可忽略。
+  - 替代了之前的 v2 prevEntry-diff + id-dedup 模型（`_seenToolUseIds` / `_seenToolResultIds` Set + `_prevEntryMessages` baseline 全部移除）；保留 diagnostics 基础设施在 ChatView/AppBase/ChatMessage 等其他位置；sessionMerge 仅保留 `sessionMerge.merged` / `sessionMerge.newSession.differentUser` 两个 enabled-gated 事件供新算法可观测性
+  - **测试**：`test/incremental-merge.test.js` 用反向锚点版本 853 行替换 v2 953 行（含 `describe('reverse anchor regression')` 6 case 锁死翻车场景：① text-only 共 64-char 头部不再误判；② newLen>curLen 带 K-msg 末尾重叠不再 K 条复制；③ 严格前缀扩展引用稳定；④ suffix-subset 引用稳定；⑤ 空 fp 防御；⑥ 反向扫多候选选最右）；其余 v2 test cases（id-dedup / cold-bootstrap / sliding window）随 v2 模型移除一并删除
+
+- diagnostics(frame-capture): mainAgent UI 重复/错位排查的证据捕获基础设施（默认关闭，生产零开销）
+  - **背景**：memory `project_doubled_history_two_rewrites_failed.md` 记录 2 次"修复"翻车（warning counter=0 误判修复成功），教训：必须靠原始证据（snapshot + DOM 验证）定位污染最初出现的 hop
+  - **3 高嫌疑点**（4 探查 + 2 review agent 共识）：(A) `sessionMerge.js:274` additions push 不 bump `messages._cacheGen`（仅 modifications L251 bump），纯 append 帧 ChatView WeakMap 命中陈旧 toolResultMap；(B) `ChatView.jsx:659-662` `sessionsActuallyChanged` 浅比较，session 对象 in-place mutate 时假阴性；(C) `ChatView.jsx:1879-1895` `nextSessionStart` 假设 `firstTsBySi[]` 严格递增，null/乱序/重复时 subAgent 错位
+  - **新增** `src/utils/diagnostics.js`：frame snapshot ring buffer (max 20)、`identityHash` (WeakMap-backed 不持引用)、`registerMsgRender` / `unregisterMsgRender` (ChatMessage mount/unmount 注册式重复检测，无 querySelectorAll 热路径)、`captureFrameSnapshot` (shape-only：sessionRefId/msgsRefId/cacheGen/firstTs/seenToolUseIdsSize 不持 messages 引用，GC 友好)、`shouldSample(denom)` (固定模式 counter%denom，避开 Math.random() 开销)、`setLastKnownSessions` (AppBase 注入)、`checkDuplicates` (rAF 触发器扫 `_msgRegistry`)
+  - **新增 `__CCV_DIAG__` API**：`enableCapture(true)` / `captureNow(label)` / `getFrames()` / `exportFrames()` / `clearFrames()` / `duplicates()` / `checkDuplicates()`
+  - **埋点**（全部 `if (!isDiagEnabled()) return;` 早 return）：
+    - sessionMerge：`sessionMerge.addition.accept` / `sessionMerge.addition.dedupSkip` / `sessionMerge.addition.cacheGenStatus` (嫌疑 A 关键证据：`add>0 cacheGen 不变` 直接现形) / `sessionMerge.mod.miss`
+    - AppBase：`appBase.merge.cacheGenAfter` + `setLastKnownSessions` 让 `captureNow()` 默认有数据
+    - ChatView：`chatView.didUpdate.sessions` (嫌疑 B 关键证据：`refChanged=1 actualChanged=0`) / `chatView.invalidate.si` / `chatView.firstTsBySi` (嫌疑 C 证据：sample 1/20) / `chatView.nextSessionStart`
+  - **重复检测器**：ChatView `componentDidUpdate` 末尾 `requestAnimationFrame` 调 `checkDuplicates()`，发现 `_msgRegistry[uuid].count >= 2` 自动 capture frame；assistant `<ChatMessage>` 加 `_diagMsgUuid={msg.uuid}` / `_diagKeyPrefix` 两个新 prop（uuid 缺失时跳过 register，不撞 React data-attr 警告）
+  - **使用**：`window.__CCV_DIAG__.enableCapture(true)` → 复现 bug → `copy(window.__CCV_DIAG__.exportFrames())`。`enableCapture` 是统一总开关——一次启用 console verbose + ring buffer + frame snapshot + dup detector + 所有 gated 详细事件，不再需要单独设 `__TS_DEBUG__=true`。snapshot 含每个 session 的 `sessionRefId / msgsRefId / msgsLen / cacheGen / firstTs / lastTs / seenToolUseIdsSize / 末 30 条 msgs[uuid8/role/ts/contentLen/blockTypes/tuIds/trIds]` + 当前 `duplicates[]` + 末 30 条 `lastEvents` + 末 10 条 `lastWarnings`
+  - **测试**：`test/diagnostics.test.js` 加 9 case 覆盖 disabled-no-op / 重复 register 命中 / shape-only snapshot / ring 滚动 / shouldSample 严格固定 / exportFrames JSON 解析 / autoTriggerOnDup 自动 capture / disable 清空 registry / identityHash 同 obj 同 id；1683/1683 pass + build OK
+  - **本轮明确不修**：sessionMerge.js:274 cacheGen bump 缺失 / sessionsActuallyChanged 浅比较 / nextSessionStart 时间戳扫描——等用户实际复现并提供 snapshot 后再据证据决策修哪一层（避开 warning counter 误判翻车的老路）
+
+- fix(chat-view): nextSessionStart 时间反向导致 subAgent 整段被 drop 的渲染层 P0
+  - **真因**：`ChatView.jsx:1878` 原 `mainAgentSessions[si + 1].messages[0]._timestamp` 假设 sessions 数组按时间升序，但 sessionMerge `new-session-different-user` 路径把新 session 追加到数组末尾，其 `firstTs` 可能早于既有 sessions 内部 message 的 timestamp——nextSessionStart 时间反向，本属当前 si 的 subAgent 整段被 drop（用户实测 si=0 dropped 408→469 持续累积，si=1 / si=2 同样被错误过滤）
+  - **诊断证据**：用户上传 `console-1778204747112.log` 显示 `droppedFirstTs(18:20:55) > nextSessionStart(18:01:12)` 时间反向 19 分钟；同时 sessionMerge 端 `dedupSkipped=0` / `mod=0 add=2 d=0` 完全干净——bug 不在 sessionMerge 数据层而在 ChatView 渲染层
+  - **修复**：扫所有非当前 si 的 sessions，取 `firstTs > 当前 session.lastTs` 的最小 firstTs 作 nextSessionStart。不依赖数组下标顺序，跨 device 切换 / userId 切换场景下也对
+  - **历史教训**：本周前后 3 次 ship 都误以为是 sessionMerge 数据层 bug（4 层防御 → 双层 head-alignment guard → v1 index-keyed → v2 prevEntry-diff+id-dedup），全部修错层。直到 3 个独立 agent 从 3 角度（信号分布/调用栈/HTML 比例）会聚到 ChatView 渲染层才锁定。Memory 里早期笔记 "lastSessionLastTs 倒退 → ChatView nextSessionStart 把 subAgent break 飞" 已预言此 bug 但被 sessionMerge 假象盖过去
+  - 1673/1673 pass + build OK
+
+- refactor(sessionMerge): 二次重写，根治 CLI doubled-history 漏判
+  - **问题**：第一版 index-keyed slot-based 的 append 路径只按位置不按内容去重——CLI 单帧偶发把首部 history 副本拼接到末尾（如 `[m1..366, m1..368]`），副本位置原本是空的，无 slot rewrite 触发，被无脑 push 导致整段对话翻倍。诊断 log 看似干净
+  - **新模型**：lastSession 加 `_prevEntryMessages` 缓存上一帧 CLI raw messages 作 diff baseline + `_seenToolUseIds` / `_seenToolResultIds` 累积 session 内 tool_use.id 与 tool_result.tool_use_id（Anthropic API 强保证唯一）。每帧用 prev vs new 算 positional diff，modifications（前 min 内 fp 不同的 slot）走 offset+fp 守卫双校验定位 lastSession.messages 中的目标位置原地覆盖 + bump _cacheGen + 同步 Set；additions（尾段超出 prev 部分）经 id-dedup 过滤，命中已见 id 直接 skip——CLI 副本必定命中。纯 text/thinking 永不 dedup 容许用户重发同文本
+  - **保留**：isPostClearCheckpoint / isCompactCheckpoint / 异 user / transient-skip / sliding window（基于 lastSession.messages 末尾子集，聚合视更可靠）。createNewSession 工厂统一处理 4 个新 session 分支
+  - **可观测**：`recordWarning('sessionMerge.dedupSkipped')` / `sessionMerge.modificationMissed` / `sessionMerge.multiSlotRewrite` 命中时触发；`__CCV_DIAG__.counters()['sessionMerge.dedupSkipped'] > 0` 即证明 doubled history 真被拦截
+  - **测试**：`test/incremental-merge.test.js` 新增 6 个 dedup 专项 case 锁死核心场景：tool_use 副本 / tool_result 副本 / 纯 text 不误删 / _prevEntryMessages 跨帧 progression / postClear 重置 / sliding window 也刷 prev
+  - 1671/1671 pass + build OK
+  - **背景**：用户实测 22MB HTML 导出里 78 user bubble + 905 assistant bubble（实际只发 ~10 条 user message），单一 timestamp 重复 205 次。前后投入 4 轮防御（双层 head-alignment guard / immutable rebuild / per-si 失效 / 改造 0 prefix-overlap shadow rewrite + diagnostics 模块）都没覆盖"alignedHead === currentLen 全对齐 + newMessages [currentLen..] 实际是 lastSession 历史副本"这个死角——CLI 偶发把累积历史在 newMessages 末尾再发一份，老 push-based merge 盲信切片 newMessages[currentLen..] 是真增量，把历史副本接到 lastSession 末尾雪崩
+  - **根因**：merge 一直是 additive 模型（lastSession.messages 长度只增不减），其工作前提是"CLI 每帧 body.messages 单调追加，前 currentLen 条永远等于上次 lastSession 前 currentLen 条"——这个前提从来没在代码里被强制校验过。alignedHead 70% / prefix-overlap / full-rewrite-rebuild 等启发式都是位置/结构层面的 patch，捕不到协议语义异常
+  - **新模型**（用户提议的 index-keyed slot-based）：
+    - lastSession.messages 是按 entry.body.messages 下标索引的 slot array，每条 message 打 `_originIndex`
+    - 现存 slot fp 不同 → in-place 覆写 + bump `messages._cacheGen`
+    - newLen > currentLen → push 新 slot；newLen < currentLen + tail subset → sliding window 保留 messages 不动；newLen < currentLen + non-subset → slots [0..newLen-1] 覆盖 + [newLen..] 保留
+    - 长度天然封顶 max(已见 newLen)，CLI 单帧报文几条就显示几条，**绝不跨帧累加翻倍**
+    - CLI 单帧内部重复（[hist, hist_copy] 这种 CLI 上游 bug）忠实展示——cc-viewer 的责任边界是"按位置渲染 CLI 给的内容"，内容语义由 CLI 负责
+  - **新增 /compact 边界检测** `isCompactCheckpoint(entry, prevMessageCount, prevMessages)`：CLI 协议层无显式标记，用 `_isCheckpoint=true && newLen<prevMessageCount && msg[0] fp 改变 && 非 /clear` 4 信号联合推断，命中即创建新 session，旧 session.messages 完整保留——避免 /compact 把累积对话整段冲走
+  - **删除的启发式分支**（共 ~170 行）：alignedHead 70% 检测 / prefix-overlap-append / full-rewrite-rebuild / non-subset-rebuild / head-not-aligned-rebuild / equal-len 多分支判定 / append-all-fallback。保留 isPostClearCheckpoint / transient-skip / 异 user 新 session / Plan Mode sliding window
+  - **WeakMap cache pollution 治理**（多 agent review 揪出的 P0 阻塞）：messages ref 长期稳定后，单纯 ref 比对无法识别"slot 内容被改写"的 cache 失效。`src/utils/toolResultBuilder.js` 的 `getToolResultCache` 加 `messages._cacheGen vs cached._gen` 比对，gen 不匹配返回 null 强制重建；`setToolResultCache` 时记录 gen。`src/components/ChatView.jsx` 加 `_incToolCacheGen` 字段，fallback 路径下 ref + gen 任一不匹配 → 强制 createEmptyToolState 全扫
+  - **测试**：`test/incremental-merge.test.js` 删 push 路径多分支判定的所有 case，重写为 index-keyed 语义 12 个 describe 36 个 case 覆盖 initial / 纯 append / slot rewrite / compression-window / /clear / /compact / 异 user / transient / 多 session / streaming dedup / edge cases / _cacheGen 进度
+  - **可观测**：保留 `recordEvent('sessionMerge.slotRewrite' / 'sessionMerge.slidingWindow' / 'sessionMerge.postCompactCheckpoint')` + `recordWarning('sessionMerge.multiSlotRewrite')`（多 slot 同时改写罕见，便于 console 排查）
+  - 1663/1663 pass + build OK
+
+- chore(diagnostics): 调试日志策略重构 — 新建集中式诊断模块替代分散 TS-DEBUG console.log
+  - **背景**：流式 mainAgent rebuild + cache staleness 系列排查中分散加了 14 处 `__TS_DEBUG__` 守卫的 console.log，每帧 stream-progress 至少 4-7 行，长会话开 `__TS_DEBUG__=true` 几秒刷千行；plan step 9 全删又会失去诊断手段——本次重构解决这对矛盾
+  - **新模块** `src/utils/diagnostics.js`：三层抽象
+    - `recordEvent(type, payload?)` — 永久累加 counter（零 console 开销），仅 `__TS_DEBUG__=true` 时写 ring buffer (≤500 条) + console.log
+    - `recordWarning(type, payload)` — 始终持久化 warning array (≤200 条) + `console.warn`，不依赖 `__TS_DEBUG__` 开关
+    - 全局桥接 `window.__CCV_DIAG__` 暴露 `events()/counters()/warnings()/summary()/clear()` 让用户在 DevTools Console 一行查现状
+  - **改造覆盖**：`src/utils/sessionMerge.js` 10 处 + `src/AppBase.jsx` 3 处 + `src/components/ChatView.jsx` 5 处 全部迁移到 recordEvent / recordWarning
+    - 关键事件转 event：`sessionMerge.append.{incremental-append|head-not-aligned-rebuild}` / `sessionMerge.shrink.{compression-window-keep|non-subset-rebuild}` / `sessionMerge.equal-len.{full-rewrite-rebuild|prefix-overlap-append|append-all-fallback}` / `sessionMerge.postClearCheckpoint` / `chatView.cacheInvalidate` / `chatView.subAgentInserted` / `appBase.processEntries` 等
+    - 异常信号转 warning（始终 console.warn 让用户能直接看到，无需开 `__TS_DEBUG__`）：
+      - `sessionMerge.alignedHeadDrift` — 70% 阈值放过的 push 错位（用户曾实测 alignedHead=154 currentLen=171 drift=17 仍走 push 的死角）
+      - `chatView.subAgentDropped` — subAgent 因 nextSessionStart 截断（"卡片消失"症状的强信号）
+      - `appBase.timestampsReset` — 中间态 entry 误判新会话起点导致 timestamp 倒退（曾踩过的坑）
+    - 高频低价值打点删除：sessionMerge enter dump 大对象 / AppBase _processEntries START/END sessionsSnapshot / ChatView session loop iteration（每 si 每帧打）
+  - **测试**：新增 `test/diagnostics.test.js` 14 case 覆盖 counter 累加 / ring buffer 限制（500/200）/ payload undefined 边界 / `__TS_DEBUG__` 开关行为 / 全局桥接 API 不可外部 mutate / clear() 重置
+  - **使用**：用户在 DevTools Console 一行命令观测：`window.__CCV_DIAG__.summary()` 看 counter 分布 + warning 摘要 / `.warnings().slice(-10)` 看最近 10 条异常 / `.events()` 看最近 500 条详细事件（仅 __TS_DEBUG__ 开启时填充）
+  - 1681/1681 pass
+
+- fix(streaming-rebuild-cache-staleness): 流式 mainAgent rebuild 后 UI 显示陈旧内容根本性修复 — sessionMerge 与 ChatView cache 协议从矛盾变一致
+  - **问题**：流式期间 CLI 触发 mainAgent 消息整段改写（SUGGESTION MODE → teammate-message / TeamDelete 历史重组）时，尽管 sessionMerge.js 双层 head-alignment guard 已触发 `full-rewrite-rebuild`，用户在浏览器仍看到旧内容
+  - **真因**（3 个并行 Explore agent 调研 + 3 个 review agent 反馈）：
+    1. `src/utils/sessionMerge.js:131/164/240` 3 处 rebuild 路径做 `lastSession.messages = newMessages` —— 仅 mutate session 对象的 messages 属性，不替换 session 对象本身的 ref
+    2. `src/components/ChatView.jsx:587-602 sessionsActuallyChanged` 用 `prev[i] !== next[i]` 判 session ref 变化，rebuild 后 ref 不变 → 三大 cache（_sessionItemCache/_incToolState/_reqScanCache）都不清
+    3. `ChatView.jsx:1676` FULL HIT cache key `sc.session === session && sc.msgsLen === session.messages.length` 在 rebuild + msgsLen 不变时永远命中陈旧 sc.items
+    4. `ChatView.jsx:1138-1147` _incToolState fallback 永久污染漏洞：rebuild 后新 messages ref → fallback 用旧 _incToolState append 新数组尾段 → `setToolResultCache(messages, staleState)` 把脏数据写回新 messages 的 WeakMap，无机制能清
+    5. 派生 byKey map 7 个字段（`_mergedPlanApprovalMapByKey` 等）在 sessionsActuallyChanged 路径未 reset
+    6. `sessionMerge.js:211` prefix-overlap shadow rewrite 死角：`if (overlap === 0)` 守卫让 alignedMatchCount 仅在 overlap=0 计算 → 巧合 newMessages[0]==curMsgs[N-1] 时 overlap=1 跳过 rewrite 检测 → push 翻倍
+  - **修复**：
+    - **sessionMerge 改造 0**：alignedMatchCount 无条件计算（去掉 `overlap===0` 守卫），决策优先级变 rebuild > prefix-overlap > append-all，修 prefix-overlap shadow 死角
+    - **sessionMerge 改造 A/B/C**：3 处 rebuild 路径改为 immutable replacement（`return [...prevSessions.slice(0,-1), {...lastSession, messages: newMessages, response, entryTimestamp}]`），提前 return 不 fall-through 到 L252-253 的 mutate 出口；incremental-append/prefix-overlap-append/compressionWindow subset 路径保留现有 mutation 优化
+    - **ChatView 改造 F.1**：构造函数加 `_incToolMessagesRef = null`
+    - **ChatView 改造 F.2/J**：`sessionsActuallyChanged` 路径 per-si 选择性失效（只清变化的 si，避免 si=N rebuild 让前面所有 si 整体重渲，性能 ~220ms → ~70ms 单帧）+ 同步 reset 7 个派生 byKey map（`_mergedPlanApprovalMapByKey/_prevPlanCacheByKey/_prevPlanDirtyByKey/_mergedAskAnswerMapByKey/_prevAskCacheByKey/_prevAskDirtyByKey/_prevAskLocalByKey`）+ active si 受影响时清 `_incToolState/_incToolMessagesRef`，否则跨 si 累积保留
+    - **ChatView 改造 F.3**：`renderSessionMessages` fallback 加 `sameRefAsLastUse = _incToolMessagesRef === messages` ref guard，rebuild 后 messages ref 变 → 强制 createEmptyToolState，避免 stale state 写回新 messages 的 WeakMap key 永久污染；WeakMap 命中早返路径故意不更新 _incToolMessagesRef（命中说明 ref 未换）
+  - **测试**：`test/incremental-merge.test.js` 6 处 rebuild case 追加 session ref 不等断言；新增 8 个 case 覆盖改造 0（rebuild 优先级 + append-all fallback 对照）/ 改造 H 边界（A3 短对话 currentLen<4 / A4 70% 边界 ±1 / C3 70% 阈值 ±1 / C4 绝对底 4）/ 改造 I（prefix-overlap-append ref 稳定）；1667/1667 pass
+  - **回滚路径**：完整回滚 `git checkout HEAD -- src/utils/sessionMerge.js src/components/ChatView.jsx test/incremental-merge.test.js`；部分回滚优先 revert ChatView（保留 sessionMerge immutable，sessionsActuallyChanged 仍能触发清缓存）；不要单独 revert sessionMerge（留半截 bug）
+
+- fix(teammate-detector): teammate 渲染不稳定 — 同一个 teammate 的 N 次 API call 有的标 "Teammate: 名字" 有的标 "SubAgent" 交替闪烁；根因：SDK Agent 的"嵌套工具调用"（teammate 内部 Bash/Read/Grep）API 请求里 tools 数组只剩那一个被调用的工具，SendMessage **不在里面**，前端 `isNativeTeammate` 严格按"system 含 'You are a Claude agent' + tools 含 SendMessage" 判据 → 嵌套调用全部降级为 SubAgent
+  - `src/utils/teammateDetector.js` 加 sticky 名字缓存 `_knownTeammateNames` (Set<name>)：teammate 顶层调用（含 SendMessage）一旦确认就把 `extractNativeTeammateName` 提出的名字记入 Set，之后**无 SendMessage 但同名**的嵌套调用也归 teammate；严格 SendMessage 检查首先把"从未见过的 SubAgent"挡在第一关，sticky 只补救"已确认 teammate"的后续调用，不会把 SubAgent 误升级（顺序保证：jsonl 按 timestamp 写，teammate 顶层调用必然先于该 teammate 任何嵌套工具调用，前端按时序处理 requests 名字必然先入库再被嵌套查询）
+  - `src/utils/teammateDetector.js` 新增 `resetTeammateNameCache()` 公开 API：用户切项目想避免名字残留误判时调用；测试用例之间隔离也用这个；现有 WeakMap req-cache 不动，sticky cache 是平行的二级缓存
+  - `test/native-teammate-detector.test.js` 加 4 case：(1) 顶层 teammate 注册名字后同名嵌套调用也识别为 teammate；(2) 未注册名字的 SubAgent 仍判 false（防误升级）；(3) reset 后 sticky 失效；(4) sticky 不污染主 agent 判定（主 agent system 不命中 NATIVE_TEAMMATE_RE 第一关就 return false 不进 sticky）
+  - **review pass** 复审采纳：(A1) `resetTeammateNameCache()` 接入 `src/AppBase.jsx` 的 `workspace_started` / `workspace_stopped` 事件 — 防用户切项目（不刷页面）时旧项目 teammate 名字残留命中新项目 SubAgent 误升级；同时把 `_cache` (WeakMap) 也整体替换为新实例（`let` 而非 `const`），避免老 req 上的 false 缓存遗留遮挡新判定；(D) ChatMessage isEmpty 注释从 5 行 trim 到 2 行，符合 CLAUDE.md "默认不写注释"；(E) sticky cache 头注释加 TODO 标记长远应在 server.js / sdk-manager 层补齐 req.teammate 后整体删除本前端补丁
+
+- fix(chat-empty-content): ChatMessage `renderSubAgentChatMessage` innerContent 空时 return null 让消息从 UI 上凭空消失（不是折叠是不存在）；触发条件：response.body.content 全是 tool_use（无 text）+ collapseToolResults=true + tool 不在 Full-Display 白名单时 renderAssistantContent 返回空数组
+  - `src/components/ChatMessage.jsx` 改为保留 label + timestamp + view 按钮的外壳，bubble 渲染 `(no displayable content)` 占位让用户至少看到这次 API call 发生过、能点 [view] 看原始请求
+  - `src/i18n.js` `ui.subAgentEmptyContent` 18 语全译（zh "（无可显示内容）"/zh-TW/en/ja/ko/de/es/fr/it/da/pl/ru/ar/no/pt-BR/th/tr/uk）
+
+## 1.6.248 (2026-05-08)
+
+- fix(ask-orphan-badge): cc-viewer 现在能识别"被 CLI schema 校验拒收"的孤儿 AskUserQuestion——在 jsonl 渲染层加红色徽章 "❌ 此提问被 CLI 拒绝（schema 校验失败，未能投递到底层会话）" + 可展开"查看原始错误"折叠区显示完整 `<tool_use_error>InputValidationError…` 文本，让用户一眼区分 (a) 自己拒了 / (b) model 调用本身被 CLI 拒。背景：经 5-agent ask-robustness 团调研，根因是 `~/claude-code/tools/AskUserQuestionTool/AskUserQuestionTool.tsx:16` 的 `description: z.string()`（runtime 必填）经 `zodToJsonSchema` 应输出 `required:["label","description"]`，但 model 实际收到的 JSON schema 只有 `["label"]`——emission 与 validation 间存在某层 schema-rewrite（claude-code post-process / Anthropic 后端 well-known tool 处理 / 版本飘移待 follow-up 厘清），cc-viewer 永远无法在 PreToolUse hook 之前介入（toolExecution.ts:615 safeParse 在 toolHooks.ts:800 runPreToolUseHooks 之前执行，失败直接返 InputValidationError，ask-bridge 永不 spawn），只能在渲染层把症状暴露给用户。改动：(1) `src/utils/toolResultBuilder.js` 新增 `isInputValidationError = isError && /InputValidationError|<tool_use_error>/i.test && !isPermissionDenied`，挂到 toolResultMap entry 与已有 isPermissionDenied/isUltraplan 并列；(2) 抽 `src/components/AskValidationBadge.jsx` 单文件组件（接收 `resultText` prop，含展开 `<details>` 显示原文），`src/components/ChatMessage.jsx:437-470` AskUserQuestion 分支读 `toolResultMap[tu.id].isInputValidationError` 取 resultText，走交互/recap 任一路径前都渲染该组件去重；(3) `src/components/ChatMessage.module.css` 新增 `.askValidationErrorBadge / Title / Details / RawText` 样式（红色 token + monospace 折叠 pre）；(4) `src/i18n.js` 新增 `ui.askValidationErrorBadge` + `ui.askValidationErrorRaw` 18 语全译；(5) 兜底 normalize：`lib/ask-bridge.js:63` 解析 questions 后对 options[].description 缺失补 `""`（防 schema 修了但 hook 还在迁移期），`server.js:2319` POST /api/ask-hook 镜像同样的 normalize 覆盖 plugin/SDK 等非 ask-bridge client。配合上一条 fix-ask-submit-failure-modal 的 antd Modal 升级，构成"渲染层显式标错 + 用户提交时 modal 解释 + ask-bridge 兜底 normalize"三层防御
+- fix(ask-submit-failure-modal): AskUserQuestion 提交失败时把 `message.warning` toast 升级为 antd `Modal.warning`，给用户更显著的反馈与原因说明。背景：当 ask 在 API 层就被 `InputValidationError` 拒绝（如 Claude Code 的 zod schema `description: z.string()` 必填但 zodToJsonSchema 输出 `required:["label"]` 只——assistant 按文档省略 description 即触发），底层 CLI 从未拿到 PreToolUse hook，cc-viewer 仍按 jsonl 里的 tool_use 渲染成可交互表单，用户点提交 → `_submitViaSequentialQueue` 检 `state.ptyPrompt` 不是合法 ask → `_abortAskSubmitWithRollback` 回滚乐观写入 + 弹 toast。toast 文字小、停留短，用户难以判断症状是临时网络/服务问题还是 ask 本身死了。改动：`src/components/ChatView.jsx:_abortAskSubmitWithRollback` 把 `message.warning(t('ui.askSubmitRetryHint'))` 替换为 `Modal.warning({ title, content })`，title 复用现有 `ui.askSubmitRetryHint`（"提交未送达，请重试"），content 用新 i18n key `ui.askSubmitFailedDetail` 写明 3 大原因（CLI 层拒绝 / WS 暂断 / hook bridge 未就绪）+ 下一步建议；底部加一行 `[reason] {abortReason}` 暴露技术码（ws-not-open / pty-prompt-invalid / ws-send-failed）便于排障。`src/i18n.js` 新增 `ui.askSubmitFailedDetail` 18 语全译。配套保持 `toolResultBuilder.js:181` 原 `isPermissionDenied` 判据不动——errored ask 仍渲染成可交互表单，让用户主动尝试提交触发 modal，而不是被 cc-viewer 静默标 rejected
+- refactor(ask-question-form): AskUserQuestion `options[].description` schema 标记可选，cc-viewer 现有 5 处访问点（AskQuestionForm.jsx 4 处 + ChatMessage.jsx 1 处）原本各自内联 `opt.description && ...` / 三元 `opt.description ? \`${label}: ${desc}\` : label`，逻辑重复且无单测兜底；本机 jsonl 已确认 4 条 description 缺失的真实样本（2026-05-07）。抽出 `src/utils/askOptionDesc.js` 暴露 `optionAriaLabel(opt)` + `hasOptionDescription(opt)` 两个纯 helper：前者用 `String(opt.label)` 对齐原 JSX 模板字面量在 number label（如 `123`）下的渲染，避免误退化为空串丢 a11y；后者 `Boolean(opt && opt.description)` 与原 `&&` falsy 判定严格等价。`AskQuestionForm.jsx` 4 处 + `ChatMessage.jsx` 480 行全部切到 helper，`grep 'opt.description'` 后只剩纯值取用、不再有判断式。`test/askOptionDesc.test.js` 7 case 锁定 falsy/truthy 集合（含 whitespace/数字/对象/数组）+ number label 强转 + 空 opt 边界
+- fix(ask-hook): 多并发 AskUserQuestion 时上一个未答的会卡死下一个 — 单槽 → Map<id> 多路复用
+  - 现象：`pendingAskHook` 是单变量，第二个 ask-bridge POST 进来时 server.js:2324 直接 409 Superseded 老的，老 bridge 进程降级到终端 UI（`lib/ask-bridge.js:131-134` exit 0 fallback）；前端 `pendingAsk` 同时被覆盖，UI 上下一个 ask 也答不出来
+  - 对照 perm-hook（`pendingPermHooks` Map + 队列 + id 寻址）和 SDK Plan（`_pendingApprovals` Map + 5min 独立 timeout）—— 这两条路径一直是健壮的多路复用，只有 ask-hook 是单槽。本次让 ask-hook 抄齐 perm-hook 的形态
+  - `server.js` `pendingAskHook` 单变量 → `pendingAskHooks = new Map()` + `ASK_HOOK_MAP_MAX = 50` 一致防 OOM；`/api/ask-hook` POST 不再 supersede 前一个，改为生成 `id = ask_${ts}_${rand}` + cap 满时驱逐最老（429）+ 每 entry 独立 5min timer + `res.on('close')` 按 id 清理；广播 `ask-hook-pending`/`ask-hook-resolved`/`ask-hook-timeout` 全部带 `id`，与 `_notifyParentPending` 已有的 `msg.id != null ? String(msg.id) : '__ask__'` 路径打通（`server.js:141`）让 Electron tab worker `pendingByTab[tabId].ask` Map 按 id 多路复用（`electron/main.js:148, 199, 473-475, 667` 早就支持 id-keyed，这次 server 终于配齐）
+  - WS `ask-hook-answer` handler 加 `msg.id` 寻址；无 id 时 fallback 到 Map 第一个 entry（保留旧前端兼容路径）；plugin interaction `getPendingAsk()` 保留单数 shim（返回 first），新增 `getPendingAsks()` 返回数组，`resolveAsk` 重载 `(id, answers)` 强类型 + 单参 legacy `(answers)` fallback
+  - `src/components/ChatView.jsx` 加 `askQueue: []` 状态镜像 `permissionQueue`：`ask-hook-pending`/`sdk-ask-pending` 到达时如 head 已占用就入队（按 id 去重防 WS 重连重投），entry 形如 `{ id, questions, kind: 'hook'|'sdk' }`；新 `_promoteNextAskFromQueue` helper 在 head 解析（resolved/timeout）时弹下一个并同步 `_askHookActive`/`_sdkAskId`/`_askHookQuestions` 三个路由 instance 字段（kind=sdk 走 SDK 路径、kind=hook 走 hook bridge 路径）；`handleAskQuestionSubmit` 改为乐观推进队列（不再 `pendingAsk: null` 一刀切）；`_submitViaHookBridge(answers, explicitHeadId)` 新增 id 参数，`ask-hook-answer` payload 现在带 `id`（`__ask__` 占位仅旧 server 兼容时跳过）
+  - `componentWillUnmount` 把 `state.askQueue` 也通过 `window.tabBridge.notifyAskResolved` 逐个清掉，否则 Electron `pendingByTab[tabId].ask` Map 残留导致 dock badge / flashFrame 状态不归零；ws-close 状态恢复路径（`_onTerminalWsState`）也清 askQueue
+  - `lib/ask-bridge.js` 完全不动：bridge 对 id 不可知，发 POST 等回包，id 是 server 内部寻址用
+  - `test/server-ask-hook-map.test.js` 2 case：两 POST 并发都不 409 supersede（核心 regression guard，旧单槽实现下首请求会被服务端 409 close）+ 空 questions[] 400 验证；workspace 模式无 WS server，故纯 HTTP 验证
+  - **review pass** 复审采纳：(1) `pendingAskHooks.has(id)` collision guard 防 30bit 熵碰撞下 `Map.set` 静默覆盖泄漏 res；(2) `lib/ask-bridge.js` 区分 HTTP 429（cap 满驱逐）与其他 4xx，stderr 显式日志；(3) `LEGACY_ASK_PLACEHOLDER_ID` 常量化（5 处 `'__ask__'` 字面量）+ `ASK_KIND.HOOK/SDK` 常量化（3 处 `kind: 'hook'/'sdk'`）；(4) `sdk-ask-pending` 缺 id 改 `console.warn` 显式上报防御 invariant 违反；(5) 删 `getPendingAsks()` 之外的单数 `getPendingAsk()` shim + `resolveAsk(idOrAnswers, answersOrUndef)` 重载，强类型只剩 `resolveAsk(id, answers)`
+  - 1635/1635 pass（包含 sticky teammate cache 4 个新 case）
+
 ## 1.6.247 (2026-05-07)
 
 - chore(perm-bridge): `git commit` / `git push` 退出硬拦截白名单，仅 `npm publish` 仍走 Web UI 强制审批
