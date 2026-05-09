@@ -347,11 +347,17 @@ async function handleRequest(req, res) {
   // 要求用户每次手动设 CCV_ALLOWED_HOSTS 不可接受。token 仍是必需(server.js:300-310 ACCESS_TOKEN gate),
   // DNS rebinding 攻击者需精确知道用户 LAN IP 才能利用,门槛降低但不增新攻击面;Vite/Cursor 同行也默认放开 LAN。
   // CCV_ALLOWED_HOSTS 显式设(包括 '*' 关闭防护)时完全沿用用户值,与 1.6.227 行为一致,向后兼容。
+  // CCV_EXTRA_ALLOWED_HOSTS 用于在默认/CCV_ALLOWED_HOSTS 基础上追加额外 host(如内网穿透外网地址),不影响原有列表。
   // 静态资源和 OPTIONS 预检不挡。
   if (!isStaticAsset && method !== 'OPTIONS') {
+    const defaultHosts = ['localhost', '127.0.0.1', '::1', '[::1]', ...getAllLocalIps()];
     const allowedHosts = process.env.CCV_ALLOWED_HOSTS
       ? process.env.CCV_ALLOWED_HOSTS.split(',').map(s => s.trim()).filter(Boolean)
-      : ['localhost', '127.0.0.1', '::1', '[::1]', ...getAllLocalIps()];
+      : [...defaultHosts];
+    if (process.env.CCV_EXTRA_ALLOWED_HOSTS && !allowedHosts.includes('*')) {
+      const extras = process.env.CCV_EXTRA_ALLOWED_HOSTS.split(',').map(s => s.trim()).filter(Boolean);
+      allowedHosts.push(...extras);
+    }
     if (!allowedHosts.includes('*')) {
       const hostHeader = (req.headers.host || '').toLowerCase();
       // 端口剥离:RFC 3986 要求 IPv6 Host 必须带 brackets `[::1]:port`,bare `::1` 末尾 `\d` 会被错剥成 `:`。
