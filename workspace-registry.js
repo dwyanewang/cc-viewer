@@ -1,5 +1,6 @@
 // Workspace Registry - 工作区持久化管理
-import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync, readdirSync, openSync, closeSync, renameSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync, readdirSync, openSync, closeSync, unlinkSync } from 'node:fs';
+import { renameSyncWithRetry } from './lib/file-api.js';
 import { join, basename, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { LOG_DIR } from './findcc.js';
@@ -69,19 +70,9 @@ export function saveWorkspaces(list) {
     mkdirSync(LOG_DIR, { recursive: true });
     writeFileSync(tmpFile, JSON.stringify({ workspaces: list }, null, 2));
     
-    // Windows 上 renameSync 可能会因为目标文件存在或被占用而失败
-    // 简单的重试机制
-    let retries = 3;
-    while (retries > 0) {
-      try {
-        renameSync(tmpFile, getWorkspacesFile());
-        break;
-      } catch (err) {
-        if (retries === 1) throw err;
-        retries--;
-        sleep(20);
-      }
-    }
+    // Windows 上 renameSync 可能会因为目标文件存在或被占用而失败。统一走 lib/file-api.js
+    // renameSyncWithRetry helper（同款重试策略，跟 interceptor / log-management 一致）。
+    renameSyncWithRetry(tmpFile, getWorkspacesFile());
   } catch (err) {
     console.error('[CC Viewer] Failed to save workspaces:', err.message);
     // 尝试清理临时文件
@@ -101,7 +92,10 @@ export function registerWorkspace(absolutePath) {
     const resolvedPath = resolve(absolutePath);
     const projectName = basename(resolvedPath).replace(/[^a-zA-Z0-9_\-\.]/g, '_');
     const list = loadWorkspaces();
-    const existing = list.find(w => w.path === resolvedPath);
+    // Windows NTFS 不分大小写——`C:\App` 跟 `c:\app` 是同目录但 `===` 视为不同。
+    // 仅 Win 下小写化比较；POSIX 保持原样不引入回归。
+    const pathEq = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+    const existing = list.find(w => pathEq(w.path, resolvedPath));
     if (existing) {
       existing.lastUsed = new Date().toISOString();
       existing.projectName = projectName;

@@ -202,9 +202,12 @@ function injectCliJs() {
   if (content.includes(INJECT_START)) {
     return 'exists';
   }
-  const lines = content.split('\n');
+  // 保留主导 EOL：若原文件 CRLF，注入完仍 CRLF（否则 split('\n')+join('\n') 会把 Win 文件
+  // 一次性转 LF，git/编辑器抱怨混合行尾且对哈希签名敏感的脚本可能失效）。
+  const eol = content.includes('\r\n') ? '\r\n' : '\n';
+  const lines = content.split(/\r?\n/);
   lines.splice(2, 0, INJECT_BLOCK);
-  writeFileSync(cliPath, lines.join('\n'));
+  writeFileSync(cliPath, lines.join(eol));
   return 'injected';
 }
 
@@ -379,9 +382,16 @@ async function runCliMode(extraClaudeArgs = [], cwd, noOpen = false) {
   const url = `${protocol}://127.0.0.1:${port}`;
   if (!noOpen) {
     try {
-      const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
-      const { execSync } = await import('node:child_process');
-      execSync(`${cmd} ${url}`, { stdio: 'ignore', timeout: 5000 });
+      // URL 含 & 在 cmd.exe 下会被当命令分隔符切断 query；用 spawn 数组传参避免 shell interpolation。
+      // Win 上 `start` 是 cmd.exe 内置不是 .exe，必须 shell:true；用 spawn + 数组让 Node 自己 escape。
+      // 第二个 arg '""' 是 `start` 的 window-title 占位（否则 start 会把 URL 当 title）。
+      const { spawn } = await import('node:child_process');
+      if (process.platform === 'win32') {
+        spawn('cmd.exe', ['/c', 'start', '""', url], { stdio: 'ignore', detached: true, windowsHide: true }).unref();
+      } else {
+        const cmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
+        spawn(cmd, [url], { stdio: 'ignore', detached: true }).unref();
+      }
     } catch {}
   }
 
@@ -474,9 +484,16 @@ async function runSdkMode(extraClaudeArgs = [], cwd, noOpen = false) {
   const url = `${protocol}://127.0.0.1:${port}`;
   if (!noOpen) {
     try {
-      const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
-      const { execSync } = await import('node:child_process');
-      execSync(`${cmd} ${url}`, { stdio: 'ignore', timeout: 5000 });
+      // URL 含 & 在 cmd.exe 下会被当命令分隔符切断 query；用 spawn 数组传参避免 shell interpolation。
+      // Win 上 `start` 是 cmd.exe 内置不是 .exe，必须 shell:true；用 spawn + 数组让 Node 自己 escape。
+      // 第二个 arg '""' 是 `start` 的 window-title 占位（否则 start 会把 URL 当 title）。
+      const { spawn } = await import('node:child_process');
+      if (process.platform === 'win32') {
+        spawn('cmd.exe', ['/c', 'start', '""', url], { stdio: 'ignore', detached: true, windowsHide: true }).unref();
+      } else {
+        const cmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
+        spawn(cmd, [url], { stdio: 'ignore', detached: true }).unref();
+      }
     } catch {}
   }
 
@@ -538,9 +555,16 @@ async function runCliModeWorkspaceSelector(extraClaudeArgs = [], noOpen = false)
   const url = `${wsProtocol}://127.0.0.1:${port}`;
   if (!noOpen) {
     try {
-      const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
-      const { execSync } = await import('node:child_process');
-      execSync(`${cmd} ${url}`, { stdio: 'ignore', timeout: 5000 });
+      // URL 含 & 在 cmd.exe 下会被当命令分隔符切断 query；用 spawn 数组传参避免 shell interpolation。
+      // Win 上 `start` 是 cmd.exe 内置不是 .exe，必须 shell:true；用 spawn + 数组让 Node 自己 escape。
+      // 第二个 arg '""' 是 `start` 的 window-title 占位（否则 start 会把 URL 当 title）。
+      const { spawn } = await import('node:child_process');
+      if (process.platform === 'win32') {
+        spawn('cmd.exe', ['/c', 'start', '""', url], { stdio: 'ignore', detached: true, windowsHide: true }).unref();
+      } else {
+        const cmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
+        spawn(cmd, [url], { stdio: 'ignore', detached: true }).unref();
+      }
     } catch {}
   }
 

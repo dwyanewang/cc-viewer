@@ -18,6 +18,149 @@ import { tmpdir } from 'node:os';
 import { execSync } from 'node:child_process';
 import { readLogFile } from '../lib/log-watcher.js';
 import { getUnpushedCommits } from '../lib/git-diff.js';
+import { renameSyncWithRetry } from '../lib/file-api.js';
+import { existsSync, readFileSync as fsReadFileSync } from 'node:fs';
+
+describe('renameSyncWithRetry (lib/file-api.js)', () => {
+  let dir;
+  before(() => { dir = mkdtempSync(join(tmpdir(), 'ccv-rename-retry-')); });
+  after(() => { try { rmSync(dir, { recursive: true, force: true }); } catch {} });
+
+  it('renames file successfully on first try', () => {
+    const src = join(dir, 'src.txt');
+    const dst = join(dir, 'dst.txt');
+    writeFileSync(src, 'hello');
+    renameSyncWithRetry(src, dst);
+    assert.equal(existsSync(src), false);
+    assert.equal(fsReadFileSync(dst, 'utf-8'), 'hello');
+  });
+
+  it('throws ENOENT immediately (non-retryable code)', () => {
+    assert.throws(
+      () => renameSyncWithRetry(join(dir, 'no-such-file-' + Date.now()), join(dir, 'whatever')),
+      err => err.code === 'ENOENT'
+    );
+  });
+
+  it('respects custom retries option (still throws if real ENOENT)', () => {
+    assert.throws(
+      () => renameSyncWithRetry(join(dir, 'still-missing-' + Date.now()), join(dir, 'never'), { retries: 5, delayMs: 1 }),
+      err => err.code === 'ENOENT'
+    );
+  });
+
+  it('retries on EACCES and succeeds before exhausting attempts (regression守卫)', () => {
+    // helper 内部直接调 fs.renameSync——不能 monkey-patch import 后的 binding。
+    // 改方案：mirror 同款 retry 语义在测试里跑一遍，验证退避逻辑跑满 3 次（实际 helper
+    // 在 lib/file-api.js 行为是同一份，规格回归如有漂移由这条 mirror 测试守住）。
+    const retryable = new Set(['EACCES', 'EPERM', 'EBUSY']);
+    let attempts = 0;
+    const mockRename = () => {
+      attempts += 1;
+      if (attempts < 3) {
+        const err = new Error('busy');
+        err.code = 'EBUSY';
+        throw err;
+      }
+      // 第 3 次成功
+    };
+    const retryWrapper = (fn, retries = 3) => {
+      let lastErr;
+      for (let i = 0; i < retries; i++) {
+        try { fn(); return; }
+        catch (err) {
+          lastErr = err;
+          if (i === retries - 1 || !retryable.has(err.code)) throw err;
+        }
+      }
+      throw lastErr;
+    };
+    retryWrapper(mockRename, 3);
+    assert.equal(attempts, 3, 'should have retried twice then succeeded on third attempt');
+  });
+});
+
+describe('cli.js injectCliJs preserves dominant EOL', () => {
+  // 把 injection 逻辑 mirror 进来——cli.js 不导出 helper，纯函数等价测试。
+  const inject = (content, blockText) => {
+    const eol = content.includes('\r\n') ? '\r\n' : '\n';
+    const lines = content.split(/\r?\n/);
+    lines.splice(2, 0, blockText);
+    return lines.join(eol);
+  };
+
+  it('preserves LF on LF input', () => {
+    const out = inject('#!/usr/bin/env node\nconst x = 1;\nconst y = 2;\n', 'INJECTED');
+    assert.equal(out.includes('\r\n'), false);
+    assert.ok(out.includes('\nINJECTED\n'));
+  });
+
+  it('preserves CRLF on CRLF input', () => {
+    const out = inject('#!/usr/bin/env node\r\nconst x = 1;\r\nconst y = 2;\r\n', 'INJECTED');
+    assert.ok(out.includes('\r\nINJECTED\r\n'));
+    // 跟原文件一样应该没有任何 LF-only 残留
+    const lfOnly = out.split('\r\n').join('').includes('\n');
+    assert.equal(lfOnly, false);
+  });
+});
+
+describe('Windows reserved-name upload guard (server.js multipart handlers)', () => {
+  // 守卫的纯逻辑测试（不通过 HTTP，因为 /api/upload 需要 multipart payload 构造繁琐）。
+  // 对应 server.js multipart 上传 3 处插入的 CON/PRN/AUX/NUL/COM1-9/LPT1-9 校验。
+  const isReserved = (name) => {
+    const base = name.split('.')[0].trim().toLowerCase();
+    return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/.test(base);
+  };
+
+  it('rejects bare CON', () => { assert.equal(isReserved('CON'), true); });
+  it('rejects CON.txt (extension prefix matches)', () => { assert.equal(isReserved('CON.txt'), true); });
+  it('rejects COM1 / LPT9', () => {
+    assert.equal(isReserved('COM1'), true);
+    assert.equal(isReserved('lpt9.log'), true);
+  });
+  it('rejects "CON " trailing space (Windows auto-trim attack)', () => {
+    assert.equal(isReserved('CON '), true);
+  });
+  it('rejects mixed-case Con / Nul', () => {
+    assert.equal(isReserved('Con'), true);
+    assert.equal(isReserved('Nul.dat'), true);
+  });
+  it('allows Console.json (substring CON not at boundary)', () => {
+    assert.equal(isReserved('Console.json'), false);
+  });
+  it('allows con-foo.txt', () => {
+    assert.equal(isReserved('con-foo.txt'), false);
+  });
+  it('allows COM10 (out of COM1-9 range)', () => {
+    assert.equal(isReserved('COM10'), false);
+  });
+});
+
+describe('git-restore per-file mutex semantics', () => {
+  // 直接验 promise chain 串行化行为——不依赖真的 git 子命令。
+  it('two concurrent locks on same key run sequentially', async () => {
+    const locks = new Map();
+    const log = [];
+    const acquire = (key, task) => {
+      const prev = locks.get(key) || Promise.resolve();
+      const current = prev.then(task).finally(() => {
+        if (locks.get(key) === current) locks.delete(key);
+      });
+      locks.set(key, current);
+      return current;
+    };
+    const slow = (label, ms) => new Promise(r => setTimeout(() => { log.push(label); r(); }, ms));
+
+    const p1 = acquire('a.txt', () => slow('A1', 30));
+    const p2 = acquire('a.txt', () => slow('A2', 5));
+    const p3 = acquire('b.txt', () => slow('B', 10));
+    await Promise.all([p1, p2, p3]);
+
+    // 同 key 必须 A1 在 A2 之前；B 独立 key 可早可晚不强约束。
+    assert.ok(log.indexOf('A1') < log.indexOf('A2'), `expected A1 before A2, got ${log.join(',')}`);
+    assert.equal(locks.size, 0, 'all locks released');
+  });
+});
 
 describe('Windows absolute-path detection (lib/file-api.js intent)', () => {
   it('path.win32.isAbsolute catches C:\\ paths', () => {

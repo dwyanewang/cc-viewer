@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.6.259 (2026-05-11)
+
+- fix(mobile): 移动端开启 Terminal 后权限审批 modal 飞出屏幕根治
+  - **症状**：mobile 视图（窄屏 < 768px、非 pad-mode）下，用户点击 Terminal 切到终端视图后，工具调用触发的「权限审批」浮层（`ToolApprovalPanel` `.panelGlobal`）位置跳到屏幕外几乎看不见；未切 Terminal 时 modal 位置正常。
+  - **根因**：`src/components/ChatInputBar.jsx` 内 `useLayoutEffect` 依赖数组为 `[]`，仅 mount 时跑一次并捕获闭包内的 `el = rootRef.current`。ChatInputBar 在 `terminalVisible=true` 时短路 `return null`（line 201-209），`<div ref={rootRef}>` 不再渲染，React 把 `rootRef.current` 置 null 卸载旧 DOM。但 `[]` 依赖让 cleanup 不触发，已注册的 `ResizeObserver(el)` + `visualViewport.resize` + `window.resize` 三个监听仍持闭包旧 `el` 引用。开 Terminal 时 `.mobileChatOverlay` 的 `transform: translateX(0)` transition / iOS 软键盘 / 浏览器工具栏抖动均触发 `visualViewport.resize`，setVar 对脱离 DOM 的 el 调 `getBoundingClientRect()` 返回 `{top:0,...}`（HTML spec：detached 节点无 layout box，rect 全 0），让 `distFromBottom = vh - 0 = vh`（≈800px），写入 `--chat-input-bar-height: 800px`，`.panelGlobal` 的 `bottom: max(calc(800+12), 56) = 812px` 把 modal 顶到视口顶部外 800px → 看不见。**经典 React effect stale closure + DOM 卸载竞态**，与 `mobileChatOverlay.transform` 创建 stacking context 无关（modal 已主动渲染在 `mobileCLIBody` 之外避开 transform 影响）。
+  - **修复（src/components/ChatInputBar.jsx:56-106，仅 1 文件）**：
+    1. effect 依赖 `[]` → `[terminalVisible]`，切换 Terminal 时旧 ResizeObserver / vv listener / window listener 正确 cleanup，新 effect 拿到当前 `rootRef.current`。**注意**：真正 unmount（ChatView 离开 / workspace 切换）走的还是 React 标准 cleanup 路径，旧的「unmount 时保留 var 最后值不清除」FOUC 防护（v1.6.176 引入）依然保留；新加的 removeProperty 只发生在 `el === null` 的 toggle 分支，即输入栏确实不在 DOM 的时刻——此时 fallback 200px 才是「正确」位置，不是 FOUC。
+    2. `el` 为 null 时（terminal 模式 ChatInputBar return null/chip）主动 `document.documentElement.style.removeProperty('--chat-input-bar-height')`，让 `.panelGlobal` 回退 fallback 200px（max() 兜底 56px），Terminal 模式下 modal 自然贴底 212px，正好让出 60px 虚拟键盘条 + 35px 工具栏 + ~117px 缓冲。
+    3. `setVar` 内新增双重防御：`!el.isConnected` 兜底 detached 节点；`rect.width === 0 && rect.height === 0` 兜底 display:none 祖先（attached 但无 layout box）—— 极端情况 RO / vv callback 在 el 卸载或祖先隐藏后的下一轮派发仍触发也不写脏值。
+    4. 顶部注释完整记录 stale-closure 根因与修复意图，留 trace 给后人（项目历史多次反复重构这块定位逻辑：v1.6.172 引入 var、v1.6.176 改 unmount 保留、v1.6.246 加 zoom 折算 + max() 兜底，trace 价值高于行数）。
+  - **测试**：`npm run build` 通过；`npm run test` 1891/1891 全绿；手动验证：chat 模式 modal 紧贴输入栏 12px，切 Terminal 后 modal 回到底部 212px 位置稳定，多次切换无累积错误，iPad/pad-mode 不受影响（pad-mode 用 `.panel` 非 `.panelGlobal`）。
+  - **5-人 UltraReview 采纳**：P2 (hooks-reviewer) display:none 祖先防御已加 rect w=h=0 check；P2 (quality-reviewer) setVar 内注释精简为 2 行，根因 trace 保留在顶部段；P3 (quality-reviewer) 措辞「microtask」改「下一轮派发」（ResizeObserver callback 实际在 sync layout 阶段，非 microtask；vv.resize 是普通 task）。**P1 (mobile-ux-reviewer) 不采纳，记 backlog**：切 Terminal 时如有 modal 存在会跳 ~130px（从贴输入栏 80px → fallback 212px）。两种 mitigation——加 `.panelGlobal { transition: bottom 0.3s }` 或 terminal 模式隐藏 modal——前者会破坏 iOS 键盘高频升降时 modal 即时跟随响应性（vv.resize 频率远高于 terminal 切换），后者改 modal 可见性策略影响面太大。当前从「飞出屏幕 800px 不可用」改善到「跳到 212px 可见且可操作」已是绝对改善，离散切换时的视觉跳跃属低频可接受 trade-off。
+
+## 1.6.258 (2026-05-11)
+
+- fix(windows): 广义 Windows 适配批 2 —— 4 安全洞 + FileExplorer 5 处 UX + 14 项杂项 + 5-agent UltraReview 采纳 P0/P1 单 PR 3 logical commit 落地
+  - **commit 1 安全 / 数据丢失 4 件**：
+    - `server.js:1853` `/api/delete-file` statSync → `lstatSync` 拒符号链——防 TOCTOU 攻击者把目标换 symlink 让 `rmSync` recursive 在 POSIX 上跟随删 cwd 外目录。defense-in-depth：rmSync 前 realpath 再校验关闭 lstat↔rmSync 间窗 swap。
+    - `server.js:1787-1801` `/api/move-file` EXDEV fallback 加 `lstatSync` 拒符号链——同款 TOCTOU 攻击向量，cpSync + rmSync 跟随路径。批 1 漏点修复。
+    - `server.js multipart 3 处` `/api/upload-image` `/api/import-file` `/api/import-skill` 加 Windows 保留名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）守卫——Windows 上 `writeFileSync(join(dir, 'CON'))` 戳物理设备 `\\.\CON` 而不是创建文件。`.trim()` 防 `CON ` 拖空格绕过（Windows API 自动 trim 尾随空格 / 句点都视为同名）。
+    - `server.js:134 gitRestoreLocks Map` per-file mutex + handler 3121-3138 promise chain 串行化「git status + checkout/clean」同 key 子命令对——多 tab 并发同文件 revert race 根治。finally 主清理 + setTimeout(30s).unref() 兜底防 finally 异常累积内存。lockKey 走 `resolve()` 规整 `./foo.js / foo.js` 同形态防绕过。
+  - **commit 2 FileExplorer 5 处 Modal.confirm fetch-fail silent close**：
+    - `src/components/FileExplorer.jsx:396/417/437/571/592` 5 处 Modal.confirm onOk 改 async/throw + `message.error` 显式提示——mirror #84 PR 的 `handleRestore` 同款修法，4xx/5xx 不再让弹窗静默关闭，throw 让 antd Modal.confirm 保住弹窗供重试。
+    - `src/i18n.js` 新增 3 个 i18n key × 18 locales（mirror restoreFailed 结构）：`ui.contextMenu.createFileFailed` / `createDirFailed` / `deleteFailed`。
+  - **commit 3 杂项 14 项**：
+    - `lib/file-api.js` export `renameSyncWithRetry(src, dst, opts?)` 共享 helper（EACCES/EPERM/EBUSY 限定 retry 3×20ms，其它 code 直接抛——窄于旧 inline retry）；`interceptor.js` / `lib/interceptor-core.js` / `lib/log-management.js` / `workspace-registry.js` 4 处 renameSync 调用统一接入。
+    - `workspace-registry.js:104` Windows NTFS 大小写不敏感：仅 Win 下 `pathEq` 小写化比较，POSIX 原样不变（避免重复 workspace 注册 `C:\App` vs `c:\app`）。**注意**：旧 `workspaces.json` 残留的大小写变体重复条目不自动迁移，用户首次发现可手动清理一次。
+    - `server.js:4299` `process.kill(pid, 'SIGWINCH')` 加 platform 守卫——Win 无 SIGWINCH，前面 `resizePty` 已跨平台处理 resize。
+    - `electron/main.js:135` 抽 `killChildEscalating(child, escalateMs=3000)` helper：Win 直接 `child.kill()` 走 `TerminateProcess` 立即结束（旧 SIGTERM noop 让 tab close 卡满 5s）；POSIX 保留 SIGTERM → 3s SIGKILL 升级。两处 IPC-disconnected 路径调用 helper。
+    - 路径字符串切片 5 处：`server.js:2883/3405` `absPath.split('/').pop()` → `basename()`；`server.js:1830` `toDir+'/'+name` → `join().replace(/\\/g,'/')` 响应 JSON 统一 POSIX 风格；`lib/log-management.js:142` `files.split('/')[0]` → `split(/[\\/]/)[0]`。
+    - Shell/spawn 4 处：`findcc.js:121/176` platform 分支 `where` vs `which`/`command -v` + realpath backslash → forward-slash normalize（regex 匹配统一）；`cli.js` 3 处 `execSync(\`${cmd} ${url}\`)` → `spawn` 数组防 `&` 截断（Win 走 `cmd /c start`）；`server.js:1964` `explorer /select` 合一个 arg + `windowsHide:true`；`server.js:2160` `cmd.exe` spawn 加 `windowsHide:true` 防闪窗。
+    - CRLF 微强化 2 处：`server.js:3158` git status `split('\n')` → `split(/\r?\n/)` 防未来 strict 比较破窗；`cli.js` `injectCliJs` 检测主导 EOL 保留 split + join 防 LF→CRLF 单向转。
+  - **commit 4 (UltraReview 采纳 P0/P1)**：
+    - 补 commit 1 漏的 `/api/upload-image` 保留名守卫（commit 1 message 声称 3 处但实际只落地 2 处）。
+    - 3 处 reserved name regex 提取到模块级 const `WINDOWS_RESERVED_NAMES` dedup。
+    - cpSync 显式 `dereference: false`——Node 默认就是 false 但显式写明意图防默认变更让递归 copy 跟随内嵌 symlink。
+    - 30000 magic number 提到 `GIT_RESTORE_LOCK_CLEANUP_MS` const。
+    - `renameSyncWithRetry` 测试补 retry-path 守卫（mirror retry 语义跑一遍验证 EBUSY 触发 retry 直到第 3 次成功）。
+  - **测试**：`test/windows-compat.test.js` 16 → 30+ case（含 reserved name 8 个边界 / git-restore mutex 串行化 / renameSyncWithRetry 3 case / EOL preservation 2 case）；总计 1891/1891 全过 + build 通过。
+  - **跳过的 UltraReview 项**：defensive #1 `/api/delete-file` isFile branch unlinkSync TOCTOU（误判：POSIX unlinkSync 不跟随 symlink）/ defensive #2 within-FS symlink rename（non-security）/ defensive #4 setTimeout unref 时机（进程退出无关）/ architect 其它 2 处 IPC inline kill（legit different code paths）。
+  - **批 3 入 backlog（P2/P3）**：chokidar 轮询间隔 / 剪贴板 backslash / Electron 签名 / UAC 防火墙 UX 文档 / `.gitattributes` EOL / `## Unreleased` 段 publish 流程文档。32 条审计完整清单仍在 `/Users/sky/.claude/plans/imperative-imagining-ullman.md`。
+
 ## 1.6.257 (2026-05-11)
 
 - fix(git): Issue #84 —— GitChanges 单文件「撤销变更」在 Windows 下静默 no-op

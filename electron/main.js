@@ -117,6 +117,23 @@ process.env.CCV_ELECTRON_MULTITAB = '1'; // Tell server not to spawn Claude on l
 let mgmtServerMod = null;
 let mgmtPort = null;
 
+/**
+ * 终止 child process —— Windows 上 SIGTERM 是 noop（要等满 escalateMs 才走 SIGKILL，tab close 卡）；
+ * 直接 kill() 让 Node 走 TerminateProcess 立即结束。POSIX 保留 SIGTERM → escalateMs → SIGKILL 升级。
+ * 返回 Promise 在子进程退出或超时后 resolve。
+ */
+function killChildEscalating(child, escalateMs = 3000) {
+  if (process.platform === 'win32') {
+    try { child.kill(); } catch {}
+    return Promise.resolve();
+  }
+  try { child.kill('SIGTERM'); } catch {}
+  return new Promise(resolve => {
+    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} resolve(); }, escalateMs);
+    child.on('exit', () => { clearTimeout(t); resolve(); });
+  });
+}
+
 async function startMgmtServer() {
   const { startProxy } = await import(pathToFileURL(join(rootDir, 'proxy.js')).href);
   const proxyPort = await startProxy();
@@ -564,12 +581,8 @@ async function closeTab(tabId) {
       }, 5000);
       tab.child.on('exit', () => clearTimeout(forceTimer));
     } else {
-      // IPC channel closed, kill with SIGKILL escalation
-      try { tab.child.kill('SIGTERM'); } catch {}
-      const forceTimer = setTimeout(() => {
-        try { tab.child.kill('SIGKILL'); } catch {}
-      }, 3000);
-      tab.child.on('exit', () => clearTimeout(forceTimer));
+      // IPC channel closed, kill with platform-aware escalation
+      killChildEscalating(tab.child, 3000);
     }
   }
 
@@ -703,12 +716,8 @@ async function cleanupAll() {
         tab.child.on('exit', () => { clearTimeout(timer); resolve(); });
       }));
     } else if (tab.child) {
-      // Child process exists but IPC channel is closed, kill with SIGKILL escalation
-      try { tab.child.kill('SIGTERM'); } catch {}
-      promises.push(new Promise(resolve => {
-        const timer = setTimeout(() => { try { tab.child.kill('SIGKILL'); } catch {} resolve(); }, 3000);
-        tab.child.on('exit', () => { clearTimeout(timer); resolve(); });
-      }));
+      // Child process exists but IPC channel is closed, kill with platform-aware escalation
+      promises.push(killChildEscalating(tab.child, 3000));
     }
   }
   await Promise.all(promises);

@@ -397,17 +397,26 @@ function TreeNode({ item, path, depth, onFileClick, expandedPaths, onToggleExpan
           title: t('ui.contextMenu.newFile'),
           content: <Input id={inputId} autoFocus placeholder="filename.ext" style={{ background: 'var(--bg-container)', borderColor: 'var(--border-primary)', color: 'var(--text-secondary)', caretColor: 'var(--text-secondary)' }} onPressEnter={() => { document.querySelector('.ant-modal-confirm-btns .ant-btn-primary')?.click(); }} />,
           okText: t('ui.contextMenu.newFile'),
-          onOk: () => {
+          // 失败 throw → antd Modal.confirm 保住弹窗供重试；message.error 显式提示，避免静默关闭误以为成功（同 #84 模式）。
+          onOk: async () => {
             const input = document.getElementById(inputId);
             const name = (input?.value || '').trim();
-            if (!name) return Promise.reject();
-            return fetch(apiUrl('/api/create-file'), {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ dirPath: childPath, name }),
-            }).then(r => {
-              if (r.ok && onFileRenamed) onFileRenamed(null, `${childPath}/${name}`);
-            });
+            if (!name) throw new Error('Empty filename');
+            let errMsg;
+            try {
+              const r = await fetch(apiUrl('/api/create-file'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ dirPath: childPath, name }),
+              });
+              if (r.ok) { if (onFileRenamed) onFileRenamed(null, `${childPath}/${name}`); return; }
+              errMsg = `HTTP ${r.status}`;
+              try { const d = await r.json(); if (d?.error) errMsg = d.error; } catch {}
+            } catch (err) {
+              errMsg = err?.message || 'network error';
+            }
+            message.error(t('ui.contextMenu.createFileFailed', { error: errMsg }));
+            throw new Error(errMsg);
           },
         });
         break;
@@ -418,17 +427,25 @@ function TreeNode({ item, path, depth, onFileClick, expandedPaths, onToggleExpan
           title: t('ui.contextMenu.newDir'),
           content: <Input id={inputId} autoFocus placeholder="folder-name" style={{ background: 'var(--bg-container)', borderColor: 'var(--border-primary)', color: 'var(--text-secondary)', caretColor: 'var(--text-secondary)' }} onPressEnter={() => { document.querySelector('.ant-modal-confirm-btns .ant-btn-primary')?.click(); }} />,
           okText: t('ui.contextMenu.newDir'),
-          onOk: () => {
+          onOk: async () => {
             const input = document.getElementById(inputId);
             const name = (input?.value || '').trim();
-            if (!name) return Promise.reject();
-            return fetch(apiUrl('/api/create-dir'), {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ dirPath: childPath, name }),
-            }).then(r => {
-              if (r.ok && onFileRenamed) onFileRenamed(null, `${childPath}/${name}`);
-            });
+            if (!name) throw new Error('Empty dir name');
+            let errMsg;
+            try {
+              const r = await fetch(apiUrl('/api/create-dir'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ dirPath: childPath, name }),
+              });
+              if (r.ok) { if (onFileRenamed) onFileRenamed(null, `${childPath}/${name}`); return; }
+              errMsg = `HTTP ${r.status}`;
+              try { const d = await r.json(); if (d?.error) errMsg = d.error; } catch {}
+            } catch (err) {
+              errMsg = err?.message || 'network error';
+            }
+            message.error(t('ui.contextMenu.createDirFailed', { error: errMsg }));
+            throw new Error(errMsg);
           },
         });
         break;
@@ -438,13 +455,23 @@ function TreeNode({ item, path, depth, onFileClick, expandedPaths, onToggleExpan
           title: isDir ? t('ui.contextMenu.deleteDirConfirm', { name: item.name }) : t('ui.contextMenu.deleteConfirm', { name: item.name }),
           okType: 'danger',
           okText: t('ui.contextMenu.delete'),
-          onOk: () => fetch(apiUrl('/api/delete-file'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path: childPath }),
-          }).then(r => {
-            if (r.ok && onFileRenamed) onFileRenamed(childPath, null);
-          }).catch(() => {}),
+          onOk: async () => {
+            let errMsg;
+            try {
+              const r = await fetch(apiUrl('/api/delete-file'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: childPath }),
+              });
+              if (r.ok) { if (onFileRenamed) onFileRenamed(childPath, null); return; }
+              errMsg = `HTTP ${r.status}`;
+              try { const d = await r.json(); if (d?.error) errMsg = d.error; } catch {}
+            } catch (err) {
+              errMsg = err?.message || 'network error';
+            }
+            message.error(t('ui.contextMenu.deleteFailed', { error: errMsg }));
+            throw new Error(errMsg);
+          },
         });
         break;
     }
@@ -572,17 +599,26 @@ export default function FileExplorer({ style, onClose, onFileClick, expandedPath
           title: t('ui.contextMenu.newFile'),
           content: <Input id={inputId} autoFocus placeholder="filename.ext" style={{ background: 'var(--bg-container)', borderColor: 'var(--border-primary)', color: 'var(--text-secondary)', caretColor: 'var(--text-secondary)' }} onPressEnter={() => { document.querySelector('.ant-modal-confirm-btns .ant-btn-primary')?.click(); }} />,
           okText: t('ui.contextMenu.newFile'),
-          onOk: () => {
+          // 失败 throw → antd Modal.confirm 保住弹窗供重试（同 #84 模式）。
+          onOk: async () => {
             const input = document.getElementById(inputId);
             const name = (input?.value || '').trim();
-            if (!name) return Promise.reject();
-            return fetch(apiUrl('/api/create-file'), {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ dirPath: '', name }),
-            }).then(r => {
-              if (r.ok && onFileRenamed) onFileRenamed(null, name);
-            });
+            if (!name) throw new Error('Empty filename');
+            let errMsg;
+            try {
+              const r = await fetch(apiUrl('/api/create-file'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ dirPath: '', name }),
+              });
+              if (r.ok) { if (onFileRenamed) onFileRenamed(null, name); return; }
+              errMsg = `HTTP ${r.status}`;
+              try { const d = await r.json(); if (d?.error) errMsg = d.error; } catch {}
+            } catch (err) {
+              errMsg = err?.message || 'network error';
+            }
+            message.error(t('ui.contextMenu.createFileFailed', { error: errMsg }));
+            throw new Error(errMsg);
           },
         });
         break;
@@ -593,17 +629,25 @@ export default function FileExplorer({ style, onClose, onFileClick, expandedPath
           title: t('ui.contextMenu.newDir'),
           content: <Input id={inputId} autoFocus placeholder="folder-name" style={{ background: 'var(--bg-container)', borderColor: 'var(--border-primary)', color: 'var(--text-secondary)', caretColor: 'var(--text-secondary)' }} onPressEnter={() => { document.querySelector('.ant-modal-confirm-btns .ant-btn-primary')?.click(); }} />,
           okText: t('ui.contextMenu.newDir'),
-          onOk: () => {
+          onOk: async () => {
             const input = document.getElementById(inputId);
             const name = (input?.value || '').trim();
-            if (!name) return Promise.reject();
-            return fetch(apiUrl('/api/create-dir'), {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ dirPath: '', name }),
-            }).then(r => {
-              if (r.ok && onFileRenamed) onFileRenamed(null, name);
-            });
+            if (!name) throw new Error('Empty dir name');
+            let errMsg;
+            try {
+              const r = await fetch(apiUrl('/api/create-dir'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ dirPath: '', name }),
+              });
+              if (r.ok) { if (onFileRenamed) onFileRenamed(null, name); return; }
+              errMsg = `HTTP ${r.status}`;
+              try { const d = await r.json(); if (d?.error) errMsg = d.error; } catch {}
+            } catch (err) {
+              errMsg = err?.message || 'network error';
+            }
+            message.error(t('ui.contextMenu.createDirFailed', { error: errMsg }));
+            throw new Error(errMsg);
           },
         });
         break;

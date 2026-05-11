@@ -117,24 +117,23 @@ export function resolveCliPath() {
  * 返回 node_modules 中的 claude cli.js 路径
  */
 export function resolveNpmClaudePath() {
-  // 1. 尝试 which/command -v / where 找到 npm 安装的 claude
-  const whichCmds = process.platform === 'win32'
+  // 1. 尝试 which/command -v 找到 npm 安装的 claude（Windows 上用 `where`，否则 POSIX 二选一）
+  const lookupCmds = process.platform === 'win32'
     ? [`where ${BINARY_NAME}`]
     : [`which ${BINARY_NAME}`, `command -v ${BINARY_NAME}`];
-  for (const cmd of whichCmds) {
+  for (const cmd of lookupCmds) {
     try {
-      const result = execSync(cmd, { encoding: 'utf-8', shell: true, env: process.env }).trim();
-      // Windows where 可能返回多行，逐行检查
-      const lines = result.split('\n').map(l => l.trim()).filter(l => l && existsSync(l));
-      for (const line of lines) {
+      // Windows `where` 输出可能多行 CRLF，取第一行 trim 即可
+      const rawOut = execSync(cmd, { encoding: 'utf-8', shell: true, env: process.env });
+      const result = rawOut.split(/\r?\n/)[0].trim();
+      if (result && existsSync(result)) {
         // 只接受 npm 安装的符号链接（解析后指向 node_modules）
         try {
           const real = realpathSync(line);
           if (real.includes('node_modules')) {
-            // 找到 npm 版本，返回 cli.js 的路径
-            // real 可能是 .../node_modules/@anthropic-ai/claude-code/bin/claude
-            // 我们需要返回 .../node_modules/@anthropic-ai/claude-code/cli.js
-            const match = real.match(/(.*node_modules\/@[^/]+\/[^/]+)\//);
+            // realpath 在 Win 上是 backslash，统一 normalize 成 '/' 再匹配
+            const normReal = real.replace(/\\/g, '/');
+            const match = normReal.match(/(.*node_modules\/@[^/]+\/[^/]+)\//);
             if (match) {
               const packageDir = match[1];
               const cliPath = join(packageDir, CLI_ENTRY);
@@ -176,16 +175,15 @@ export function resolveNativePath() {
   const platformBin = findPlatformBinary(globalRoot);
   if (platformBin) return platformBin;
 
-  // 2. 尝试 which/command -v / where（继承当前 process.env PATH）
-  const whichCmdsNative = process.platform === 'win32'
+  // 2. 尝试 which/command -v（继承当前 process.env PATH；Win 上用 `where`）
+  const lookupCmds = process.platform === 'win32'
     ? [`where ${BINARY_NAME}`]
     : [`which ${BINARY_NAME}`, `command -v ${BINARY_NAME}`];
-  for (const cmd of whichCmdsNative) {
+  for (const cmd of lookupCmds) {
     try {
-      const result = execSync(cmd, { encoding: 'utf-8', shell: true, env: process.env }).trim();
-      // Windows where 可能返回多行，逐行检查
-      const lines = result.split('\n').map(l => l.trim()).filter(l => l && existsSync(l));
-      for (const line of lines) {
+      const rawOut = execSync(cmd, { encoding: 'utf-8', shell: true, env: process.env });
+      const result = rawOut.split(/\r?\n/)[0].trim();
+      if (result && existsSync(result)) {
         // 只排除 .js 文件（老版本 npm 分发的 cli.js，需要 node 运行，
         // 由 resolveNpmClaudePath 处理）。Claude Code 2.x+ 的 npm 包内
         // 直接打包了原生二进制（bin/claude.exe），应当作 native 处理。

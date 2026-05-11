@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
 import { createConnection } from 'node:net';
 import { randomBytes } from 'node:crypto';
-import { readFileSync, writeFileSync, existsSync, watchFile, unwatchFile, statSync, readdirSync, renameSync, unlinkSync, rmSync, openSync, readSync, closeSync, realpathSync, mkdirSync, createReadStream, cpSync, copyFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, watchFile, unwatchFile, statSync, lstatSync, readdirSync, renameSync, unlinkSync, rmSync, openSync, readSync, closeSync, realpathSync, mkdirSync, createReadStream, cpSync, copyFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, extname, resolve, basename, sep } from 'node:path';
 import { homedir, platform, networkInterfaces, tmpdir } from 'node:os';
@@ -130,6 +130,16 @@ const ASK_HOOK_MAP_MAX = 50;
 // Map supports concurrent sub-agent/teammate requests (keyed by request id)
 const pendingPermHooks = new Map(); // Map<id, { toolName, input, res, timer, createdAt }>
 const PERM_HOOK_MAP_MAX = 50;
+
+// Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）模块级常量——multipart 3 处 upload
+// handler 都用此校验，避免内联 regex 复制粘贴漂移。
+const WINDOWS_RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
+
+// Per-file mutex for /api/git-restore —— 防多 tab 并发 revert 同文件造成 git status + checkout
+// 子命令序列被插队导致不可预测的工作树状态。Promise chain 串行化同 key 请求；finally 路径
+// 主清理，setTimeout 兜底防 finally 异常吞 entry 累积内存。
+const gitRestoreLocks = new Map(); // Map<absLockKey, Promise<void>>
+const GIT_RESTORE_LOCK_CLEANUP_MS = 30000;
 
 // Notify the parent process (Electron main, when forked under tab-worker) about pending state changes.
 // No-op outside Electron (process.send is undefined when run as a standalone Node server).
@@ -441,6 +451,13 @@ async function handleRequest(req, res) {
         // Windows 非法字符 <>:"|?* 在 Unix 合法（ISO 时间戳 10:30:45.log、name:v1.txt 等常见），
         // 不做跨平台代理过滤，让 writeFileSync 在 Windows 上自行抛错即可。
         const originalName = nameMatch[1].replace(/[\x00-\x1f/\\]/g, '_');
+        // Windows 保留设备名守卫（/api/upload-image）——见 WINDOWS_RESERVED_NAMES 注释。
+        {
+          const base = originalName.split('.')[0].trim().toLowerCase();
+          if (WINDOWS_RESERVED_NAMES.test(base)) {
+            throw new Error('Reserved filename not allowed');
+          }
+        }
         const bodyStart = headerEnd + 4;
         // Find the closing boundary
         const closingBoundary = Buffer.from('\r\n--' + boundary);
@@ -540,6 +557,13 @@ async function handleRequest(req, res) {
         if (!nameMatch) throw new Error('No filename');
         // sanitize 与 /api/upload 一致：只过真正有害的字符，保留 Unix 合法 : " < > | ? * 等
         const originalName = nameMatch[1].replace(/[\x00-\x1f/\\]/g, '_');
+        // Windows 保留设备名守卫（见 WINDOWS_RESERVED_NAMES 注释）。
+        {
+          const base = originalName.split('.')[0].trim().toLowerCase();
+          if (WINDOWS_RESERVED_NAMES.test(base)) {
+            throw new Error('Reserved filename not allowed');
+          }
+        }
         const bodyStart = headerEnd + 4;
         const closingBoundary = Buffer.from('\r\n--' + boundary);
         const bodyEnd = buf.indexOf(closingBoundary, bodyStart);
@@ -1547,6 +1571,13 @@ async function handleRequest(req, res) {
           .normalize('NFKC')
           .replace(/[\x00-\x1f/\\]/g, '_')
           .replace(/[​-‏‪-‮⁠﻿]/g, '');
+        // Windows 保留设备名守卫（见 WINDOWS_RESERVED_NAMES 注释）。
+        {
+          const base = originalName.split('.')[0].trim().toLowerCase();
+          if (WINDOWS_RESERVED_NAMES.test(base)) {
+            throw Object.assign(new Error('Reserved filename not allowed'), { status: 400 });
+          }
+        }
         const lower = originalName.toLowerCase();
         const isZip = lower.endsWith('.zip');
         const isMd = lower.endsWith('.md');
@@ -1813,9 +1844,18 @@ async function handleRequest(req, res) {
           renameSync(oldFullPath, newFullPath);
         } catch (mvErr) {
           if (mvErr.code === 'EXDEV') {
-            // 跨文件系统：fallback to copy + delete
-            if (statSync(oldFullPath).isDirectory()) {
-              cpSync(oldFullPath, newFullPath, { recursive: true });
+            // 跨文件系统：fallback to copy + delete。先 lstat 拒 symlink ——避免攻击者 swap 让
+            // cpSync 跟随复制 + rmSync 跟随删除（同 /api/delete-file 的 TOCTOU）。
+            const oldStat = lstatSync(oldFullPath);
+            if (oldStat.isSymbolicLink()) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Cannot move symbolic links via this endpoint' }));
+              return;
+            }
+            if (oldStat.isDirectory()) {
+              // dereference: false 是 Node 默认，但显式写明意图——避免未来默认变更让递归 copy
+              // 跟随内嵌 symlink 复制到 newFullPath 形成 cwd 内"指向 cwd 外"的活链。
+              cpSync(oldFullPath, newFullPath, { recursive: true, dereference: false });
               rmSync(oldFullPath, { recursive: true, force: true });
             } else {
               copyFileSync(oldFullPath, newFullPath);
@@ -1829,7 +1869,8 @@ async function handleRequest(req, res) {
             throw mvErr;
           }
         }
-        const newRelPath = toDir.endsWith('/') ? toDir + name : toDir + '/' + name;
+        // 返回前端 JSON 统一 POSIX 风格，path.join 在 Win 上会产 backslash，需 normalize 回 '/'。
+        const newRelPath = join(toDir, name).replace(/\\/g, '/');
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, newPath: newRelPath }));
       } catch (err) {
@@ -1878,7 +1919,14 @@ async function handleRequest(req, res) {
           res.end(JSON.stringify({ error: 'Path traversal not allowed' }));
           return;
         }
-        const stat = statSync(fullPath);
+        // 用 lstatSync 不跟随 symlink ——避免 TOCTOU 攻击者把目标换成软链让 rmSync(recursive)
+        // 在 POSIX 上跟着删 cwd 外的目录。一切 symlink 目标都拒绝。
+        const stat = lstatSync(fullPath);
+        if (stat.isSymbolicLink()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Cannot delete symbolic links via this endpoint' }));
+          return;
+        }
         if (stat.isDirectory()) {
           // protectedDirs 守卫得对 Win backslash 路径 & NTFS case-insensitive 同时设防 ——
           // 否则 `path: "node_modules\\foo"` 或 `".GIT"` 都能绕过 split('/') 直接删整目录。
@@ -1887,6 +1935,13 @@ async function handleRequest(req, res) {
           if (normalizedSegs.some(part => protectedDirs.has(part))) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'Cannot delete protected directory' }));
+            return;
+          }
+          // Defense-in-depth：lstat 跟 rmSync 间窗内攻击者再次 swap → 再 realpath 确认。
+          const realFull2 = realpathSync(fullPath);
+          if (!realFull2.startsWith(realCwd + sep)) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Path escaped cwd after validation' }));
             return;
           }
           rmSync(fullPath, { recursive: true, force: true });
@@ -1948,7 +2003,8 @@ async function handleRequest(req, res) {
         if (plat === 'darwin') {
           execFile('open', ['-R', fullPath], () => {});
         } else if (plat === 'win32') {
-          spawn('explorer', ['/select,', fullPath], { shell: false });
+          // explorer /select,<path> 必须合到一个 arg；分两个会让含空格/中文路径 escape 失败。
+          spawn('explorer.exe', [`/select,${fullPath}`], { shell: false, windowsHide: true });
         } else {
           execFile('xdg-open', [dirname(fullPath)], () => {});
         }
@@ -2144,7 +2200,7 @@ async function handleRequest(req, res) {
         if (plat === 'darwin') {
           spawn('open', ['-a', 'Terminal', fullDir], { stdio: 'ignore', detached: true }).unref();
         } else if (plat === 'win32') {
-          spawn('cmd.exe', ['/c', 'start', 'cmd.exe'], { cwd: fullDir, stdio: 'ignore', detached: true }).unref();
+          spawn('cmd.exe', ['/c', 'start', 'cmd.exe'], { cwd: fullDir, stdio: 'ignore', detached: true, windowsHide: true }).unref();
         } else {
           // Linux: try common terminal emulators
           const terminals = ['gnome-terminal', 'konsole', 'xfce4-terminal', 'xterm'];
@@ -2868,7 +2924,7 @@ async function handleRequest(req, res) {
       if (!policy.ok && policy.reason === 'realpath-failed' && isAbs) {
         const pName = _projectName || 'default';
         const persistPrefix = join(getClaudeConfigDir(), 'cc-viewer', pName, 'images');
-        const fileName = absPath.split('/').pop();
+        const fileName = basename(absPath);
         if (fileName) {
           const persistFile = join(persistPrefix, fileName);
           const fallbackPolicy = isReadAllowed(persistFile);
@@ -3096,14 +3152,28 @@ async function handleRequest(req, res) {
             return;
           }
         }
-        // Check if file is untracked
-        const { stdout: statusOut } = await execFileAsync('git', ['status', '--porcelain', '--', filePath], { cwd, encoding: 'utf-8', timeout: 5000 });
-        const isUntracked = statusOut.trim().startsWith('??');
-        if (isUntracked) {
-          await execFileAsync('git', ['clean', '-fd', '--', filePath], { cwd, timeout: 10000 });
-        } else {
-          await execFileAsync('git', ['checkout', '--', filePath], { cwd, timeout: 10000 });
-        }
+        // Per-file mutex 序列化「git status + checkout/clean」子命令对。多 tab 并发同文件
+        // revert 时不再有 race 让两个 checkout 交错执行（最终状态不可预测）。
+        // resolve() 规整 `./foo.js` / `foo.js` / `.//foo.js` 为同一 lockKey，防形变绕过。
+        const lockKey = resolve(join(cwd, filePath));
+        const prev = gitRestoreLocks.get(lockKey) || Promise.resolve();
+        const current = prev.then(async () => {
+          const { stdout: statusOut } = await execFileAsync('git', ['status', '--porcelain', '--', filePath], { cwd, encoding: 'utf-8', timeout: 5000 });
+          const isUntracked = statusOut.trim().startsWith('??');
+          if (isUntracked) {
+            await execFileAsync('git', ['clean', '-fd', '--', filePath], { cwd, timeout: 10000 });
+          } else {
+            await execFileAsync('git', ['checkout', '--', filePath], { cwd, timeout: 10000 });
+          }
+        }).finally(() => {
+          if (gitRestoreLocks.get(lockKey) === current) gitRestoreLocks.delete(lockKey);
+        });
+        gitRestoreLocks.set(lockKey, current);
+        // setTimeout 兜底——防 finally 异常吞 entry 累积内存。
+        setTimeout(() => {
+          if (gitRestoreLocks.get(lockKey) === current) gitRestoreLocks.delete(lockKey);
+        }, GIT_RESTORE_LOCK_CLEANUP_MS).unref();
+        await current;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
@@ -3128,7 +3198,8 @@ async function handleRequest(req, res) {
       // maxBuffer 拉到 10MB——默认 1MB 在 node_modules 未 gitignore 之类的极端
       // 场景下会被截断，导致后续 split 解析错位。
       const { stdout: output } = await execFileAsync('git', ['status', '--porcelain', '-uall'], { cwd, encoding: 'utf-8', timeout: 5000, maxBuffer: 10 * 1024 * 1024 });
-      const lines = output.split('\n').filter(line => line.trim());
+      // Win 上 git stdout 是 CRLF；现状靠下文 .trim() 兜底，加正则更稳防未来 strict 比较破窗。
+      const lines = output.split(/\r?\n/).filter(line => line.trim());
       const changes = lines.map(line => {
         const status = line.substring(0, 2).trim();
         let file = line.substring(3).trim();
@@ -3406,7 +3477,7 @@ async function handleRequest(req, res) {
         res.end(JSON.stringify({ error: 'Access denied' }));
         return;
       }
-      const fileName = file.split('/').pop();
+      const fileName = basename(file);
       const format = parsedUrl.searchParams.get('format');
       // Delta storage: format=raw 下载原始文件；默认下载重建后的全量格式
       if (format === 'raw') {
@@ -4300,8 +4371,12 @@ async function setupTerminalWebSocket(httpServer) {
             if (_needRedrawBootstrap) {
               _needRedrawBootstrap = false;
               try {
-                const pid = getClaudePid();
-                if (pid && pid !== process.pid) process.kill(pid, 'SIGWINCH');
+                // Windows 无 SIGWINCH；ConPTY 在前面的 resizePty 调用里已经处理过 resize 通知，
+                // 这里仅是 POSIX 上的"等尺寸 noop 不发信号"兜底，Win 上跳过避免抛异常。
+                if (process.platform !== 'win32') {
+                  const pid = getClaudePid();
+                  if (pid && pid !== process.pid) process.kill(pid, 'SIGWINCH');
+                }
               } catch {}
             }
           }

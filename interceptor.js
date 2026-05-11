@@ -7,7 +7,8 @@ const _ccvSkipArgs = ['--version', '-v', '--v', '--help', '-h', 'doctor', 'insta
 const _ccvSkip = _ccvSkipArgs.includes(process.argv[2]);
 
 import './lib/proxy-env.js';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, statSync, renameSync, unlinkSync, existsSync, watchFile } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, statSync, unlinkSync, existsSync, watchFile } from 'node:fs';
+import { renameSyncWithRetry } from './lib/file-api.js';
 import http from 'node:http';
 import https from 'node:https';
 import { homedir } from 'node:os';
@@ -221,7 +222,7 @@ function resolveResumeChoice(choice) {
       if (existsSync(tempFile)) {
         const sz = statSync(tempFile).size;
         if (sz > 0) {
-          renameSync(tempFile, newPath);
+          renameSyncWithRetry(tempFile, newPath);
         } else {
           try { unlinkSync(tempFile); } catch { }
         }
