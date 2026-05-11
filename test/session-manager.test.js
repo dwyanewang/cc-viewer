@@ -8,6 +8,7 @@ import {
   buildSessionIndex,
   splitHotCold,
   mergeSessionIndices,
+  applyInPlaceLastMsgReplace,
 } from '../src/utils/sessionManager.js';
 
 // ─── Test helpers ─────────────────────────────────────────────────��───────────
@@ -342,5 +343,237 @@ describe('mergeSessionIndices', () => {
     assert.equal(result[0].sessionId, 'ts-a');
     assert.equal(result[1].sessionId, 'ts-b');
     assert.equal(result[2].sessionId, 'ts-c');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// applyInPlaceLastMsgReplace — 信号驱动短路（消费服务端 _inPlaceReplaceDetected）
+// 防 SUGGESTION MODE → 用户真实输入替换末位时 sessionMerge prefix-overlap 翻倍
+// （实证 cc-viewer 自身复现：jsonl 中 _inPlaceReplaceDetected:true 与 BUG 1:1 对应）
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('applyInPlaceLastMsgReplace', () => {
+  function makeMsg(role, text) {
+    return { role, content: [{ type: 'text', text }], _timestamp: '2026-05-09T10:00:00Z' };
+  }
+  function makeSessionLocal(messages, userId = 'u1') {
+    return { userId, messages, response: { status: 200, body: {} }, entryTimestamp: '2026-05-09T10:00:00Z' };
+  }
+
+  it('命中信号 → in-place 替换末位（前 N-1 引用稳定，长度不翻倍）', () => {
+    const m0 = makeMsg('user', 'hi');
+    const m1 = makeMsg('assistant', 'hello');
+    const m2_old = makeMsg('user', '[SUGGESTION MODE: ...]');
+    const session = makeSessionLocal([m0, m1, m2_old]);
+    const prevSessions = [session];
+
+    const m2_new = makeMsg('user', '继续关闭 @hunter-D');
+    const entry = {
+      _isCheckpoint: true,
+      _inPlaceReplaceDetected: true,
+      timestamp: '2026-05-09T11:10:03Z',
+      response: { status: 200, body: { content: [] } },
+      body: { messages: [m0, m1, m2_new] },  // length 3，跟 prev 一致
+    };
+
+    // 前置 invariant assert（防 fixture 漂移）：触发短路要求两边长度完全一致
+    assert.equal(entry.body.messages.length, session.messages.length, 'fixture invariant: entry/session 长度必须相等');
+
+    const result = applyInPlaceLastMsgReplace(prevSessions, entry, '2026-05-09T11:10:03Z', false);
+
+    assert.equal(result.applied, true, '应该命中短路');
+    assert.equal(result.sessions.length, 1, 'sessions 数组长度不变');
+    const newLast = result.sessions[0];
+    assert.equal(newLast.messages.length, 3, '末位 in-place 替换后长度仍 = 3（不翻倍）');
+    assert.strictEqual(newLast.messages[0], m0, '前 N-1 条 message[0] 引用复用');
+    assert.strictEqual(newLast.messages[1], m1, '前 N-1 条 message[1] 引用复用');
+    assert.strictEqual(newLast.messages[2], m2_new, '末位用 entry.body.messages[N-1] 新引用');
+    assert.notStrictEqual(newLast, session, 'lastSession 引用变化（让 ChatView _sessionItemCache 失效触发重渲染）');
+  });
+
+  it('未命中信号（无 _inPlaceReplaceDetected）→ applied=false 让 fallback 到 mergeMainAgentSessions', () => {
+    const m0 = makeMsg('user', 'hi');
+    const m1 = makeMsg('assistant', 'hello');
+    const session = makeSessionLocal([m0, m1]);
+    const entry = {
+      _isCheckpoint: true,
+      // _inPlaceReplaceDetected: undefined ← 故意不设
+      timestamp: '2026-05-09T11:10:03Z',
+      body: { messages: [m0, m1] },
+    };
+
+    const result = applyInPlaceLastMsgReplace([session], entry, '2026-05-09T11:10:03Z', false);
+    assert.equal(result.applied, false, '无信号字段时不应短路');
+  });
+
+  it('isNewSession=true → applied=false（不破坏新 session 起点语义）', () => {
+    const m0 = makeMsg('user', 'fresh');
+    const session = makeSessionLocal([m0]);
+    const entry = {
+      _isCheckpoint: true,
+      _inPlaceReplaceDetected: true,
+      timestamp: '2026-05-09T11:10:03Z',
+      body: { messages: [m0] },
+    };
+    const result = applyInPlaceLastMsgReplace([session], entry, '2026-05-09T11:10:03Z', /*isNewSession*/ true);
+    assert.equal(result.applied, false, 'isNewSession=true 时不应短路（让 mergeMainAgentSessions 处理新 session 起点）');
+  });
+
+  it('messages.length 不一致 → applied=false（防误吃增量 push 场景）', () => {
+    const m0 = makeMsg('user', 'hi');
+    const session = makeSessionLocal([m0]);
+    const entry = {
+      _isCheckpoint: true,
+      _inPlaceReplaceDetected: true,
+      timestamp: '2026-05-09T11:10:03Z',
+      body: { messages: [m0, makeMsg('assistant', 'new')] },  // length 2 ≠ session.messages.length 1
+    };
+    const result = applyInPlaceLastMsgReplace([session], entry, '2026-05-09T11:10:03Z', false);
+    assert.equal(result.applied, false, '长度不一致时不应短路（普通 push 走 mergeMainAgentSessions 即可）');
+  });
+
+  it('空 prevSessions → applied=false（首条 entry 走 mergeMainAgentSessions 创建初始 session）', () => {
+    const m0 = makeMsg('user', 'hi');
+    const m1 = makeMsg('assistant', 'a');
+    const entry = {
+      _isCheckpoint: true,
+      _inPlaceReplaceDetected: true,
+      timestamp: '2026-05-09T11:10:03Z',
+      response: { status: 200, body: {} },
+      body: { messages: [m0, m1] },
+    };
+    const result = applyInPlaceLastMsgReplace([], entry, '2026-05-09T11:10:03Z', false);
+    assert.equal(result.applied, false);
+  });
+
+  // 新增防御性 case（reviewer 采纳建议）：
+  it('messages.length > currentLen → applied=false（防意外消费信号导致丢消息）', () => {
+    const m0 = makeMsg('user', 'hi');
+    const session = makeSessionLocal([m0]);
+    const m1 = makeMsg('assistant', 'a');
+    const m2 = makeMsg('user', 'q');
+    const entry = {
+      _isCheckpoint: true,
+      _inPlaceReplaceDetected: true,
+      timestamp: '2026-05-09T11:10:03Z',
+      response: { status: 200, body: {} },
+      body: { messages: [m0, m1, m2] },  // length 3 > session.messages.length 1
+    };
+    const result = applyInPlaceLastMsgReplace([session], entry, '2026-05-09T11:10:03Z', false);
+    assert.equal(result.applied, false, '长度不一致（>）应 fallback 让 mergeMainAgentSessions 走增量 push');
+  });
+
+  it('entry.response 缺失（inProgress 异常）→ applied=false 防 ChatView Last Response 污染', () => {
+    const m0 = makeMsg('user', 'hi');
+    const m1 = makeMsg('assistant', 'a');
+    const m2_old = makeMsg('user', 'old');
+    const session = makeSessionLocal([m0, m1, m2_old]);
+    const m2_new = makeMsg('user', 'new');
+    const entry = {
+      _isCheckpoint: true,
+      _inPlaceReplaceDetected: true,
+      timestamp: '2026-05-09T11:10:03Z',
+      // response: undefined ← 故意省略
+      body: { messages: [m0, m1, m2_new] },
+    };
+    const result = applyInPlaceLastMsgReplace([session], entry, '2026-05-09T11:10:03Z', false);
+    assert.equal(result.applied, false, '无 response 时不应短路（防 newLastSession.response=undefined 污染下游）');
+  });
+
+  it('messages.length < 2 → applied=false（单消息退化为完全替换不安全，让原路径处理）', () => {
+    const m0_old = makeMsg('user', 'old');
+    const session = makeSessionLocal([m0_old]);
+    const m0_new = makeMsg('user', 'new');
+    const entry = {
+      _isCheckpoint: true,
+      _inPlaceReplaceDetected: true,
+      timestamp: '2026-05-09T11:10:03Z',
+      response: { status: 200, body: {} },
+      body: { messages: [m0_new] },  // length 1
+    };
+    const result = applyInPlaceLastMsgReplace([session], entry, '2026-05-09T11:10:03Z', false);
+    assert.equal(result.applied, false, 'N=1 时不应走 in-place 短路（前 N-1 退化为空 = 完全替换，不符合 helper 语义）');
+  });
+
+  // 新增（review R3 任务 2 缺口）：_inPlaceReplaceDetected:true 但 _isCheckpoint 缺失/false
+  it('_inPlaceReplaceDetected=true 但 _isCheckpoint 缺失 → applied=false（双信号必须齐发）', () => {
+    const m0 = makeMsg('user', 'hi');
+    const m1 = makeMsg('assistant', 'old');
+    const session = makeSessionLocal([m0, m1]);
+    const m1_new = makeMsg('assistant', 'new');
+    const entry = {
+      _inPlaceReplaceDetected: true,
+      // _isCheckpoint: undefined ← 故意省略，模拟服务端协议变更或漏写
+      timestamp: '2026-05-09T11:10:03Z',
+      response: { status: 200, body: {} },
+      body: { messages: [m0, m1_new] },
+    };
+    const result = applyInPlaceLastMsgReplace([session], entry, '2026-05-09T11:10:03Z', false);
+    assert.equal(result.applied, false, '双信号未齐发不应短路（防服务端协议变更下 in-place 误触发污染下游）');
+  });
+
+  // 新增（D 块）：fallback 计数器机制 — 信号到达但守卫拒绝时计数应增加
+  it('fallback 计数器：信号到达但守卫拒绝时累加分类计数', () => {
+    // 重置计数防本次 case 之前累积干扰
+    applyInPlaceLastMsgReplace.fallbackCount = Object.create(null);
+    applyInPlaceLastMsgReplace.appliedCount = 0;
+
+    const m0 = makeMsg('user', 'hi');
+    const session = makeSessionLocal([m0]);
+
+    // 触发 length-mismatch 路径
+    const entry1 = {
+      _isCheckpoint: true,
+      _inPlaceReplaceDetected: true,
+      timestamp: '2026-05-09T11:10:03Z',
+      response: { status: 200, body: {} },
+      body: { messages: [m0, makeMsg('assistant', 'a'), makeMsg('user', 'b')] },
+    };
+    applyInPlaceLastMsgReplace([session], entry1, '2026-05-09T11:10:03Z', false);
+    assert.equal(applyInPlaceLastMsgReplace.fallbackCount['length-mismatch'], 1, 'length-mismatch 应计数');
+
+    // 触发 response-missing 路径
+    const session2 = makeSessionLocal([m0, makeMsg('assistant', 'a'), makeMsg('user', 'b')]);
+    const entry2 = {
+      _isCheckpoint: true,
+      _inPlaceReplaceDetected: true,
+      timestamp: '2026-05-09T11:10:03Z',
+      // response 缺失
+      body: { messages: [m0, makeMsg('assistant', 'a'), makeMsg('user', 'c')] },
+    };
+    applyInPlaceLastMsgReplace([session2], entry2, '2026-05-09T11:10:03Z', false);
+    assert.equal(applyInPlaceLastMsgReplace.fallbackCount['response-missing'], 1, 'response-missing 应计数');
+
+    // 触发 messages-too-short 路径
+    const entry3 = {
+      _isCheckpoint: true,
+      _inPlaceReplaceDetected: true,
+      timestamp: '2026-05-09T11:10:03Z',
+      response: { status: 200, body: {} },
+      body: { messages: [m0] },
+    };
+    applyInPlaceLastMsgReplace([session], entry3, '2026-05-09T11:10:03Z', false);
+    assert.equal(applyInPlaceLastMsgReplace.fallbackCount['messages-too-short'], 1, 'messages-too-short 应计数');
+
+    // 无信号路径不计数（防 SSE 高频流量淹没）
+    const entry4 = {
+      timestamp: '2026-05-09T11:10:03Z',
+      body: { messages: [m0] },
+    };
+    applyInPlaceLastMsgReplace([session], entry4, '2026-05-09T11:10:03Z', false);
+    assert.equal(applyInPlaceLastMsgReplace.fallbackCount['no-signal'], undefined, '无信号路径不应计入 fallbackCount');
+
+    // applied 路径累加 appliedCount
+    const session3 = makeSessionLocal([m0, makeMsg('assistant', 'old')]);
+    const entry5 = {
+      _isCheckpoint: true,
+      _inPlaceReplaceDetected: true,
+      timestamp: '2026-05-09T11:10:03Z',
+      response: { status: 200, body: {} },
+      body: { messages: [m0, makeMsg('assistant', 'new')] },
+    };
+    const result = applyInPlaceLastMsgReplace([session3], entry5, '2026-05-09T11:10:03Z', false);
+    assert.equal(result.applied, true);
+    assert.equal(applyInPlaceLastMsgReplace.appliedCount, 1, 'applied 路径应累加 appliedCount');
   });
 });

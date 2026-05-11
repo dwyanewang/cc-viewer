@@ -1249,7 +1249,7 @@ class Mobile extends AppBase {
                   <span className={styles.mobileSettingsLabel}>{t('ui.themeColor')}</span>
                   <Select
                     size="small"
-                    value={this.state.themeColor || 'dark'}
+                    value={this.state.themeColor || 'light'}
                     onChange={this.handleThemeColorChange}
                     options={[
                       { label: t('ui.themeColor.dark'), value: 'dark' },

@@ -962,6 +962,7 @@
   margin-left: auto;
   color: var(--text-tertiary);
   font-size: 12px;
+  font-weight: 400;
   white-space: nowrap;
 }
 

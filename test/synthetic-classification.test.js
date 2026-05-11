@@ -113,6 +113,7 @@ function isSystemText(text) {
   if (/^Your response was cut off because it exceeded the output token limit/i.test(trimmed)) return true;
   if (/^Base directory for this skill:/i.test(trimmed)) return true;
   if (isSyntheticPromptText(trimmed)) return true;
+  if (/^\[Request interrupted/i.test(trimmed)) return true;
   return false;
 }
 
@@ -389,6 +390,26 @@ describe('Synthetic classification', () => {
 
     it('XML-like tag still detected (existing behavior unchanged)', () => {
       assert.equal(isSystemText('<system-reminder>...</system-reminder>'), true);
+    });
+
+    // 用户拒绝 tool / 中断 Claude 时 CLI 注入的占位 user message —— 多个历史变体都要拦
+    it('"[Request interrupted by user for tool use]" → isSystemText=true', () => {
+      assert.equal(isSystemText('[Request interrupted by user for tool use]'), true);
+    });
+
+    it('"[Request interrupted by user]" (older variant) → isSystemText=true', () => {
+      assert.equal(isSystemText('[Request interrupted by user]'), true);
+    });
+
+    it('"[Request interrupted...]" (older variant) → isSystemText=true', () => {
+      assert.equal(isSystemText('[Request interrupted...]'), true);
+    });
+
+    it('user quoting "[Request interrupted..." mid-sentence → isSystemText=false', () => {
+      assert.equal(
+        isSystemText('Why did claude inject "[Request interrupted by user]" into the log?'),
+        false
+      );
     });
   });
 });

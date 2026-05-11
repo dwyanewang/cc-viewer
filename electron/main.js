@@ -12,7 +12,7 @@ import { app, BaseWindow, WebContentsView, Menu, ipcMain, dialog, Notification }
 import { fileURLToPath, pathToFileURL } from 'url';
 import { dirname, join, basename, delimiter } from 'path';
 import { fork, execSync } from 'child_process';
-import { realpathSync, existsSync, readFileSync, watchFile, unwatchFile, mkdirSync, createWriteStream, readdirSync, statSync, unlinkSync } from 'fs';
+import { realpathSync, existsSync, readFileSync, watch, mkdirSync, createWriteStream, readdirSync, statSync, unlinkSync } from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -217,6 +217,8 @@ function aggregateApproval() {
     _isFlashing = false;
   }
   broadcastApproval();
+  // tab-bar 上的小圆环依赖 tab 列表里的 pending 字段，pending 状态变了要让 tab-bar 重渲染。
+  broadcastTabs();
 }
 
 function maybeNotify(tabId, kind, id, payload) {
@@ -315,6 +317,9 @@ function clearPendingForTab(tabId) {
 function getTabList() {
   return [...tabs.entries()].map(([id, t]) => ({
     id, name: t.projectName || basename(t.realPath || ''), status: t.status,
+    // tab-bar 用来在 tab 左侧空槽里渲染"待审批提醒小圆环"。聚合了
+    // ptyPlan / ask / permission 等所有待审批 kind，>0 表示这个 tab 里有东西需要用户决策。
+    pending: _kindCount(pendingByTab.get(id)),
   }));
 }
 
@@ -363,8 +368,11 @@ function createTab(projectPath, extraArgs = []) {
   const tabId = nextTabId++;
   const projectName = basename(realPath);
 
-  // Register immediately (loading state)
+  // Register immediately (loading state) 并立刻置为 active —— tab-bar 里的关闭按钮
+  // 由 `.tab.active .tab-close { opacity: 1 }` 控制，loading 期间若 activeTabId 还指向
+  // 旧 tab / null，新 tab 上的 × 会全程不可见，用户无法在加载阶段取消。
   tabs.set(tabId, { child: null, port: null, token: null, projectName, realPath, view: null, status: 'loading' });
+  activeTabId = tabId;
   broadcastTabs();
   hideWorkspaceSelector();
 
@@ -778,20 +786,34 @@ function cycleTab(direction) {
 }
 
 // --- Theme watching ---
+// 之前用 watchFile(interval:2000) 轮询 prefs，多 tab 切主题 → 其它 tab 的 tab-bar 最多滞后 2s。
+// fs.watch 走 kqueue/inotify 事件驱动，~0ms 滞后，且不再周期性 stat 浪费资源。
+// 生命周期：watcher 跟随 main process 进程结束自动清理，不显式 close —— 单一全局实例，
+// watchTheme() 不会重入（在 createWindow → ready 路径里只调用一次）。
 function watchTheme() {
+  let warnedCorrupt = false;
   try {
-    // 通过 getClaudeConfigDir() 读取配置目录，尊重 CLAUDE_CONFIG_DIR 重定向
     const prefsPath = join(getClaudeConfigDir(), 'cc-viewer', 'preferences.json');
     if (!existsSync(prefsPath)) return;
     const readTheme = () => {
       try {
         const prefs = JSON.parse(readFileSync(prefsPath, 'utf-8'));
+        warnedCorrupt = false;
         return prefs.themeColor === 'light' ? 'light' : 'dark';
-      } catch { return 'dark'; }
+      } catch (err) {
+        // prefs 写入瞬间被读到可能拿到不完整 JSON；仅首次 warn，避免连续事件刷屏
+        if (!warnedCorrupt) {
+          warnedCorrupt = true;
+          console.warn('[watchTheme] preferences.json read/parse failed, falling back to dark:', err.message);
+        }
+        return 'dark';
+      }
     };
     let currentTheme = readTheme();
     if (tabBarView?.webContents) tabBarView.webContents.send('theme-changed', currentTheme);
-    watchFile(prefsPath, { interval: 2000 }, () => {
+    // writeFileSync 在写入过程中可能触发多次 change 事件（特别是 macOS 下原子替换路径）；
+    // 用 readTheme + diff 自己做幂等，重复事件无副作用。
+    watch(prefsPath, () => {
       const newTheme = readTheme();
       if (newTheme !== currentTheme) {
         currentTheme = newTheme;
@@ -800,7 +822,9 @@ function watchTheme() {
         }
       }
     });
-  } catch {}
+  } catch (err) {
+    console.warn('[watchTheme] init failed:', err.message);
+  }
 }
 
 // --- Single instance lock ---
@@ -865,6 +889,15 @@ if (!gotLock) {
     });
     tabBarView.webContents.loadFile(join(__dirname, 'tab-bar.html'));
     mainWindow.contentView.addChildView(tabBarView);
+
+    // 全屏状态广播：进入全屏后 macOS 红黄绿按钮隐藏，tab-bar 需移除占位
+    const sendFullscreenState = () => {
+      if (!tabBarView?.webContents || tabBarView.webContents.isDestroyed()) return;
+      try { tabBarView.webContents.send('fullscreen-changed', !!mainWindow?.isFullScreen?.()); } catch {}
+    };
+    tabBarView.webContents.on('did-finish-load', sendFullscreenState);
+    mainWindow.on('enter-full-screen', sendFullscreenState);
+    mainWindow.on('leave-full-screen', sendFullscreenState);
 
     // When the user brings the window back to focus, stop the taskbar/dock flash and clear notifications already opened on screen.
     mainWindow.on('focus', () => {

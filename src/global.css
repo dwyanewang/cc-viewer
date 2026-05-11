@@ -1,4 +1,9 @@
-/* ===== Theme CSS Variables ===== */
+/* ===== Theme CSS Variables =====
+ * 默认主题（雪山白 / light）由 index.html 的 <html data-theme="light"> 写死 + inline 启动脚本
+ * 从 localStorage('ccv_themeColor') 抢占，避免组件级 [data-theme="..."] 选择器在 attr 缺失时全部 miss。
+ * 这里 :root 仍绑定 dark vars 是历史遗留：很多 module CSS 写了 [data-theme="dark"] / [data-theme="light"]
+ * 的成对覆写，:root 兜底能保证 attr 异常时不会出现"半亮半暗"的混合态。
+ */
 :root, [data-theme="dark"] {
   /* Background */
   --bg-base: #0a0a0a;

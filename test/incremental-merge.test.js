@@ -4,7 +4,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mergeMainAgentSessions } from '../src/utils/sessionMerge.js';
+import { mergeMainAgentSessions, messageFingerprint } from '../src/utils/sessionMerge.js';
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -707,5 +707,293 @@ describe('null timestamp in entry', () => {
     assert.equal(result[0].messages.length, 2);
     assert.equal(result[0].messages[1]._timestamp, null, '_timestamp should be null, not undefined');
     assert.equal(result[0].entryTimestamp, null);
+  });
+});
+
+// ─── reverse anchor regression — 锁死「反向锚点 + fp 三元组」对正向 prefix-overlap 翻车场景的修复
+// 来源：commit 9711024 在分支 claude/fix-mainagent-copy-bug-nq4m8 上写好但未合并到 main 的 6 case。
+// 主合并路径已切换为反向锚点算法后，这 6 case 锁死核心翻车场景。
+
+describe('reverse anchor regression', () => {
+  it('does NOT misjudge overlap when text-only msgs share 64-char prefix but differ overall', () => {
+    // 旧"正向 prefix-overlap"用 slice(0, 64) 做 fp，遇到这种共有头部的 text 会
+    // 误判成 K=2 overlap、把后两条真新增切掉。新算法多块连续校验 + len/last32 加固，
+    // anchor 不应命中，整段 append。
+    // sharedHead + commonPart 必须 ≥ 64 字符以真触发旧 slice(0,64) 共有前缀碰撞场景；
+    // 否则旧算法在 64 字符内就能区分两边，这条 case 实际未在 1.6.245 路径上验证过翻车。
+    const sharedHead = '<system-reminder>MCP Server instructions follow</system-reminder>'; // 64 chars
+    const commonPart = ' shared prefix block before any differentiator '; // 47 chars
+    const cur = [
+      { role: 'user', content: sharedHead + commonPart + 'user prompt one body Q1' },
+      { role: 'assistant', content: sharedHead + commonPart + 'assistant reply one body A1' },
+      { role: 'user', content: sharedHead + commonPart + 'user prompt two body Q2' },
+      { role: 'assistant', content: sharedHead + commonPart + 'assistant reply two body A2' },
+    ];
+    const session = makeSession(cur, { userId: 'u1' });
+
+    const newMsgs = [
+      { role: 'user', content: sharedHead + commonPart + 'user prompt three body Q3' },
+      { role: 'assistant', content: sharedHead + commonPart + 'assistant reply three body A3' },
+      { role: 'user', content: sharedHead + commonPart + 'user prompt four body Q4' },
+      { role: 'assistant', content: sharedHead + commonPart + 'assistant reply four body A4' },
+    ];
+    const entry = makeEntry(newMsgs, { userId: 'u1' });
+
+    const result = mergeMainAgentSessions([session], entry);
+
+    // newLen===curLen===4，无真重叠 → anchor 未命中 → 整段 append → 8
+    // 旧算法（slice(0,64) 单条 fp）会取大 K=4 overlap → 4 条新增全丢；新算法 length+last32 区分。
+    assert.equal(result[0].messages.length, 8, '应当整段 append 不被前 64 字符共有前缀骗到');
+  });
+
+  it('appends only non-overlap suffix when newLen>curLen with K-msg tail overlap', () => {
+    // 用户报的核心翻车：CLI Plan Mode 后偶发发出 "K 条与末尾重叠 + 后段新增" 但
+    // newLen > curLen 的窗口；旧 newLen>curLen 分支盲推 newMsgs[curLen..] →
+    // 重叠 K 条会被当新内容再 push 一遍、同对话出现两次相同消息（"复制"翻车）。
+    const a = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_a', name: 'Read' }] };
+    const b = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_a', content: 'r' }] };
+    const c = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_c', name: 'Bash' }] };
+    const d = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_c', content: 'r2' }] };
+    const session = makeSession([a, b, c, d], { userId: 'u1' });
+    const ref = session.messages;
+
+    const c2 = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_c', name: 'Bash' }] };
+    const d2 = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_c', content: 'r2' }] };
+    const e = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_e', name: 'Edit' }] };
+    const f = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_e', content: 'r3' }] };
+    const g = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_g', name: 'Write' }] };
+    const entry = makeEntry([c2, d2, e, f, g], { userId: 'u1' });
+
+    const result = mergeMainAgentSessions([session], entry);
+
+    assert.equal(result[0].messages.length, 7, '只 push 非重叠尾段，不重 push 重叠 c d');
+    assert.strictEqual(result[0].messages, ref, 'messages 引用稳定保 WeakMap 缓存');
+    assert.equal(result[0].messages[4].content[0].id, 'tu_e');
+    assert.equal(result[0].messages[6].content[0].id, 'tu_g');
+  });
+
+  it('strict prefix extension still works (newMsgs[0..curLen]==curMsgs)', () => {
+    // 经典流式：curMsgs=[a,b]，newMsgs=[a,b,c,d,e]。anchor 命中 p=0 / L=2 → push [c,d,e]。
+    const a = { role: 'user', content: 'q1' };
+    const b = { role: 'assistant', content: 'a1' };
+    const session = makeSession([a, b], { userId: 'u1' });
+    const ref = session.messages;
+
+    const a2 = { role: 'user', content: 'q1' };
+    const b2 = { role: 'assistant', content: 'a1' };
+    const c = { role: 'user', content: 'q2' };
+    const d = { role: 'assistant', content: 'a2' };
+    const e = { role: 'user', content: 'q3' };
+    const entry = makeEntry([a2, b2, c, d, e], { userId: 'u1' });
+
+    const result = mergeMainAgentSessions([session], entry);
+
+    assert.equal(result[0].messages.length, 5);
+    assert.strictEqual(result[0].messages, ref, '严格前缀扩展引用稳定');
+    assert.equal(result[0].messages[2].content, 'q2');
+  });
+
+  it('suffix-subset window keeps reference stable (anchor.overlapLen === newLen no-op)', () => {
+    // CLI 上下文压缩窗口：newMsgs 是 lastSession.messages 末尾 N 条。anchor 命中、L===newLen → no-op。
+    const head = Array.from({ length: 8 }, (_, i) => makeMsg('user', `h${i}`));
+    const xy = [makeMsg('user', 'X-content'), makeMsg('assistant', 'Y-content')];
+    const session = makeSession([...head, ...xy], { userId: 'u1' });
+    const ref = session.messages;
+    const lenBefore = ref.length;
+
+    const entry = makeEntry([
+      makeMsg('user', 'X-content'),
+      makeMsg('assistant', 'Y-content'),
+    ], { userId: 'u1' });
+
+    const result = mergeMainAgentSessions([session], entry);
+
+    assert.equal(result[0].messages.length, lenBefore, '保留累积历史不动');
+    assert.strictEqual(result[0].messages, ref, '引用稳定');
+  });
+
+  it('null/empty content does not crash and falls through to length-based fallback', () => {
+    // newMsgs[0] 是空 content 数组——fp 形如 'role|empty'，反向 anchor 必须不当锚点（否则
+    // 会和 curMsgs 中任何空 content 误命中）。
+    const cur = Array.from({ length: 3 }, (_, i) => makeMsg('user', `m${i}`));
+    const session = makeSession(cur, { userId: 'u1' });
+
+    const empty = { role: 'user', content: [] };
+    const real = { role: 'assistant', content: 'real reply' };
+    const entry = makeEntry([empty, real], { userId: 'u1' });
+
+    const result = mergeMainAgentSessions([session], entry);
+
+    // newLen=2 < curLen=3 且 anchor 未命中 → /compact rebuild 路径，messages 替换。
+    assert.equal(result[0].messages.length, 2, 'rebuild 替换为 newMsgs');
+    assert.equal(result[0].messages[1].content, 'real reply');
+  });
+
+  it('reverse scan picks rightmost candidate when multiple text msgs share fp', () => {
+    // curMsgs 中有 3 条相同 text，newMsgs[0] fp 与之相同。反向扫从末尾开始，
+    // 必须命中最右那条（p=2），从而 overlapLen=min(newLen, curLen-2)=1，append 余下。
+    const cur = [
+      { role: 'user', content: 'TTT' },
+      { role: 'user', content: 'TTT' },
+      { role: 'user', content: 'TTT' },
+    ];
+    const session = makeSession(cur, { userId: 'u1' });
+    const ref = session.messages;
+
+    const T2 = { role: 'user', content: 'TTT' };
+    const U = { role: 'assistant', content: 'after' };
+    const entry = makeEntry([T2, U], { userId: 'u1' });
+
+    const result = mergeMainAgentSessions([session], entry);
+
+    assert.equal(result[0].messages.length, 4);
+    assert.strictEqual(result[0].messages, ref);
+    assert.equal(result[0].messages[3].content, 'after');
+  });
+});
+
+// ─── 短消息 fp 三元组健壮性 — 防 length<32 时 first32===last32 重叠引发抗碰撞退化
+
+describe('short-message fp robustness', () => {
+  it('1-character message does not collide with completely different 1-char message', () => {
+    // length=1 时 first32===last32===原文，fp 仍含 length 字段，相异内容必产生不同 fp。
+    const session = makeSession([makeMsg('user', 'a'), makeMsg('assistant', 'b')], { userId: 'u1' });
+
+    // 用 newLen===curLen 末位差异路径检验 fp 区分能力
+    const entry = makeEntry([makeMsg('user', 'x'), makeMsg('assistant', 'y')], { userId: 'u1' });
+    const result = mergeMainAgentSessions([session], entry);
+
+    // newMsgs[0]='x' fp 与 curMsgs 中所有 fp 都不同 → anchor null →
+    // newLen===curLen 等长 fallback → 整段 append → 4
+    assert.equal(result[0].messages.length, 4, '短消息无重叠应整段 append');
+    assert.equal(result[0].messages[2].content, 'x');
+    assert.equal(result[0].messages[3].content, 'y');
+  });
+
+  it('16-char message: anchor correctly detects identical content, distinguishes different content', () => {
+    const A = 'aaaaaaaaaaaaaaaa'; // 16 chars
+    const B = 'bbbbbbbbbbbbbbbb'; // 16 chars
+    const session = makeSession([makeMsg('user', A), makeMsg('assistant', B)], { userId: 'u1' });
+    const ref = session.messages;
+
+    // newMsgs 完全等于 curMsgs → anchor p=0 overlapLen=2 === newLen → no-op
+    const entry = makeEntry([makeMsg('user', A), makeMsg('assistant', B)], { userId: 'u1' });
+    const result = mergeMainAgentSessions([session], entry);
+    assert.equal(result[0].messages.length, 2, '16 字符等同内容 anchor 命中走 no-op');
+    assert.strictEqual(result[0].messages, ref, '引用稳定');
+  });
+
+  it('31-char message at boundary: fp triple still distinguishes different content', () => {
+    // 31 chars 仍触 first32===last32 重叠。验证 length+content 三元组在边界仍工作。
+    const A = 'a'.repeat(31);
+    const B = 'b'.repeat(31);
+    const C = 'c'.repeat(30) + 'X'; // 31 chars 但末位不同
+    const session = makeSession([makeMsg('user', A), makeMsg('assistant', B)], { userId: 'u1' });
+    const ref = session.messages;
+
+    // newMsgs[0]=A 锚点命中 p=0，overlapLen=min(2,2)=2，校验 newMsgs[1]=C vs curMsgs[1]=B
+    // fp 异（两 string 长度都 31 但 last32 不同）→ anchor 验证失败 → 继续向左找无结果 → null
+    // newLen===curLen 等长 fallback → 整段 append
+    const entry = makeEntry([makeMsg('user', A), makeMsg('assistant', C)], { userId: 'u1' });
+    const result = mergeMainAgentSessions([session], entry);
+    assert.equal(result[0].messages.length, 4, '31 字符末位差异 fp 应能区分');
+    assert.equal(result[0].messages[3].content, C);
+    // 引用变化（push 进了新内容）
+    assert.strictEqual(result[0].messages, ref, 'push 模式引用稳定');
+  });
+});
+
+// ─── 末尾消息重排序场景 — review R1 D3 边界 case
+
+describe('reordered tail anchor disambiguation', () => {
+  it('reordered tail [m147, m146] does not falsely anchor to [m146, m147]', () => {
+    // 如果 newMsgs=[m147, m146]（重排序）且 curMsgs 末尾正好是 [m146, m147]
+    // 反向锚点找 newMsgs[0]=m147 在 curMsgs 末尾 p=last 命中，overlapLen=min(2,1)=1
+    // → push newMsgs[1..]=[m146] → curMsgs 变成 [..., m146, m147, m146]
+    // 该结果不"复制"也不"丢"—— m146 出现两次，但这是用户重发 m146 的合理后果（CLI 偶发）。
+    //
+    // 用 skipTransientFilter:true 模拟 SSE 实时路径，否则 newLen=2 + isNewConversation 命中 transient 过滤。
+    const head = Array.from({ length: 145 }, (_, i) => makeMsg('user', `h${i}`));
+    const m146 = makeMsg('user', 'msg146-distinct-content-X');
+    const m147 = makeMsg('assistant', 'msg147-distinct-content-Y');
+    const session = makeSession([...head, m146, m147], { userId: 'u1' });
+
+    // newMsgs 把末尾两条颠倒
+    const m147new = makeMsg('assistant', 'msg147-distinct-content-Y');
+    const m146new = makeMsg('user', 'msg146-distinct-content-X');
+    const entry = makeEntry([m147new, m146new], { userId: 'u1' });
+
+    const result = mergeMainAgentSessions([session], entry, { skipTransientFilter: true });
+    // anchor 找 m147 命中 p=146（最右），overlapLen=min(2, 147-146)=1
+    // → push newMsgs[1..]=[m146new]，长度 147+1=148
+    assert.equal(result[0].messages.length, 148, '反向锚点处理重排序时只 push 非重叠 tail');
+    // 末位是 m146new
+    assert.equal(result[0].messages[147].content, 'msg146-distinct-content-X');
+  });
+});
+
+// ─── fuzzy invariant — review R3 任务 2 提出的不变量测试
+
+describe('fuzzy invariant: no fp-equivalent consecutive duplicates', () => {
+  it('100 rounds of streaming/checkpoint/reset entries never produce two consecutive fp-equivalent msgs', () => {
+    // 不变量：任何调用序列后，结果 lastSession.messages 中相邻消息 fp 不应连续相等
+    // （tool_use/tool_result 配对场景下 fp 不同，文本相邻消息内容也应有 length 差异）。
+    //
+    // RNG 使用固定种子 0xdeadbeef + LCG 算法（参数取自 glibc rand），
+    // 失败时直接重跑该 case 即可复现完全相同的随机序列。
+    let sessions = [];
+    let counter = 0;
+    const rng = (() => {
+      let seed = 0xdeadbeef;
+      return () => {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        return seed / 0x7fffffff;
+      };
+    })();
+
+    for (let round = 0; round < 100; round++) {
+      const action = rng();
+      let msgs;
+      if (action < 0.6) {
+        // streaming append: 用累积历史 + 1-3 新消息
+        const lastSession = sessions[sessions.length - 1];
+        const lastMsgs = lastSession && lastSession.messages ? lastSession.messages : [];
+        const additions = Math.floor(rng() * 3) + 1;
+        msgs = [...lastMsgs];
+        for (let i = 0; i < additions; i++) {
+          counter++;
+          msgs.push(makeMsg(counter % 2 === 0 ? 'user' : 'assistant', `r${round}-m${counter}-content-padding-text`));
+        }
+      } else if (action < 0.85) {
+        // suffix subset (Plan Mode 压缩窗口): 末尾 1-3 条
+        const lastSession = sessions[sessions.length - 1];
+        const lastMsgs = lastSession && lastSession.messages ? lastSession.messages : [];
+        if (lastMsgs.length === 0) {
+          counter++;
+          msgs = [makeMsg('user', `r${round}-m${counter}-content`)];
+        } else {
+          const tailLen = Math.min(lastMsgs.length, Math.floor(rng() * 3) + 1);
+          msgs = lastMsgs.slice(-tailLen);
+        }
+      } else {
+        // 全新片段（异 user 或 /clear 后）
+        counter++;
+        msgs = [makeMsg('user', `r${round}-fresh-${counter}-content-padding`)];
+      }
+      sessions = mergeMainAgentSessions(sessions, makeEntry(msgs, { userId: 'u1' }), { skipTransientFilter: true });
+    }
+
+    // 校验：所有 session 的相邻消息 fp 不应连续相等。复用 sessionMerge.js 的 messageFingerprint
+    // 保持单一真理源；测试旁路自定义 fp 函数会出现"两边维护"的技术债。
+    for (const s of sessions) {
+      if (!s.messages) continue;
+      for (let i = 1; i < s.messages.length; i++) {
+        const fpA = messageFingerprint(s.messages[i - 1]);
+        const fpB = messageFingerprint(s.messages[i]);
+        if (fpA && fpB && fpA === fpB) {
+          assert.fail(`session ${sessions.indexOf(s)} 相邻消息 fp 重复 at index ${i - 1}/${i}: ${fpA}`);
+        }
+      }
+    }
   });
 });

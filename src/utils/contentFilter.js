@@ -194,6 +194,9 @@ export function isSystemText(text) {
   if (/^Base directory for this skill:/i.test(trimmed)) return true;
   // CLI 内部合成 prompt（Recap/Title/Compact/Topic/Summary）
   if (isSyntheticPromptText(trimmed)) return true;
+  // 用户拒绝 tool / 中断 Claude 时 CLI 注入的占位 user message —— 与上方 "✗ 已拒绝" badge 语义重复
+  // 涵盖历史变体："[Request interrupted by user for tool use]"、"[Request interrupted by user]"、"[Request interrupted...]"
+  if (/^\[Request interrupted/i.test(trimmed)) return true;
   return false;
 }
 
@@ -295,10 +298,12 @@ export function classifyUserContent(content) {
 
   // 二次提取：从被过滤的系统块中提取嵌入的用户文本
   // (e.g., /ultraplan 将 skill 指令和用户输入合并在同一 <system-reminder> 块中)
+  // stripSystemTags 后再过一次 isSystemText —— 避免对 [Request interrupted ...] 这种纯标记
+  // 文本（无可剥离 XML）误回收成用户气泡
   for (const b of content) {
     if (b.type !== 'text' || !isSystemText(b.text)) continue;
     const userText = stripSystemTags(b.text);
-    if (userText) {
+    if (userText && !isSystemText(userText)) {
       textBlocks.push({ ...b, text: userText });
     }
   }

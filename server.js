@@ -42,7 +42,7 @@ import { checkAndUpdate } from './lib/updater.js';
 import { loadPlugins, runWaterfallHook, runParallelHook, getPluginsInfo, getPluginsDir } from './lib/plugin-loader.js';
 import { uploadPlugins, installPluginFromUrl } from './lib/plugin-manager.js';
 import { getUserProfile } from './lib/user-profile.js';
-import { getGitDiffs, countUntrackedLines } from './lib/git-diff.js';
+import { getGitDiffs, countUntrackedLines, getUnpushedCommits, isValidCommitHash } from './lib/git-diff.js';
 import { CONTEXT_WINDOW_FILE, readModelContextSize, buildContextWindowEvent, getContextSizeForModel } from './lib/context-watcher.js';
 import { watchLogFile, startWatching, getWatchedFiles, sendEventToClients, sendToClients } from './lib/log-watcher.js';
 import { isMainAgentEntry, extractCachedContent } from './lib/kv-cache-analyzer.js';
@@ -59,6 +59,8 @@ function getPrefsFile() { return join(LOG_DIR, 'preferences.json'); }
 
 // 启动时一次性读取 ~/.claude/settings.json（不 watch）
 let claudeSettings = {};
+// SSR theme 注入自检状态：模板缺 data-theme 时仅首次 warn（避免高 QPS 刷屏）
+let _ssrThemeAttrWarned = false;
 try {
   const settingsPath = join(getClaudeConfigDir(), 'settings.json');
   if (existsSync(settingsPath)) {
@@ -2410,6 +2412,10 @@ async function handleRequest(req, res) {
             return;
           }
         } else {
+          // Fallback id：当 hook caller 没传 toolUseId（如老 Claude Code PreToolUse hook
+          // payload 不含 tool_use_id），生成 ask_${ts}_${rnd} 占位。这个 id 与 jsonl 里
+          // tool_use.id（toolu_xxx）不同名，前端 portal 决策必须按 ask_* 前缀通配命中。
+          // 协议锚点：src/utils/askPortalMatcher.js — 改此处前缀格式必须同步改 matcher。
           do { id = `ask_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`; } while (pendingAskHooks.has(id));
         }
 
@@ -3175,13 +3181,37 @@ async function handleRequest(req, res) {
       }
 
       const files = filesParam.split(',').map(f => f.trim()).filter(Boolean);
-      const diffs = await getGitDiffs(cwd, files);
+      const commitParam = parsedUrl.searchParams.get('commit');
+      // Reject malformed commit hashes; falsy = working-tree mode
+      const commitHash = commitParam && isValidCommitHash(commitParam) ? commitParam : undefined;
+      const diffs = await getGitDiffs(cwd, files, commitHash);
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ diffs }));
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message, diffs: [] }));
+    }
+    return;
+  }
+
+  // Local commits ahead of upstream (origin/<branch>..HEAD).
+  // Silent empty result when no upstream / detached HEAD — by design.
+  if (url.startsWith('/api/git-log-unpushed') && method === 'GET') {
+    try {
+      const repoParam = parsedUrl.searchParams.get('repo');
+      const cwd = resolveRepoCwd(repoParam);
+      if (!cwd) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid repo parameter', commits: [], hasUpstream: false }));
+        return;
+      }
+      const result = await getUnpushedCommits(cwd);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message, commits: [], hasUpstream: false }));
     }
     return;
   }
@@ -3645,6 +3675,48 @@ async function handleRequest(req, res) {
 
     const fullPath = join(__dirname, 'dist', filePath);
 
+    // index.html 服务端注入主题：根治"老用户首屏闪屏"。
+    // 老用户 preferences.json 里 themeColor='dark' 但浏览器 localStorage 还没缓存过 →
+    // 静态 index.html 的 <html data-theme="light"> 会导致 Loading 页先渲成白色，
+    // 等 React 拿到 prefs 才切回 dark，肉眼可见一次"白闪"。
+    // 这里把当前 prefs 里的 themeColor 直接写进 HTML，inline boot script 仍负责
+    // 处理 URL ?theme= 优先级与 localStorage 缓存。
+    //
+    // 主题来源优先级（首屏 → React 接管后）：
+    //   1. URL ?theme=  （inline boot script 读取，最高优先）
+    //   2. localStorage ccv_themeColor  （inline boot script 读取，跨刷新缓存）
+    //   3. preferences.json 的 themeColor  （此处 SSR 注入到 <html data-theme="...">，老用户兜底）
+    //   4. dist/index.html 模板里的硬编码 default ("light")
+    // React 接管后 AppBase._applyTheme() 会基于 1/2/3 重新统一 state + DOM + localStorage 三向同步。
+    const serveIndexHtml = () => {
+      try {
+        const indexPath = join(__dirname, 'dist', 'index.html');
+        let html = readFileSync(indexPath, 'utf-8');
+        let themeColor = 'light';
+        try {
+          if (existsSync(getPrefsFile())) {
+            const prefs = JSON.parse(readFileSync(getPrefsFile(), 'utf-8'));
+            if (prefs.themeColor === 'dark' || prefs.themeColor === 'light') themeColor = prefs.themeColor;
+          }
+        } catch { /* 读 prefs 失败就走默认 light */ }
+        // 自检：模板里没有 <html ... data-theme="..."> 时 replace 静默 no-op，SSR 优化失效但不报错。
+        // 仅首次 warn 避免高 QPS 刷屏（_ssrThemeAttrWarned 单进程一次性）。
+        if (!_ssrThemeAttrWarned && !/<html[^>]*data-theme="[^"]*"/.test(html)) {
+          _ssrThemeAttrWarned = true;
+          console.warn('[serveIndexHtml] dist/index.html 没有 <html data-theme="..."> 属性，SSR theme 注入将不生效。检查 index.html 模板。');
+        }
+        html = html.replace(/<html([^>]*?)data-theme="[^"]*"/, `<html$1data-theme="${themeColor}"`);
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+        res.end(html);
+        return true;
+      } catch { return false; }
+    };
+
+    if (filePath === '/index.html') {
+      if (serveIndexHtml()) return;
+      // serveIndexHtml 失败时 fall through 到下面的常规静态路径
+    }
+
     try {
       if (existsSync(fullPath) && statSync(fullPath).isFile()) {
         const content = readFileSync(fullPath);
@@ -3674,15 +3746,9 @@ async function handleRequest(req, res) {
     }
 
     // SPA fallback: 非 API/非静态文件请求返回 index.html（路由由前端处理）
-    try {
-      const indexPath = join(__dirname, 'dist', 'index.html');
-      const html = readFileSync(indexPath, 'utf-8');
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
-      res.end(html);
-    } catch (err) {
-      res.writeHead(404);
-      res.end('Not Found');
-    }
+    if (serveIndexHtml()) return;
+    res.writeHead(404);
+    res.end('Not Found');
     return;
   }
 

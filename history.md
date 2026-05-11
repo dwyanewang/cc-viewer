@@ -1,6 +1,105 @@
 # Changelog
 
-## Unreleased
+## 1.6.255 (2026-05-10)
+
+- fix(ui): 文件浏览器 / Git 面板自动刷新机制重写——根治 Edit/Write/MultiEdit 触发时"忽刷忽不刷"
+  - **背景**：旧逻辑五条独立缺陷叠加：① 只把 `Write` 列入 needFileRefresh，`Edit/NotebookEdit` 只刷 Git 不刷文件树，`MultiEdit` 完全漏判；② 监听 tool_use（工具尚未执行，特别是 Bash 长命令）拿到旧文件状态；③ 仅扫 `mainAgentSessions`，subAgent / teammate（Task / Agent Team）的修改完全感知不到；④ `_processedToolIds.size > 5000` 暴力 clear() 让残留的旧 tool_use 被重新认作"新事件"再触发刷新；⑤ 文件浏览器关闭期间的信号被守卫直接丢弃。
+  - **修法**：`ChatView.jsx::_checkToolFileChanges()` 重写为 Pass 1 收集 `tool_use_id → {name, input}` 索引 + Pass 2 扫 `tool_result` 触发刷新双阶段；`tool_result` 出现 = 工具已执行完，`is_error=true` 跳过；两阶段都同时扫 `mainAgentSessions` + `props.requests` 覆盖 subAgent/teammate；`FILE_MUTATING_TOOLS = Set('Write','Edit','MultiEdit','NotebookEdit')` 取代长串 OR；`_pendingFileRefresh / _pendingGitRefresh` 累积关闭期间信号，打开瞬间消费；`_processedToolIdQueue` FIFO + LRU 砍头（上限 20000 / 保留 15000）替代暴力 clear；`collectToolUseBlocks` 提到模块顶层避免每次 cdU 重建闭包；`tool_use_id` 长度 cap 256；dev-only INVARIANT assertion；`componentDidUpdate` 的 `requests` 变化分支也调 `_checkToolFileChanges()`（否则 subAgent 路径感知不到）。
+  - **command 正则补 delete 系列**：`commandValidator.js::MUTATING_CMD_RE` 加 `rmdir` / `unlink` / `\bfind\b[^|;&\n]*-delete\b`（限定单条命令内避免跨管道误匹配）+ JSDoc 注明 trade-off。
+  - **测试**：新增 `test/commandValidator.test.js` 20 case 覆盖删除系列 / 创建移动 / 元信息 / git mutating / 包管理 / 重定向 + "已知 trade-off"分组带 ⚠️ 维护者警告。1829/1829 全过。
+
+- fix(ui): AskUserQuestion 弹窗"标题在但内容空白"——根治老 Claude Code 不传 tool_use_id 触发的 portal 失配
+  - **背景**：用户多次反馈 modal 顶部"需要回答"标题在但内容区空白，同时对话流 inline 卡片渲染正常。
+  - **根因**：`ask-bridge.js` 的 `payload?.tool_use_id || null` 在老 Claude Code PreToolUse hook payload 不传 `tool_use_id` 时拿到 null → `server.js:2387` 走 fallback 自生成 `ask_${Date.now()}_${rnd}`。前端 `pendingAsk.id` 是这个 fallback id 但对话流 `tool_use.id` 是 `toolu_xxx`，两套命名空间不映射。`ChatMessage.jsx` portal 决策只对 `__ask__`（LEGACY 占位）通配不对 `ask_*`（fallback）通配 → owner 那条 ChatMessage 走 inline 但 modal askSlot 永远空。
+  - **修法**：portal 决策抽到 `src/utils/askPortalMatcher.js::shouldPortalAskForm()`，明确列举三种合法 `activeAskId` 形态（`toolu_xxx` strict / `__ask__` LEGACY 通配 / `ask_${ts}_${rnd}` fallback 通配）。owner-idx 算法保证只有 owner 那条 ChatMessage 持非 null `lastPendingAskId`，通配不扩散误命中历史 tool_use。`server.js:2390` fallback id 生成处加 cross-link 注释指向 matcher，防 server 改格式后前端漏改。**不引入 modal 自渲染 fallback**——用户明确要求治本不治标。
+
+- chore(deps): 新增 c8 单元测试覆盖率工具
+  - devDep `c8 ^11.0.0`（零 CVE）。新增 `npm run test:coverage:html` 生成 `coverage/index.html`；原 `test:coverage` 补漏 `src/utils/*.js`。`package.json` 顶层 `c8` 配置 include/exclude/all/report-dir。`.gitignore` 加 `coverage`。当前基线：Statements 58.69% / Branches 74.88% / Functions 75.54% / Lines 58.69%。
+
+- chore(review): 三轮 5-agent UltraReview 采纳 P0/P1
+  - 第 1 轮（文件浏览器刷新）：常量化 `PROCESSED_TOOL_IDS_MAX/KEEP` / `FILE_MUTATING_TOOLS` Set / 命名 `dirty` → `pending` / 上限抬到 20000 / 新增 commandValidator 单测。
+  - 第 2 轮（portal 修复）：扩展 `ask_*` 通配（防御性 + 架构师双 ACCEPT）。
+  - 第 3 轮（累积 7 文件）：INVARIANT 守卫 `NODE_ENV === 'development'`（vite prod 能 DCE）；`_processToolResult` 加 `typeof fp === 'string'` 防御；test 加 ⚠️ 维护者警告；抽出 `askPortalMatcher.js` + server.js cross-link 注释形成 server↔client fallback id 协议显式锚点。1829/1829 全过 + `npm run build` 通过。
+
+## 1.6.254 (2026-05-10)
+
+- feat(ui): 侧栏三个 hover popover（数据统计 / Team 会话 / 用户 Prompt 导航）改为视口贴顶 + 箭头跟随触发器中心
+  - **背景**：用户反馈 Token 数据统计 popover 内容过高时把整个画面"撑出"viewport，顶部被裁掉。原配置 `placement="rightTop"` + Antd 默认 `autoAdjustOverflow={adjustY:true}`（翻转 placement，不平移）。
+  - **修法**：三处 popover 统一改成 `placement="right"` + `arrow={{pointAtCenter:true}}` + `autoAdjustOverflow={false}` + `align.overflow.{adjustX:true, shiftY:true}`。`shiftY:true` 走 rc-align 的"沿 Y 轴平移"分支让 popup 整体向上平移直到塞进 viewport 顶部，`pointAtCenter` 让箭头沿 popup 边自动跟踪触发器中心，从而"上方借标题栏空间 + 箭头始终指对"。content 外套 `maxHeight: calc(100vh - 48px)` + `overflow-y: auto`（上下各留 24px：顶部贴标题栏 / 底部预留 footer 工具栏视觉余量）。
+  - **统一样式**：用户 Prompt 导航 popover 同步 Team 会话风格（背景 `--bg-elevated` + `border: 1px solid --border-light` + `padding: 0`），并新增 sticky 标题栏 `用户 Prompt 导航 (N)`。`.userPromptNavWrap` 用 flex 列布局让标题固定、列表滚动。
+- fix(ui): 拒绝的 tool result 红框只保留 `✗ 已拒绝` badge，去掉下方"The user doesn't want to proceed..."固定模板长说明（纯噪音，无动态信息）；同时 `[Request interrupted by user for tool use]`（含历史变体 `[Request interrupted by user]` / `[Request interrupted...]`）这条 CLI 注入的占位 user message 整条隐藏，与 badge 语义重复。
+  - **过滤位置**：`src/utils/contentFilter.js::isSystemText` 加 `^\[Request interrupted` 前缀匹配；`classifyUserContent` 二次提取（`stripSystemTags` 后回收用户文本的兜底逻辑）补一道 `!isSystemText(userText)` 守卫——避免 `[Request interrupted...]` 这种纯标记文本被回收成用户气泡。`test/synthetic-classification.test.js` 同步 KEEP-IN-SYNC 内联副本 + 新增 4 个用例覆盖三种变体 + 用户中段引用反例。
+- fix(electron): `watchTheme()` `preferences.json` 解析失败由静默回退改为首次 `console.warn`（避免连续 fs.watch 事件刷屏），加生命周期注释说明 watcher 跟随 main process 自动清理 / 不重入。
+- fix(server): `serveIndexHtml()` SSR 主题注入加自检——模板缺 `<html ... data-theme="...">` 时首次 warn（避免 SSR 优化静默 no-op），并写明四层主题来源优先级（URL ?theme= → localStorage → preferences.json → 模板 default）。
+- test(pty): 新增 `test/pty-prompt-retry.test.js`（14 case），镜像 `_submitViaSequentialQueueInternal` 决策段：覆盖 ws-not-open 短路 / 第一次自检失败 → 150ms 重试 / history 兜底过滤 plan|dangerous / reverse 取最新 active / retryCount 单调防无限循环。1809/1809 全过 + `npm run build` 通过。
+- chore(deps,electron): 合入 PR #82（@xiaoyuervae）—— 默认剥离 `CLAUDE_CODE_NO_FLICKER`，wrap 嵌入式 fallback / scratch shell 让用户 rc 仍能跑、然后再 unset；显式 `CCV_KEEP_CLAUDE_CODE_NO_FLICKER=1` 可保留旧行为。新增 `lib/terminal-env.js` + 配套测试，wrapper 文件写到 `~/.claude/cc-viewer/shell-rc/`，**不污染**用户 `.zshrc` / `.bashrc`。
+- chore(review): 5-agent UltraReview 采纳 P0 + 全部 P1（PTY 重试单测 / fs.watch warn / Popover footer 余量 / fs.watch 生命周期注释 / SSR data-theme 自检 / 主题优先级文档）。
+
+## 1.6.253 (2026-05-10)
+
+- fix(sessionMerge): 反向锚点对齐替换正向 prefix-overlap，根治 mainAgent "复制翻车" 残余 + 引入 wire format 单一真理源文档
+  - **背景**：用户反馈 mainAgent 对话内容仍偶发"复制翻车"——同一对话里 K 条尾部消息被当新增内容再 push 一次。1.6.249/1.6.250/1.6.251 三轮服务端层 fix（`_inPlaceReplaceDetected` 信号 / Plan C eager-update race）必要但不充分：客户端 sessionMerge 仍用旧的「正向 prefix-overlap + slice(0,64) 单条 fp」算法，遇到 `<system-reminder>...` / `<command-name>/...` 共有 64 字符头部碰撞 + CLI Plan Mode 故意发的 "K 条尾部重叠 + 后段新增" 窗口，仍会 (a) `newLen===curLen` 末位 fp 异时选错最大 K 切掉真新增；(b) `newLen>curLen` 盲推 `newMsgs[curLen..]` 复制重叠 K 条。
+  - **历史**：分支 `claude/fix-mainagent-copy-bug-nq4m8` commit `9711024` 已写好反向锚点 + fp 三元组算法（`length + first32 + last32`），206/206 test pass，但当时判断"已有服务端信号驱动 fix 足够"被搁置未合并。本轮把它从孤儿分支移植到 main，并在它基础上加了 fp 缓存优化（findReverseAnchor 内预算 `newMessages` fp 数组，SSE 5000+/s 路径节省 25-100ms 累计延迟）。
+  - **算法核心**：以 `newMessages[0]` 为锚从 `lastSession.messages` 末尾反向扫，配合多块连续 fp 等价校验决定 append / no-op / rebuild；anchor 命中即真锚点的概率最高（流式真锚点贴近末尾），避免命中靠前的 fp 碰撞误锚点；fp 升级 `length + first32 + last32` 三元组让单条碰撞概率压到忽略量级，多块连续碰撞概率近 0。anchor 未命中时按 newLen 与 curLen 关系 fallback：`<` → `/compact` rebuild、`===` → 整段 append（Plan Mode 2-msg 全替换窗口）、`>` → 严格前缀扩展 push tail（保 1.6.244 之前语义防回归）。
+  - **未引入客户端队列（用户主张方案 C）**：审视 `AppBase.jsx:1110-1305` 后确认客户端 SSE → `_pendingEntries` → RAF → `_flushPendingEntries` → 单一 `setState` updater 这条链已经天然串行（RAF 浏览器保证 + React 18 自动批 + 单 tab 单 EventSource + 多 tab Electron 进程隔离），引入 per-session 队列**不解决任何正确性问题**反而掩盖算法层缺陷。直接对治根因（sessionMerge 算法替换）+ 加诊断挂钩，不引队列。
+  - **诊断挂钩**：`src/utils/sessionManager.js::applyInPlaceLastMsgReplace` 7 级守卫的"信号到达但守卫拒绝"分支加 verbose 日志（gated by `globalThis.__CCV_SESSIONMERGE_TRACE__ === true`）+ 分类计数器 `applyInPlaceLastMsgReplace.fallbackCount`（`length-mismatch` / `response-missing` / `messages-too-short` 等）+ 成功路径计数 `appliedCount`。无信号路径（绝大多数 entry 的正常路径）不计数防 SSE 高频流量淹没。未来 race 复发时 console 直接读计数即可定位是信号缺失 / 哪条守卫拦了。
+  - **wire format 单一真理源**：新建 `docs/WIRE_FORMAT.md`（§1 entry 4 形态 + §2 关键字段词典 + §3 6 种已知特殊窗口 + §4 信号链路图 + §5 5 层容错 + §6 维护责任 6 关键词搜索清单 + 附录 A 历史演进）。`interceptor.js` / `lib/delta-reconstructor.js` / `src/utils/sessionManager.js` / `src/utils/sessionMerge.js` 顶部注释指向该文档。本轮**无 wire 字段名 / 触发条件 / 客户端消费契约变更**，旧 jsonl 兼容。
+  - **测试**：`test/incremental-merge.test.js` 新增 11 case：① 9711024 的 6 个 reverse-anchor regression（共 64-char 头部不再误判 / `newLen>curLen` 末尾重叠不再 K 条复制 / 严格前缀扩展引用稳定 / suffix-subset 引用稳定 / 空 fp 防御 / 反向扫多候选选最右）；② short-message fp robustness 3 case（length=1/16/31 字符边界 first32===last32 重叠抗碰撞）；③ reordered tail anchor disambiguation 1 case（末尾消息重排序）；④ fuzzy invariant 1 case（100 轮固定种子 LCG 随机 entry，校验末尾消息无 fp 等价连续重复）。`test/session-manager.test.js` 新增 2 case：`_isCheckpoint` 缺失但 `_inPlaceReplaceDetected:true` 应 fallback / fallback 计数器机制（`length-mismatch` + `response-missing` + `messages-too-short` + `appliedCount` 各路径锁死）。1783/1783 全过 + `npm run build` 通过。
+  - **5-agent UltraReview 采纳**：P0（history.md 必更新——本条）+ P1（export `messageFingerprint` test 复用 / findReverseAnchor `newFps` 边界注释 / fixture `system-reminder` 加固到 ≥ 64 字符以真触发旧 slice(0,64) 共有前缀碰撞 / fuzzy seed 复现说明 / WIRE_FORMAT 附录 A 协议兼容性声明）。
+
+## 1.6.252
+
+- fix(proxy): 摘掉上游 `accept-encoding` 里的 zstd，根治 Node<22.15 环境下 routify 类自建代理回 zstd 压缩响应导致的 `API Error: Failed to parse JSON`
+  - **背景**：用户在 Node 20/22 早期版本上跑 ccv，命中 routify.alibaba-inc.com 上游时遇到 `API Error: Failed to parse JSON`；最近一条 200 响应 body 在网络面板里是一片 ` ` + 零散字符（典型「压缩字节被当 UTF-8 解码」表现）。
+  - **根因链**：① Claude CLI 用新版 undici 自动加 `accept-encoding: gzip, deflate, br, zstd`；② `proxy.js:69-70` 把请求 headers 整包透传上游（只删 host）；③ routify 看到客户端声明能解 zstd → 选 zstd 压缩；④ 但**真正收响应的是 proxy.js 的全局 fetch**，绑定**用户机器的 Node 版本**——Node bundled undici 在 22.15 之前不识 zstd，`response.body` 是原始 zstd 字节；⑤ `interceptor.js:801` TextDecoder 当 UTF-8 强解出乱码；⑥ `proxy.js:102` 又把 `content-encoding: zstd` header 剥了透传给 Claude CLI，CLI 当 JSON parse 当场炸。换句话说 Claude CLI 替 proxy.js 做了 zstd 承诺，但兑现承诺的是 proxy.js 自己。
+  - **修法**：`proxy.js` 新增 exported helper `stripZstdAcceptEncoding(headers)`，在转发给上游之前从 `accept-encoding` 摘掉 zstd token（保留 gzip/deflate/br/q-value/TitleCase 大小写、单 zstd 时回退到 `gzip, deflate, br`、词边界正则不误伤 `fzstd`/`zstd-foo`）。一行调用接到 `headers = { ...req.headers }; delete headers.host` 之后。零依赖、对所有 Node 版本生效、上游 fetch 拿到的就是它能解的算法，链路恢复正常。
+  - **方案权衡**：A 摘 zstd（采纳，1 行、零依赖、Node 全版本兼容）；B 删整个 accept-encoding（不彻底，新 undici 自己又会加回 zstd）；C 检测 `content-encoding: zstd` 时手动 `zlib.createZstdDecompress` 解压（救不到 Node 20、proxy/interceptor 双解码点都要接、二次拷贝）；D 替换为 npm `undici@7`（牵动 interceptor.js 整个 fetch patch 路径）；E bump `engines.node >=22.15`（抬门槛，用户迁移阻力）。结论 A 是当前最小改动 + 最大覆盖。
+  - **测试**：`test/proxy.test.js` 新增 `stripZstdAcceptEncoding` 10 case 覆盖 ① 缺失头静默返回；② 未列 zstd 静默返回；③ 小写头去除 zstd；④ TitleCase 头去除 zstd；⑤ q-value 形式去除；⑥ 单独 zstd 时回退默认值；⑦ 词边界不误伤 `fzstd`；⑧ 不变更入参对象；⑨ 数组型 accept-encoding 容错；⑩ null/undefined 容错。1770/1770 全过 + `npm run build` 通过。
+
+- fix(ui): GitChanges 面板调换顺序——当前工作区变更上移、本地未推送 commit 折叠区下移，中间用 1px dashed 虚线分隔
+  - **需求**：1.6.251 引入「本地未推送 COMMIT」折叠区放在工作区文件树上方，但用户反馈最高频查看的工作区变更应该在上面，未推送 commit 应该在下面，并希望两块之间有视觉分隔。
+  - **改动**：`src/components/GitChanges.jsx` 新增 `unpushedSeparator`（仅 `showUnpushed` 为真时渲染，避免无未推送 commit 仓库出现孤立分隔线），单仓库分支与多仓库分支两处渲染顺序统一调整为 `工作区树 → 虚线 → 未推送 header → 未推送 commits`。`src/components/GitChanges.module.css` 新增 `.unpushedSeparator`：`margin: 6px 8px; border-top: 1px dashed var(--border-primary); opacity: 0.7;`，无 `!important`。
+  - **影响范围**：纯前端 UI 顺序调整，无 i18n 新增、无后端改动、无测试断言变更（现有 `test/git-unpushed.test.js` 校验后端数据不验证 DOM 顺序，纯顺序调整不影响）。
+
+## 1.6.251
+
+- fix(interceptor): Plan C `_inPlaceReplaceDetected` 在并发 mainAgent 请求竞态下漏检的根治（doubled-history 残余 case）
+  - **背景**：1.6.250 已在 client 端消费 `_inPlaceReplaceDetected:true` 信号修掉 SUGGESTION MODE 末位替换的 doubled-history。但实证（cc-viewer 自验证 jsonl line 3489/3487 @21:33:46）发现 teammate 终止快速串行场景下，**信号根本没发出**——interceptor.js Plan C 漏检。
+  - **根因**：`_lastMessagesCount` / `_lastTailFp` 仅在 `_commitDeltaState`（响应完成后）才更新。mainAgent LLM 流式响应耗时数秒，期间若有另一条请求 30ms 内连续 firing（teammate shutdown_response → idle_notification → teammate_terminated 三波快速串行 / SUGGESTION MODE 多次替换），后续请求处理时 prev 状态仍是更早的值，长度比对 `messages.length === _lastMessagesCount` 失败 → Plan C 不触发 → 客户端拿到无信号的 entry → `mergeMainAgentSessions` prefix-overlap=0 → push 整段 → mainAgentSessions 内存翻倍（doubled-history）。
+  - **修法**：`interceptor.js:611-682` 在请求开始处理时即 **eager update** `_lastMessagesCount` / `_lastTailFp`（snapshot 旧值给 Plan C 用），不再等到 `_commitDeltaState`。effect：30ms 内连续 firing 的下一条请求能看到上一条已 in-flight 的 count/fp，Plan C 命中 → 写 `_inPlaceReplaceDetected:true` → 客户端 helper 短路。
+  - **失败请求场景兜底**：如果一个请求 startRequest 后失败，`_lastMessagesCount` 残留为该请求的 length，下一条成功请求会覆盖（不会永久错位）。最差情况是误命中 Plan C 写一个多余 checkpoint，client helper 的 `messages.length === lastSession.messages.length` 守卫会让 fallback 到 mergeMainAgentSessions —— 不会损坏数据。
+  - **delta 计算修正**：line 676 `messages.slice(_lastMessagesCount)` 改为 `messages.slice(_prevMessagesCount)`，否则 eager-updated 的 `_lastMessagesCount` 等于本请求的 length，slice 出空数组（消息被吞）。
+  - **协议契约不变**：`_inPlaceReplaceDetected:true + _isCheckpoint:true` 字段语义与 client `applyInPlaceLastMsgReplace` 之间的 KEEP IN SYNC 关系**完全保持**。本次修法是让 Plan C 检测更可靠，不改双端契约。
+  - **测试**：`test/interceptor-eager-update-race.test.js` 新增 5 case 覆盖：① eager update 命中竞态 in-place replace；② **control case**：关闭 eager update（旧行为）必须漏检（这是原 BUG）；③ sequential 路径回归；④ 3 路连续 replace 全部命中；⑤ 失败请求残留兜底。1759/1759 全过 + `npm run build` 通过；现存 `interceptor-delta-tail-fp.test.js` 8 个 Plan C case 全部仍 pass（eager 对 sequential 行为等价）。
+
+- feat(git): 在 git 变更面板顶部新增「本地未推送 commit」折叠区
+  - **需求**：之前面板只展示工作区未提交变更，看不到本地领先 origin/<branch> 的 commit。
+  - **后端**：`lib/git-diff.js` 新增 `getUnpushedCommits(cwd, {maxCommits=100})`，单次 `git log --pretty='...%x1f...' --name-status @{u}..HEAD` 同时拉 commit 元数据 + 改动文件（用 `\x1e`/`\x1f` 哨兵字符避免 subject 含 tab/换行误解析）；upstream 缺失 / 分离 HEAD / 非分支时返回 `{commits:[], hasUpstream:false}`，前端据此**静默隐藏**该区。同文件扩展 `getGitDiffs(cwd, files, commitHash)` 支持 commit-context diff（旧内容用 `<hash>^:file`，新内容用 `<hash>:file`，状态查 `git diff-tree -r --name-status --root <hash>`，`--root` 让初始 commit 也能正确标记 `A`）。新增 `isValidCommitHash` 严格 hex 校验（7..40 位）防 git 路径注入。
+  - **API**：`server.js` 新增 `GET /api/git-log-unpushed?repo=<path>` 返回 `{commits, hasUpstream, branch, upstream}`；`GET /api/git-diff` 新增可选 `commit=<hash>` 参数（commit-context diff），未通过 `isValidCommitHash` 校验时回退工作区模式不抛错。
+  - **前端**：`src/utils/gitApi.js` `fetchAllRepos` 同时并发拉 `git-status` + `git-log-unpushed`；`src/components/GitChanges.jsx` 抽 `CommitRow` 组件，每行显示短 hash + subject + author + 智能日期（今日时:分 / 否则月-日）+ 文件数 badge，点击展开内嵌 `TreeDir` 渲染该 commit 改动文件；commit-context 文件复用 `STATUS_COLORS`/`STATUS_LABELS`/`buildGitTree`，但隐藏 restore 按钮（commit 已落盘不应工作区 restore）。`selectedCommitHash` 与 `selectedFile`/`selectedRepo` 三元唯一标识高亮，避免工作区文件与同名 commit 文件高亮串扰。`src/components/GitDiffView.jsx` 接受 `commitHash` prop 透传到 API，并在头部多渲染一个短 hash chip 让用户知晓上下文。`src/components/ChatView.jsx` `currentGitDiff` state 增加 `commit` 字段。
+  - **设计决策**（user 单选锁定）：① 顶部折叠区与"工作区变更"并列于同一面板；② 点 commit 行展开文件 + 点文件右侧看 diff（与现有行为一致）；③ 无 upstream / detached HEAD 时静默隐藏该区。
+  - **i18n**：`src/i18n.js` 新增 `ui.gitChanges.unpushedCommits` 18 语言翻译。
+  - **CSS**：`src/components/GitChanges.module.css` 新增 `.unpushedHeader` / `.commitItem` / `.commitArrow` / `.commitHash` / `.commitSubject` / `.commitMeta` / `.commitFileBadge`，无 `!important`。
+  - **测试**：`test/git-unpushed.test.js` 新增 14 case 覆盖 `isValidCommitHash` 校验边界 / `getUnpushedCommits` 无 upstream / detached HEAD / 已同步 / commits ahead / subject 含 tab 的哨兵分隔健壮性 / `getGitDiffs` commit 模式（hash 校验 / 正常 diff / 文件新增 / 文件删除）。1750/1750 全过 + `npm run build` 通过。
+  - **多角色 review**（functional / risk / quality 三 agent）：P0 = 0；P1 三项均判为可接受不动（键盘 a11y 与现有 TreeDir 一致；初始 commit `^:` 已被 `--root` + is_new 守卫消化；R100/C75 截断到首字母不影响渲染）；P2/P3 全 ✓。
+
+- fix(ui): 弱化顶部"新版本"强提醒，移到 footer 版本号后的小黄签
+  - **需求**：顶部 Antd Tag color="orange" 横条强提示视觉过强；用户希望弱化为版本号后的小黄签 + hover 完整文案。
+  - **改动**：`src/components/AppHeader.jsx` 删除 `updateInfo && <Tag color="orange" closable>` 块及对应 `updateInfo`/`onDismissUpdate` props 与 `shouldComponentUpdate` 比较；`src/App.jsx` footer 把原 `<svg>NEW</svg>` 徽章改为 `<Tooltip title={ui.update.majorAvailable}><span className={newBadgeText}>有新版本</span></Tooltip>`，点击仍打开升级 Modal；同步删除传给 AppHeader 的失效 props。
+  - **CSS**：`src/App.module.css` 新增 `.newBadgeText` 用 `--color-warning` / `--color-warning-bg-faint` / `--color-warning-border-light` 渲染黄色 chip + hover 加深；删除已废弃的 `.footerVersionNew` / `.newBadge`。
+  - **i18n**：`src/i18n.js` 新增 `ui.update.newBadge`（"有新版本"）18 语言翻译。
+
+## 1.6.250
+
+- fix(chat): 消费服务端 `_inPlaceReplaceDetected` 信号根治 SUGGESTION MODE 末位替换触发的 doubled-history（实证 cc-viewer 自身复现锁定）
+  - **根因**：`interceptor.js:623-648` Plan C 在 mainAgent wire 上检测到 messages.length 不变但末位 fp 变化时强制写 `_isCheckpoint:true + _inPlaceReplaceDetected:true` 完整 entry。但客户端 `src/AppBase.jsx` `_flushPendingEntries` 从未消费 `_inPlaceReplaceDetected` 字段，依然走 `mergeMainAgentSessions` → `sessionMerge.js:113` prefix-overlap 算法。该算法在 `newLen===currentLen + 末位 fp 异` 必然 `maxOv = N-1` 永远找不到 K=N 全等匹配 → `overlap=0` → push 整段 newMessages → `lastSession.messages` 长度翻倍（doubled-history）。前端 ChatView 按 ts 渲染整段 → 视觉上每个 mainAgent bubble 在它自己 timestamp 旁多出一份相同内容 → "多位置穿插+整个 session 历史"翻倍。
+  - **复现实证**（cc-viewer 自身验证）：用户反复关 hunter teammate（每次输入 `'继续关闭 @hunter-X'` 替换 SUGGESTION MODE 末位）时，jsonl `_inPlaceReplaceDetected:true` 与 BUG 出现 1:1 对应（hunter-D ln=2029 / hunter-E ln=2047 命中 → BUG 触发；hunter-B ln=1981 `_isCheckpoint:false` 走 delta 路径 → 不触发）。
+  - **修法**：在 `src/utils/sessionManager.js` 新增 `applyInPlaceLastMsgReplace(prevSessions, entry, timestamp, isNewSession)` helper —— 命中信号时构造新 lastSession（前 N-1 条 message 引用复用 + 末位用 `entry.body.messages[N-1]`），返回 `{applied: true, sessions}`；未命中返回 `{applied: false}` 让调用方走原 `mergeMainAgentSessions` 路径。`AppBase.jsx:1234` 在 `assignMessageTimestamps` 后、`mergeMainAgentSessions` 前调用 helper，`applied=true` 直接接收 sessions 跳过 sessionMerge。
+  - **避开 1.6.249 拆 Layer 2 两个坑**：① 不靠客户端 fp 启发式（直接看服务端明确信号 `_inPlaceReplaceDetected:true`，interceptor 端 fp 检测更准、只在确定命中时才写）② 不覆盖整个 `lastSession.messages`（只替末位，保留前 N-1 引用 → 同 carrier ts 多条 message 不会被误并、`_timestamp` / `_generatedTs` 等 metadata 全保留）。
+  - **不修 sessionMerge.js 算法**：用户铁戒 + 9711024 反向锚点重写已证算法重写无效（算法层面无法可靠区分 in-place last-msg replace vs Plan Mode 全替换 sliding window，两者都是 `newLen===currentLen + 末位 fp 异`）。信号驱动是正交修复维度——不动 sessionMerge 内部，在 AppBase 入口加 helper 短路。
+  - **下游 React 重渲染影响（必要代价，非性能 bug）**：`lastSession` 引用变化是**必要的**——ChatView `_sessionItemCache[last].session !== session` → cache miss → 该 session 全量重渲染。这正是修复要的效果：让末位 ChatMessage 真重渲染才能显示新内容（用户真实输入替换 SUGGESTION MODE）。**反例**：如果 in-place mutate `lastSession.messages[N-1]` 不换 lastSession 引用 → ChatView 走 FULL HIT 路径复用 sc.items → 末位 chip 不刷新 → 用户看不到自己的输入 → 修复破坏。前 N-1 条 message 元素引用稳定 → React reconciliation 复用 DOM 大部分；只有末位 ChatMessage 真重渲。in-place replace 是低频事件（用户输入触发，非高频流式），N=200 场景估算 50-150ms，性能影响可控。
+  - **协议契约**（KEEP IN SYNC: `interceptor.js:644` 与 `src/utils/sessionManager.js applyInPlaceLastMsgReplace`）：服务端写 `_inPlaceReplaceDetected:true` 当且仅当 wire 上 mainAgent messages.length 不变但末位 fp 变化（_isCheckpoint:true 同时存在）。客户端 helper 是该字段唯一消费方。重命名 / 删除前需双端同步 + 跑 test/interceptor-delta-tail-fp.test.js + test/session-manager.test.js 双向回归。
+  - **测试**：`test/session-manager.test.js` 新增 `describe('applyInPlaceLastMsgReplace')` 8 case 锁死：① 命中信号 → 在原地替换末位、前 N-1 引用稳定、长度不翻倍、lastSession 引用变化；② 无 `_inPlaceReplaceDetected` 字段 → applied=false fallback；③ `isNewSession=true` → applied=false 保留新 session 起点语义；④ `messages.length` 不一致 → applied=false 防误吃增量 push；⑤ 空 `prevSessions` → applied=false 让首条 entry 走 mergeMainAgentSessions 创建初始；⑥ `messages.length > currentLen` → applied=false（防意外消费信号导致丢消息，5 角色 review 采纳建议）；⑦ `entry.response` 缺失 → applied=false 防 ChatView Last Response 污染（5 角色 review 采纳建议）；⑧ `messages.length < 2` → applied=false（单消息退化为完全替换不安全，5 角色 review 采纳建议）。1739/1739 pass + `npm run build` 通过（5 角色 review 后净加 +44 LOC：3 case 防御性测试 + 5 守卫 + 2 段协议契约注释）。
 
 - refactor(chat): 流式吸底状态机抽离为 StickyBottomController（修 4 个设计缺陷 + 锁泄漏 P0 + 死循环 P0）
   - **真因**：`ChatView.jsx` 流式吸底（stickyBottom）经多轮迭代后过度复杂 —— **11 个状态字段** + **7 处独立 scrollTop 写入** + **3 套并行机制**（Virtuoso 原生 followOutput / 自研双 rAF 缓动 / RO `_followToTargetIfSticky`）互打补丁。已识别 4 个致命设计缺陷：

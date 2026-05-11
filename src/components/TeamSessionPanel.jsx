@@ -174,7 +174,14 @@ function TeamButton({ requests, onOpenSession, navBtnClass }) {
   // spinner 只看 parser 态（不等 runtime 回包就能显示）
   const hasActiveTeam = teamSessions.some(s => !s.endTime || isWeakEnd(s));
   return (
-    <Popover content={content} trigger="hover" placement="rightTop" onOpenChange={setPopoverOpen}
+    <Popover
+      content={<div style={{ maxHeight: 'calc(100vh - 48px)', overflowY: 'auto', overflowX: 'hidden' }}>{content}</div>}
+      trigger="hover"
+      placement="right"
+      arrow={{ pointAtCenter: true }}
+      autoAdjustOverflow={false}
+      align={{ overflow: { adjustX: true, shiftY: true } }}
+      onOpenChange={setPopoverOpen}
       overlayInnerStyle={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-light)', padding: 0 }}>
       <button className={`${navBtnClass || ''} ${styles.teamBtnRelative}`} title={t('ui.teamSessions')}>
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">

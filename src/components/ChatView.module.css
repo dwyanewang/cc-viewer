@@ -92,7 +92,7 @@
 
 .stickyBottomBtn {
   position: absolute;
-  right: 0;
+  right: 12px;
   bottom: 0;
   display: flex;
   flex-direction: column;
@@ -245,13 +245,29 @@
   object-fit: cover;
 }
 
-.userPromptNavList {
-  max-height: 400px;
-  overflow-y: auto;
+.userPromptNavWrap {
+  display: flex;
+  flex-direction: column;
   min-width: 200px;
   max-width: 360px;
-  background: var(--bg-container);
-  border-radius: 4px;
+  /* 上下各留 24px：顶部贴标题栏，底部留出 footer 视觉余量 */
+  max-height: calc(100vh - 48px);
+}
+
+.userPromptNavTitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  padding: 4px 12px 8px;
+  border-bottom: 1px solid var(--border-primary);
+  flex-shrink: 0;
+}
+
+.userPromptNavList {
+  overflow-y: auto;
+  overflow-x: hidden;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .userPromptNavItem {

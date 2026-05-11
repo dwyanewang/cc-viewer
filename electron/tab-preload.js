@@ -7,4 +7,5 @@ contextBridge.exposeInMainWorld('tabAPI', {
   onTabsUpdated: (cb) => ipcRenderer.on('tabs-updated', (_, tabs) => cb(tabs)),
   onTabActivated: (cb) => ipcRenderer.on('tab-activated', (_, tabId) => cb(tabId)),
   onThemeChanged: (cb) => ipcRenderer.on('theme-changed', (_, theme) => cb(theme)),
+  onFullscreenChanged: (cb) => ipcRenderer.on('fullscreen-changed', (_, isFullscreen) => cb(isFullscreen)),
 });

@@ -10,7 +10,7 @@ import { formatTokenCount, filterRelevantRequests, isRelevantRequest, appendCach
 import { isMainAgent, isPostClearCheckpoint } from './utils/contentFilter';
 import { apiUrl } from './utils/apiUrl';
 import { saveEntries, loadEntries, clearEntries, getCacheMeta, saveSessionEntries, loadSessionEntries, saveSessionIndex } from './utils/entryCache';
-import { buildSessionIndex, splitHotCold, mergeSessionIndices, HOT_SESSION_COUNT, assignMessageTimestamps } from './utils/sessionManager';
+import { buildSessionIndex, splitHotCold, mergeSessionIndices, HOT_SESSION_COUNT, assignMessageTimestamps, applyInPlaceLastMsgReplace } from './utils/sessionManager';
 import { mergeMainAgentSessions as _mergeMainAgentSessions } from './utils/sessionMerge';
 import { reconstructEntries, createIncrementalReconstructor } from '../lib/delta-reconstructor.js';
 import { createEntrySlimmer, createIncrementalSlimmer, restoreSlimmedEntry, internEntryBigFields } from './utils/entry-slim.js';
@@ -98,7 +98,7 @@ class AppBase extends React.Component {
       logDir: '',
       showFullToolContent: false,
       showThinkingSummaries: false,
-      themeColor: 'dark',
+      themeColor: 'light',
       claudeMissing: false,
       updateModalVisible: false,
       fileLoading: false,
@@ -376,21 +376,22 @@ class AppBase extends React.Component {
           return { approvalPrefs: next };
         });
       }
-      if (data.themeColor) {
-        this.setState({ themeColor: data.themeColor });
-        document.documentElement.setAttribute('data-theme', data.themeColor === 'light' ? 'light' : 'dark');
-      }
+      // hydrate：prefs 没保存过 themeColor 时回退到当前 state（首次安装是 'light'）。
+      // 不写回 prefs（这一路是从 prefs 读出来的），但写 localStorage 让 inline boot script 抢占。
+      const effective = (data.themeColor === 'light' || data.themeColor === 'dark')
+        ? data.themeColor
+        : this.state.themeColor;
+      this._applyTheme(effective);
       // filterIrrelevant 默认 true，showAll = !filterIrrelevant
       const filterIrrelevant = data.filterIrrelevant !== undefined ? !!data.filterIrrelevant : true;
       this.setState({ showAll: !filterIrrelevant });
       if (data.logDir) {
         this.setState({ logDir: data.logDir });
       }
-      // URL 参数覆盖主题（白名单校验防 XSS）
+      // URL 参数覆盖主题（白名单校验防 XSS）。一次性覆盖，不写回 prefs，但同步 localStorage。
       const urlTheme = new URLSearchParams(window.location.search).get('theme');
       if (urlTheme === 'light' || urlTheme === 'dark') {
-        this.setState({ themeColor: urlTheme });
-        document.documentElement.setAttribute('data-theme', urlTheme);
+        this._applyTheme(urlTheme);
       }
     });
 
@@ -1231,9 +1232,18 @@ class AppBase extends React.Component {
 
           // 赋 _timestamp 和 _generatedTs（assistant 角色新增 msg 拿 prevMainAgentTs 反映生成时 ts）
           assignMessageTimestamps(messages, prevMessages, isNewSession, prevCount, timestamp, this._prevMainAgentTs);
-          // SSE 实时追加：每条 entry 都已是完整 request+response，不存在中间态，
-          // 跳过 transient 过滤以避免误伤真实的 /clear → 短消息对话。
-          mainAgentSessions = this.mergeMainAgentSessions(mainAgentSessions, entry, { skipTransientFilter: true });
+          // 信号驱动短路：服务端已检测到末位替换（_inPlaceReplaceDetected:true）→ 直接 in-place
+          // 替换 lastSession.messages 末位，避开 sessionMerge prefix-overlap 算法在
+          // newLen===currentLen+末位fp异 场景必然 overlap=0 → push 整段 → 翻倍的陷阱。
+          // helper 协议详见 src/utils/sessionManager.js applyInPlaceLastMsgReplace JSDoc。
+          const inPlaceResult = applyInPlaceLastMsgReplace(mainAgentSessions, entry, timestamp, isNewSession);
+          if (inPlaceResult.applied) {
+            mainAgentSessions = inPlaceResult.sessions;
+          } else {
+            // SSE 实时追加：每条 entry 都已是完整 request+response，不存在中间态，
+            // 跳过 transient 过滤以避免误伤真实的 /clear → 短消息对话。
+            mainAgentSessions = this.mergeMainAgentSessions(mainAgentSessions, entry, { skipTransientFilter: true });
+          }
 
           // 记录本次 mainAgent entry 的 timestamp，给下一次 entry 处理时
           // 当作 _generatedTs 赋给新增 assistant msg（反映"生成时刻"）。
@@ -1545,11 +1555,27 @@ class AppBase extends React.Component {
     this.context.updatePreferences({ approvalModal: next });
   };
 
+  /**
+   * 主题应用收口：state / <html data-theme> / localStorage 三处镜像同步。
+   * 三个调用方（hydrate / urlTheme / handleThemeColorChange）行为差异收敛到 opts。
+   *
+   * 幂等：setAttribute 只在值变化时调用，避免唤醒 TerminalPanel MutationObserver
+   *       重赋 xterm theme（80×24 cell 重算 1-3ms）。
+   */
+  _applyTheme = (value, opts = {}) => {
+    const theme = value === 'light' ? 'light' : 'dark';
+    const { persistPref = false, remountMermaid = false } = opts;
+    if (this.state.themeColor !== theme) this.setState({ themeColor: theme });
+    if (document.documentElement.getAttribute('data-theme') !== theme) {
+      document.documentElement.setAttribute('data-theme', theme);
+    }
+    try { localStorage.setItem('ccv_themeColor', theme); } catch {}
+    if (remountMermaid) reinitializeMermaid();
+    if (persistPref) this.context.updatePreferences({ themeColor: theme });
+  };
+
   handleThemeColorChange = (value) => {
-    this.setState({ themeColor: value });
-    document.documentElement.setAttribute('data-theme', value === 'light' ? 'light' : 'dark');
-    reinitializeMermaid();
-    this.context.updatePreferences({ themeColor: value });
+    this._applyTheme(value, { persistPref: true, remountMermaid: true });
     // 切换主题后让终端获得焦点，便于用户看到 /theme 切换效果
     window.dispatchEvent(new CustomEvent('ccv-focus-terminal'));
   };
