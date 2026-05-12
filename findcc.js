@@ -129,7 +129,7 @@ export function resolveNpmClaudePath() {
       if (result && existsSync(result)) {
         // 只接受 npm 安装的符号链接（解析后指向 node_modules）
         try {
-          const real = realpathSync(line);
+          const real = realpathSync(result);
           if (real.includes('node_modules')) {
             // realpath 在 Win 上是 backslash，统一 normalize 成 '/' 再匹配
             const normReal = real.replace(/\\/g, '/');
@@ -187,10 +187,10 @@ export function resolveNativePath() {
         // 只排除 .js 文件（老版本 npm 分发的 cli.js，需要 node 运行，
         // 由 resolveNpmClaudePath 处理）。Claude Code 2.x+ 的 npm 包内
         // 直接打包了原生二进制（bin/claude.exe），应当作 native 处理。
-        let real = line;
-        try { real = realpathSync(line); } catch { }
+        let real = result;
+        try { real = realpathSync(result); } catch { }
         if (real.endsWith('.js')) continue;
-        return line;
+        return result;
       }
     } catch {
       // ignore
