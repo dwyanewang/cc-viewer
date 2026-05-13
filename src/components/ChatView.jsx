@@ -13,7 +13,7 @@ import { getModelInfo, getEffectiveModel, resolveProducerModelInfo } from '../ut
 import { getTeammateAvatar } from '../utils/teammateAvatars';
 import { isSystemText, classifyUserContent, isMainAgent, isTeammate, resolveTeammateNames } from '../utils/contentFilter';
 import { classifyRequest, formatRequestTag, formatTeammateLabel } from '../utils/requestType';
-import { buildChunksForAnswer } from '../utils/ptyChunkBuilder';
+import { buildChunksForAnswer, buildBracketPasteSubmitChunks, BRACKET_PASTE_SUBMIT_SETTLE_MS } from '../utils/ptyChunkBuilder';
 import { isPlanApprovalPrompt, isDangerousOperationPrompt, parseToolInfoFromBuffer } from '../utils/promptClassifier';
 import { isImageFile, isMutatingCommand } from '../utils/commandValidator';
 import { loadExpandedPaths, saveExpandedPaths } from '../utils/fileExpandedPathsStorage';
@@ -2046,12 +2046,20 @@ class ChatView extends React.Component {
   handlePresetSend = (description) => {
     if (!description) return;
     const textarea = this._inputRef.current;
-    if (!textarea) return;
-    textarea.value = description;
-    textarea.style.height = 'auto';
-    textarea.style.height = Math.min(textarea.scrollHeight, (isMobile && !isPad) ? 160 : 120) + 'px';
-    this.setState({ inputEmpty: false });
-    textarea.focus();
+    if (textarea) {
+      textarea.value = description;
+      textarea.style.height = 'auto';
+      textarea.style.height = Math.min(textarea.scrollHeight, (isMobile && !isPad) ? 160 : 120) + 'px';
+      this.setState({ inputEmpty: false });
+      textarea.focus();
+    } else if (this._inputWs && this._inputWs.readyState === WebSocket.OPEN) {
+      // 终端模式下没有 textarea，直接通过 PTY 发送
+      this._inputWs.send(JSON.stringify({
+        type: 'input-sequential',
+        chunks: [description, '\r'],
+        settleMs: 50,
+      }));
+    }
   };
 
   // ─── UltraPlan handlers ─────────────────────────────────
@@ -2072,16 +2080,27 @@ class ChatView extends React.Component {
     }
     if (!assembled) return;
 
-    // 复用对话输入框的发送方式：写入 textarea → 触发 handleInputSend
-    const textarea = this._inputRef.current;
-    if (textarea) {
-      textarea.value = assembled;
-      textarea.style.height = 'auto';
-      textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
-      this.setState({ inputEmpty: false, ultraplanModalOpen: false, ultraplanPrompt: '', ultraplanVariant: 'codeExpert', ultraplanFiles: [] }, () => {
-        this.handleInputSend();
-      });
-    }
+    this.setState({
+      ultraplanModalOpen: false,
+      ultraplanPrompt: '',
+      ultraplanVariant: 'codeExpert',
+      ultraplanFiles: [],
+      pendingInput: userInput,
+      inputSuggestion: null,
+    }, () => {
+      if (this._inputWs && this._inputWs.readyState === WebSocket.OPEN) {
+        if (this.props.sdkMode) {
+          this._inputWs.send(JSON.stringify({ type: 'sdk-user-message', text: assembled }));
+        } else {
+          this._inputWs.send(JSON.stringify({
+            type: 'input-sequential',
+            chunks: buildBracketPasteSubmitChunks(assembled),
+            settleMs: BRACKET_PASTE_SUBMIT_SETTLE_MS,
+          }));
+        }
+      }
+      this.scrollToBottom();
+    });
   };
 
   _handleUltraplanUpload = () => {
