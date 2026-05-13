@@ -477,6 +477,7 @@ async function runSdkMode(extraClaudeArgs = [], cwd, noOpen = false) {
 
   // 注册 SDK 回调到 server.js（WS 消息路由用）
   serverMod.setSdkResolveApproval(sdkManager.resolveApproval);
+  serverMod.setSdkCancelApproval(sdkManager.cancelApproval);
   serverMod.setSdkSendUserMessage(sdkManager.sendUserMessage);
 
   // 自动打开浏览器

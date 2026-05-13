@@ -158,6 +158,8 @@ function _notifyParentPending(msg) {
     case 'sdk-ask-timeout':
     case 'ask-hook-resolved':
     case 'sdk-ask-resolved':
+    case 'ask-hook-cancelled':
+      // 注：ask-cancel handler 统一发 ask-hook-cancelled（不论 SDK / Hook 路径）。
       event = { type: 'pending-remove', kind: 'ask', id: msg.id != null ? String(msg.id) : '__ask__' };
       break;
     default:
@@ -2448,7 +2450,8 @@ async function handleRequest(req, res) {
           }
         }
 
-        const HOOK_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+        const HOOK_TIMEOUT = 60 * 60 * 1000; // 60 minutes — 等价 terminal Claude Code 的"无超时"体验
+        // (terminal interactiveHandler 本身无 timeout，hook 子进程层 10min；这里 60min 远超人类响应时间)
         // toolUseId 路由策略：
         //  - char whitelist + ≤256 长度 防恶意 1MB key 撑大 Map
         //  - 已存在同 id 但旧 res 已断（writableEnded/destroyed）→ 复用槽位（ask-bridge 重试场景）
@@ -2533,11 +2536,12 @@ async function handleRequest(req, res) {
           }
         }, HOOK_TIMEOUT);
 
-        pendingAskHooks.set(id, { questions, res, timer, createdAt: Date.now() });
+        const askStartedAt = Date.now();
+        pendingAskHooks.set(id, { questions, res, timer, createdAt: askStartedAt });
 
-        // Broadcast to all terminal WS clients
+        // Broadcast to all terminal WS clients — 附 startedAt + timeoutMs 让前端渲染倒计时
         if (terminalWss) {
-          const pmsg = JSON.stringify({ type: 'ask-hook-pending', id, questions });
+          const pmsg = JSON.stringify({ type: 'ask-hook-pending', id, questions, startedAt: askStartedAt, timeoutMs: HOOK_TIMEOUT });
           terminalWss.clients.forEach((client) => {
             if (client.readyState === 1) {
               try { client.send(pmsg); } catch {}
@@ -4161,6 +4165,27 @@ async function setupTerminalWebSocket(httpServer) {
         ws.send(JSON.stringify({ type: 'data', data: buffer }));
       }
 
+      // Replay pending ask-hook 请求：浏览器关 tab 再开（或 ws 重连）时，
+      // 让新 ws 立即收到当前 server-side 仍 long-poll 的 ask 列表 + startedAt + 剩余 timeoutMs，
+      // 否则前端 askMetaMap 空 → 倒计时不渲染 + lastPendingAskId 派生错。
+      // ASK_HOOK_TIMEOUT 在闭包外（line 2425 const HOOK_TIMEOUT），不直接可见 — 用 60min 字面量同源。
+      const REPLAY_HOOK_TIMEOUT = 60 * 60 * 1000;
+      const now = Date.now();
+      for (const [id, entry] of pendingAskHooks) {
+        const elapsed = now - (entry.createdAt || now);
+        const remaining = Math.max(0, REPLAY_HOOK_TIMEOUT - elapsed);
+        if (remaining <= 0) continue;
+        try {
+          ws.send(JSON.stringify({
+            type: 'ask-hook-pending',
+            id,
+            questions: entry.questions,
+            startedAt: now,        // 让前端按"还剩 remaining"起算（不是原 createdAt）
+            timeoutMs: remaining,  // 剩余可用时间
+          }));
+        } catch {}
+      }
+
       // 兜底重绘标记：claude TUI 在 alternate-screen 下只在收到 SIGWINCH 时重绘整屏。
       // 若前端首次 resize 与 PTY 当前尺寸恰好相等，pty.resize noop 不发 SIGWINCH → 前端空白。
       // 该 ws 收到第一条 resize 时（见 ws.on('message')），抖动 (rows+1) → (rows) 触发 SIGWINCH。
@@ -4247,18 +4272,15 @@ async function setupTerminalWebSocket(httpServer) {
           } else if (msg.type === 'ask-hook-answer') {
             // Client answered AskUserQuestion via hook bridge.
             // New protocol: msg.id required to address one of multiple pending asks.
-            // Legacy fallback: no id → resolve the oldest pending ask (preserves pre-Map client behavior).
+            // 老协议 fallback（取最老）已废弃 — 多 pending 时会"答错对象"造成串答；
+            // 缺 id 直接 WARN 并丢弃，让前端在 console 里看到为什么答案没生效。
             let askAnswered = false;
             let askId = msg.id;
             let askEntry = null;
             if (askId) {
               askEntry = pendingAskHooks.get(askId);
             } else {
-              const firstId = pendingAskHooks.keys().next().value;
-              if (firstId) {
-                askId = firstId;
-                askEntry = pendingAskHooks.get(firstId);
-              }
+              console.warn('[server] ask-hook-answer missing id — legacy fallback removed to prevent cross-question mis-routing; ignoring');
             }
             if (askEntry) {
               const { res: hookRes, timer } = askEntry;
@@ -4280,6 +4302,21 @@ async function setupTerminalWebSocket(httpServer) {
               });
             }
             if (askAnswered) _notifyParentPending({ type: 'ask-hook-resolved', id: askId });
+            // entry 不在（LRU evicted / 已答 / 跨 client race / 60min 超时）— 给发起方 ack
+            // ask-hook-cancelled 让前端关 modal + _pendingFlushQueue 兜底处理（如有 user
+            // message 等 ack 待 flush）。行为对齐 ask-cancel handler handled=false 分支语义。
+            // 不广播给其他 client（与 ack-cancel handled=false 一致），防误覆盖真实 answer。
+            if (!askAnswered && askId) {
+              try {
+                if (ws && ws.readyState === 1) {
+                  ws.send(JSON.stringify({
+                    type: 'ask-hook-cancelled',
+                    id: askId,
+                    reason: 'Ask entry no longer exists (timeout / evicted / already resolved)',
+                  }));
+                }
+              } catch {}
+            }
           } else if (msg.type === 'perm-hook-answer') {
             // Permission approval — SDK mode (canUseTool) or PTY mode (hook bridge)
             let permAnswered = false;
@@ -4319,6 +4356,61 @@ async function setupTerminalWebSocket(httpServer) {
               });
             }
             if (msg.id) _notifyParentPending({ type: 'sdk-ask-resolved', id: msg.id });
+          } else if (msg.type === 'ask-cancel') {
+            // 用户主动取消 AskUserQuestion（或 ChatInputBar 提交新 prompt 时打断 pending ask）。
+            // 双模式分流：先查 SDK _pendingApprovals → 再查 Hook pendingAskHooks → 都没有也广播 ack
+            // (LRU evicted / plugin-already-resolved / WS 重发等场景兜底，让所有 client modal 同步关掉)。
+            // cancelId/Reason 校验：与 toolUseId 同套白名单（≤256 字符 + [a-zA-Z0-9_-]）+ reason ≤500
+            // 防恶意/buggy client 塞超长 key 撑大 _pendingApprovals 或塞 1MB reason 打爆 broadcast。
+            const rawId = msg.id != null ? String(msg.id) : null;
+            const cancelId = rawId && rawId.length > 0 && rawId.length <= 256 && /^[a-zA-Z0-9_-]+$/.test(rawId) ? rawId : null;
+            if (rawId && !cancelId) {
+              console.warn('[server] ask-cancel rejected: invalid id format');
+              return;
+            }
+            const cancelReason = (typeof msg.reason === 'string' ? msg.reason : 'User aborted').slice(0, 500);
+            let handled = false;
+            // SDK 路径：调 cancelApproval 让 _waitForApproval resolve cancel sentinel
+            // (sdk-manager.js canUseTool 检测 sentinel 后返回 { behavior: 'deny', message: cancelReason }
+            //  → SDK 包内置 ensureToolResultPairing 兜住 transcript)
+            if (cancelId && _sdkCancelApproval) {
+              try { handled = _sdkCancelApproval(cancelId, cancelReason) === true; } catch {}
+            }
+            // Hook 路径：给对应 res 回 200 + { cancelled: true, reason }
+            // ask-bridge.js 检测 cancelled 字段后输出 { hookSpecificOutput: { permissionDecision: 'deny', ... } }
+            if (!handled && cancelId) {
+              const askEntry = pendingAskHooks.get(cancelId);
+              if (askEntry) {
+                const { res: hookRes, timer } = askEntry;
+                if (timer) clearTimeout(timer);
+                pendingAskHooks.delete(cancelId);
+                handled = true;
+                try {
+                  if (hookRes && !hookRes.headersSent) {
+                    hookRes.writeHead(200, { 'Content-Type': 'application/json' });
+                    hookRes.end(JSON.stringify({ cancelled: true, reason: cancelReason }));
+                  }
+                } catch {}
+              }
+            }
+            // ack 广播分两档：
+            //   - handled=true（真的取消了 SDK 或 Hook entry）→ 广播给所有 client + 通知 parent
+            //   - handled=false（LRU evicted / plugin 已答 / 重发等）→ 只 ack 给发起方，不广播
+            //     原因：那些场景下其他 client 看到的是 answered 而非 cancelled，广播会让前端
+            //     localAskAnswers 误覆盖真实 answer 涂成灰态。发起方自身已经乐观写过，此时
+            //     server 的 ack 实际只起"sync 错过的 ack"作用。
+            if (cancelId) {
+              const cmsg = JSON.stringify({ type: 'ask-hook-cancelled', id: cancelId, reason: cancelReason });
+              if (handled && terminalWss) {
+                terminalWss.clients.forEach((c) => {
+                  if (c.readyState === 1) try { c.send(cmsg); } catch {}
+                });
+                _notifyParentPending({ type: 'ask-hook-cancelled', id: cancelId });
+              } else if (!handled && ws && ws.readyState === 1) {
+                // 仅 ack 给发起方，让其前端 _waitingCancelAck flush user message
+                try { ws.send(cmsg); } catch {}
+              }
+            }
           } else if (msg.type === 'sdk-plan-answer') {
             // Plan approval in SDK mode
             if (_sdkResolveApproval) {
@@ -4535,7 +4627,8 @@ export function broadcastWsMessage(msg) {
   // 显式调用 _notifyParentPending 的分支（ask-hook-resolved 等）走 ws.send 不进这里，无重复触发。
   if (msg && typeof msg === 'object' && typeof msg.type === 'string'
       && (msg.type === 'sdk-ask-pending' || msg.type === 'sdk-ask-resolved' || msg.type === 'sdk-ask-timeout'
-          || msg.type === 'ask-hook-pending' || msg.type === 'ask-hook-resolved' || msg.type === 'ask-hook-timeout')) {
+          || msg.type === 'ask-hook-pending' || msg.type === 'ask-hook-resolved' || msg.type === 'ask-hook-timeout'
+          || msg.type === 'ask-hook-cancelled')) {
     _notifyParentPending(msg);
   }
 }
@@ -4543,6 +4636,12 @@ export function broadcastWsMessage(msg) {
 /** Reference to sdk-manager's resolveApproval (set by cli.js after import). */
 let _sdkResolveApproval = null;
 export function setSdkResolveApproval(fn) { _sdkResolveApproval = fn; }
+
+/** Reference to sdk-manager's cancelApproval (set by cli.js after import). */
+// 与 _sdkResolveApproval 平行——但语义不同：cancelApproval 让 _waitForApproval resolve
+// 一个 cancel sentinel，让 canUseTool 走 deny 分支（而非 allow）。
+let _sdkCancelApproval = null;
+export function setSdkCancelApproval(fn) { _sdkCancelApproval = fn; }
 
 /** Reference to sdk-manager's sendUserMessage (set by cli.js after import). */
 let _sdkSendUserMessage = null;

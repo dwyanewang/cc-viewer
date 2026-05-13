@@ -102,12 +102,27 @@ export default function ApprovalModal({
     activePtyPlanId: visibleKinds.includes('ptyPlan') ? _idForKind('ptyPlan', approvalGlobal) : null,
   }), [slotsReady, visibleKinds, approvalGlobal]);
 
-  // ESC dismiss — listens globally so it works even when focus is elsewhere.
+  // ESC = minimise（pending 保留）
+  // Cmd/Ctrl+ESC = cancel（仅对 ask 类型生效，等价 terminal Claude Code 的 onAbort）—
+  // 等价路径：ChatView.handleAskCancel 走 ask-cancel WS 协议 + SDK 包内置 ensureToolResultPairing 闭合 transcript。
+  //
+  // preventDefault + stopPropagation 防 ESC 冒泡到下层（textarea / 全局 PTY keydown listener
+  // 等）误触发副作用 — 已观察到的复现：modal 内按 ESC 后 inline 卡片提交报 pty-prompt-invalid。
   const handleEsc = useCallback((e) => {
     if (e.key !== 'Escape') return;
     if (!activeKind) return;
     const id = _idForKind(activeKind, approvalGlobal);
-    if (id != null && onDismiss) onDismiss(activeKind, id);
+    if (id == null) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if ((e.metaKey || e.ctrlKey) && activeKind === 'ask') {
+      const cancelFn = approvalGlobal?.ask?.handlers?.cancel;
+      if (cancelFn) {
+        cancelFn(id, 'User aborted');
+        return;
+      }
+    }
+    if (onDismiss) onDismiss(activeKind, id);
   }, [activeKind, approvalGlobal, onDismiss]);
 
   useEffect(() => {
@@ -204,6 +219,11 @@ export default function ApprovalModal({
             </div>
             <div className={styles.footer}>
               <span>{_tr('ui.approval.modal.dismissHint', null, 'ESC or click outside to minimise (pending stays)')}</span>
+              {activeKind === 'ask' && approvalGlobal?.ask?.handlers?.cancel && (
+                <span className={styles.dismissHintExtra}>
+                  {_tr('ui.approval.modal.cancelHint', null, '⌘/Ctrl+ESC to cancel')}
+                </span>
+              )}
               <button className={styles.dismissBtn} onClick={handleManualDismiss}>
                 {_tr('ui.approval.modal.dismiss', null, 'Minimise')}
               </button>
