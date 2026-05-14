@@ -1,6 +1,20 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useContext } from 'react';
 import { t } from '../i18n';
+import { SettingsContext } from '../contexts/SettingsContext';
+import { playEvent as playVoiceEvent } from '../utils/voicePackPlayer';
 import styles from './ChatMessage.module.css';
+
+// Voice-pack warning thresholds (ms remaining). Two-tier:
+// 60 s alone is too late — user may already be away from the keyboard.
+const VOICE_WARNING_THRESHOLDS = [
+  { eventKey: 'timeoutWarning5min', remainingMs: 5 * 60 * 1000 },
+  { eventKey: 'timeoutWarning60s',  remainingMs: 60 * 1000 },
+];
+
+// Derived from VOICE_WARNING_THRESHOLDS so adding a 3rd threshold (e.g. 30 min)
+// doesn't require updating both lists().
+const _emptyFiredLatch = () =>
+  VOICE_WARNING_THRESHOLDS.reduce((acc, { eventKey }) => { acc[eventKey] = false; return acc; }, {});
 
 /**
  * AskUserQuestion 倒计时显示 — 独立小组件，自己持有 setInterval，
@@ -29,9 +43,24 @@ export default function AskTimeoutCountdown({ startedAt, timeoutMs }) {
 
   const [remaining, setRemaining] = useState(compute);
   const timerRef = useRef(null);
+  // Per-threshold latch — each warning fires at most once per (startedAt, timeoutMs).
+  // Resets in the effect when those props change (new ask = new countdown).
+  const firedRef = useRef(_emptyFiredLatch());
+  const settingsCtx = useContext(SettingsContext);
+  // Hold latest voicePack settings in a ref so the tick closure reads fresh values
+  // (toggling enabled mid-countdown is a real user flow, and useEffect deps are
+  // intentionally minimal — we don't want to tear down the interval on every prefs change).
+  // Ref write happens in an effect (NOT during render) to satisfy React StrictMode
+  //().
+  const voicePackRef = useRef(null);
+  useEffect(() => {
+    voicePackRef.current = settingsCtx?.preferences?.approvalModal?.voicePack || null;
+  });
 
   useEffect(() => {
     if (!validStartedAt || !validTimeoutMs) return undefined;
+    // New (startedAt, timeoutMs) tuple = fresh countdown = re-arm warnings.
+    firedRef.current = _emptyFiredLatch();
     // 初始计算一次（prop 变化时同步刷新）
     setRemaining(compute());
 
@@ -39,10 +68,27 @@ export default function AskTimeoutCountdown({ startedAt, timeoutMs }) {
     const initial = Math.max(0, validTimeoutMs - (Date.now() - validStartedAt));
     if (initial <= 0) return undefined;
 
+    const fireWarningsIfDue = (rMs) => {
+      const vp = voicePackRef.current;
+      if (!vp || vp.enabled !== true) return;
+      for (const { eventKey, remainingMs } of VOICE_WARNING_THRESHOLDS) {
+        // Skip if user disabled this specific event (events[key] === null).
+        if (!vp.events || !vp.events[eventKey]) continue;
+        if (firedRef.current[eventKey]) continue;
+        // Threshold *crossing*: only when initial > remainingMs (i.e. we mounted
+        // before the warning was due) AND current rMs is at or below the line.
+        if (initial > remainingMs && rMs <= remainingMs) {
+          firedRef.current[eventKey] = true;
+          try { playVoiceEvent(eventKey, vp, { dedupeKey: `${eventKey}:${validStartedAt}` }); } catch {}
+        }
+      }
+    };
+
     const tick = () => {
       // 每次都基于 wall-clock 重算，drift 不累积
       const r = Math.max(0, validTimeoutMs - (Date.now() - validStartedAt));
       setRemaining(r);
+      fireWarningsIfDue(r);
       // 到 0 主动清，防空跑（cleanup 在 unmount 时再清一次，幂等）
       if (r <= 0 && timerRef.current) {
         clearInterval(timerRef.current);

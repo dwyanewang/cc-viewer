@@ -741,7 +741,7 @@
   max-height: min(400px, 50vh);
   overflow-x: hidden;
   overflow-y: auto;
-  border: 1px solid var(--color-primary-dark-bg);
+  border: 1px solid var(--border-primary);
 }
 
 .planFeedback {

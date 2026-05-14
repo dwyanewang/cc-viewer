@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.6.265 (2026-05-13)
+
+- fix(interceptor): `_commitDeltaState` 加幂等守卫，防止 mainAgent 请求乱序完成时较短 commit 倒推 eager-updated 状态导致 doubled-history 残余
+- fix(ui): GitChanges 标题栏刷新图标垂直对齐（headerTitle 改 inline-flex + align-items:center）
+- refactor(file-viewer): 移除 MDX 「强制 GUI 编辑」入口与 forceMdxOverride state；扩展检测命中或解析失败时只走旧 marked 预览
+
+## 1.6.264 (2026-05-13)
+
+- feat(voice-pack): Approval Settings 新增「语音包」面板，可为 4 类生命周期事件绑定音频（plan 审批 / askUserQuestion / 60min 超时预警 5min+60s 双段 / Claude turn 结束）
+- feat(voice-pack): 内置「Pixel Buddy 像素小宠物」chiptune 默认包（5 个 8-bit SFX，总 ~100KB）+ 用户上传 mp3/wav/ogg/m4a（≤2MB）；全局开关 + 音量条 + 试听 + 重置；Mobile phone 也能配
+- feat(voice-pack): `/api/voice-pack/{list,upload,delete,audio/:id}`；上传 loopback-only + magic bytes + UUID 白名单 + symlink 防穿越；audio 接口 HTTP Range 206 兼容 iOS Safari；`/api/preferences` `approvalModal.voicePack` 深合并 + 失效 id 自动 reconcile
+- feat(voice-pack): turn-end 用 Claude Code Stop hook（auto-install 到 settings.json）+ SSE 广播，比 streaming 状态更准；超时预警复用 AskTimeoutCountdown 时钟源；30s 冷却 + focus gate
+- feat(voice-pack): 21 i18n key × 18 lang
+
 ## 1.6.263 (2026-05-13)
 
 - feat(ask-timeout): AskUserQuestion 超时改 60min（原 5min），等价 terminal 无超时体验；问题卡片底部新增倒计时显示（wall-clock 校准 + visibility 触发即时刷新 + unmount/0 双闸内存回收）；ask-hook-pending / sdk-ask-pending 广播附 startedAt + timeoutMs；WS 重连后 server replay pending ask 含剩余 timeoutMs 倒计时连续不重置；倒计时 ≤60s 切 warning 色 + a11y role=timer aria-live；6 i18n key × 18 lang

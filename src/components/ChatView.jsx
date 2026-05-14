@@ -13,6 +13,7 @@ import { getModelInfo, getEffectiveModel, resolveProducerModelInfo } from '../ut
 import { getTeammateAvatar } from '../utils/teammateAvatars';
 import { isSystemText, classifyUserContent, isMainAgent, isTeammate, resolveTeammateNames } from '../utils/contentFilter';
 import { classifyRequest, formatRequestTag, formatTeammateLabel } from '../utils/requestType';
+import { playEvent as playVoiceEvent } from '../utils/voicePackPlayer';
 import { buildChunksForAnswer, buildBracketPasteSubmitChunks, BRACKET_PASTE_SUBMIT_SETTLE_MS } from '../utils/ptyChunkBuilder';
 import { isPlanApprovalPrompt, isDangerousOperationPrompt, parseToolInfoFromBuffer } from '../utils/promptClassifier';
 import { isImageFile, isMutatingCommand } from '../utils/commandValidator';
@@ -638,6 +639,15 @@ class ChatView extends React.Component {
           plan: this.state.pendingPlanApproval,
           handlers: { approve: this.handlePlanApprove, reject: this.handlePlanReject },
         });
+        // SDK ExitPlanMode lives in an inline card, not the global ApprovalModal, so
+        // ApprovalModal's sound effect never fires for this path. Hook the voice pack
+        // here directly( — SDK plan was silent before this).
+        try {
+          const vp = this.props.preferences?.approvalModal?.voicePack;
+          if (vp && vp.enabled && vp.events && vp.events.planApproval) {
+            playVoiceEvent('planApproval', vp, { dedupeKey: `planApproval:${this.state.pendingPlanApproval.id}` });
+          }
+        } catch { /* never throw from componentDidUpdate */ }
       } else {
         this.props.onPendingPlanApproval(null);
       }
@@ -2053,11 +2063,12 @@ class ChatView extends React.Component {
       this.setState({ inputEmpty: false });
       textarea.focus();
     } else if (this._inputWs && this._inputWs.readyState === WebSocket.OPEN) {
-      // 终端模式下没有 textarea，直接通过 PTY 发送
+      // 终端模式下没有 textarea，直接通过 PTY 发送。
+      // 用 bracket-paste 包裹避免 description 含 `/` `!` `\t` 等被 Ink TUI 当特殊键解析。
       this._inputWs.send(JSON.stringify({
         type: 'input-sequential',
-        chunks: [description, '\r'],
-        settleMs: 50,
+        chunks: buildBracketPasteSubmitChunks(description),
+        settleMs: BRACKET_PASTE_SUBMIT_SETTLE_MS,
       }));
     }
   };
@@ -2080,6 +2091,28 @@ class ChatView extends React.Component {
     }
     if (!assembled) return;
 
+    // WS 断开时不直接丢消息：把 assembled 写回 textarea 作草稿，让用户能手动重试。
+    // 不设 pendingInput（没真发出去，不该显示 optimistic bubble）。
+    const wsOpen = this._inputWs && this._inputWs.readyState === WebSocket.OPEN;
+    if (!wsOpen) {
+      const ta = this._inputRef.current;
+      if (ta) {
+        ta.value = assembled;
+        ta.style.height = 'auto';
+        ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
+      }
+      this.setState({
+        ultraplanModalOpen: false,
+        ultraplanPrompt: '',
+        ultraplanVariant: 'codeExpert',
+        ultraplanFiles: [],
+        inputEmpty: ta ? !assembled : true,
+      }, () => {
+        if (ta) ta.focus();
+      });
+      return;
+    }
+
     this.setState({
       ultraplanModalOpen: false,
       ultraplanPrompt: '',
@@ -2088,16 +2121,14 @@ class ChatView extends React.Component {
       pendingInput: userInput,
       inputSuggestion: null,
     }, () => {
-      if (this._inputWs && this._inputWs.readyState === WebSocket.OPEN) {
-        if (this.props.sdkMode) {
-          this._inputWs.send(JSON.stringify({ type: 'sdk-user-message', text: assembled }));
-        } else {
-          this._inputWs.send(JSON.stringify({
-            type: 'input-sequential',
-            chunks: buildBracketPasteSubmitChunks(assembled),
-            settleMs: BRACKET_PASTE_SUBMIT_SETTLE_MS,
-          }));
-        }
+      if (this.props.sdkMode) {
+        this._inputWs.send(JSON.stringify({ type: 'sdk-user-message', text: assembled }));
+      } else {
+        this._inputWs.send(JSON.stringify({
+          type: 'input-sequential',
+          chunks: buildBracketPasteSubmitChunks(assembled),
+          settleMs: BRACKET_PASTE_SUBMIT_SETTLE_MS,
+        }));
       }
       this.scrollToBottom();
     });
@@ -2966,6 +2997,9 @@ class ChatView extends React.Component {
     if (!text) return;
     const ws = this._inputWs;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // /clear 自身不解锁血条 lock（lock 是清空确认后由 AppBase.handleClearContextOptimistic 设置）；
+    // 其他正常用户消息（包括 slash 命令）都视为「新请求」并解锁血条。
+    if (!/^\s*\/clear(\s|$)/.test(text)) this.props.onUserMessageSent?.();
     if (this.props.sdkMode) {
       ws.send(JSON.stringify({ type: 'sdk-user-message', text }));
     } else {
@@ -3828,6 +3862,7 @@ class ChatView extends React.Component {
         currentFile: resolved,
         currentGitDiff: null,
         scrollToLine: null,
+        gitChangesOpen: false,
         fileExplorerExpandedPaths: newSet,
       };
     });

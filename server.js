@@ -52,6 +52,21 @@ import { awaitDrainOrClose } from './lib/sse-backpressure.js';
 import { enrichRawIfNeeded } from './lib/enrich-plan-input.js';
 import { buildTeamStatusResponse } from './lib/team-runtime.js';
 import { discoverClaudeMdCandidates, readCandidateById } from './lib/claude-md-discovery.js';
+import {
+  saveAudio as vpSaveAudio,
+  listUserAudio as vpListUserAudio,
+  deleteUserAudio as vpDeleteUserAudio,
+  getUserAudioPath as vpGetUserAudioPath,
+  getDefaultPackPath as vpGetDefaultPackPath,
+  listDefaultPack as vpListDefaultPack,
+  isDefaultPackPlaceholder as vpIsDefaultPackPlaceholder,
+  reconcileVoicePackPrefs as vpReconcile,
+  mimeForFormat as vpMime,
+  isValidId as vpIsValidId,
+  EVENT_KEYS as VP_EVENT_KEYS,
+  MAX_AUDIO_BYTES as VP_MAX_BYTES,
+} from './lib/voice-pack-manager.js';
+import { mergeApprovalModalPrefs as vpMergeAM } from './lib/approval-modal-prefs.js';
 
 
 // 动态获取 getPrefsFile()（LOG_DIR 可能在运行时被 setLogDir 修改）
@@ -220,6 +235,11 @@ const MAX_PORT = parseInt(process.env.CCV_MAX_PORT) || 7099;
 const HOST = '0.0.0.0';
 
 // 局域网访问 token（本地 127.0.0.1 免验证）
+// Internal token used ONLY for bridge → server calls (env-leaked to the spawned
+// claude process via pty-manager). Separate from ACCESS_TOKEN so the LAN URL
+// token can't double as a bridge auth bypass for same-host CSRF (round-3 P1).
+const INTERNAL_TOKEN = randomBytes(16).toString('hex');
+
 const TOKEN_PATH = join(getClaudeConfigDir(), 'cc-viewer', 'access-token.json');
 
 function _ensureTokenDir() {
@@ -677,6 +697,11 @@ async function handleRequest(req, res) {
     // join() 而非字符串拼接，避免 Windows 分隔符不匹配导致比较失败
     const _cDir = getClaudeConfigDir();
     prefs.claudeConfigDir = _cDir === join(homedir(), '.claude') ? '~/.claude' : _cDir;
+    // voice-pack id reconcile — strip references to audio files that no longer exist
+    // so the client never tries to play a 404. Read-only here; client save path also runs this.
+    if (prefs.approvalModal?.voicePack) {
+      prefs.approvalModal.voicePack = vpReconcile(LOG_DIR, prefs.approvalModal.voicePack);
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(prefs));
     return;
@@ -694,7 +719,15 @@ async function handleRequest(req, res) {
         }
         let prefs = {};
         try { if (existsSync(getPrefsFile())) prefs = JSON.parse(readFileSync(getPrefsFile(), 'utf-8')); } catch { }
-        Object.assign(prefs, incoming);
+        // Deep-merge approvalModal so partial updates (e.g. `{ voicePack: { events: { askQuestion: id } } }`)
+        // don't blow away unrelated approval prefs. Shallow Object.assign for everything else.
+        const { approvalModal: incAM, ...incRest } = incoming;
+        Object.assign(prefs, incRest);
+        if (incAM && typeof incAM === 'object') {
+          prefs.approvalModal = vpMergeAM(prefs.approvalModal, incAM, {
+            reconcile: (vp) => vpReconcile(LOG_DIR, vp),
+          });
+        }
         // 确保目录存在
         const prefsFile = getPrefsFile();
         const prefsDir = dirname(prefsFile);
@@ -731,6 +764,249 @@ async function handleRequest(req, res) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Invalid JSON' }));
       }
+    });
+    return;
+  }
+
+  // ── Voice Pack API ────────────────────────────────────────────────────────
+  // Manages user-uploaded audio + serves the bundled "皇上系列" default pack.
+  // Uploads are loopback-only — LAN clients can play but not write.
+  if (url === '/api/voice-pack/list' && method === 'GET') {
+    try {
+      const userAudio = vpListUserAudio(LOG_DIR);
+      const defaultPack = vpListDefaultPack();
+      // defaultPackPlaceholder lets Settings UI label the Default option as
+      // "(placeholder)" until real recordings replace the bundled sine-wave WAVs.
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        userAudio,
+        defaultPack,
+        defaultPackPlaceholder: vpIsDefaultPackPlaceholder(),
+        eventKeys: VP_EVENT_KEYS,
+        maxBytes: VP_MAX_BYTES,
+      }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'list failed', detail: err?.message }));
+    }
+    return;
+  }
+
+  if (url === '/api/voice-pack/upload' && method === 'POST') {
+    // Loopback-only — refuse LAN clients even if they hold a valid token.
+    // The token already gates LAN access but voice-pack writes touch the local FS
+    // and end up reachable from every client; keep the write side strictly local.
+    if (!isLocal) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Upload allowed from loopback only' }));
+      return;
+    }
+    const contentType = req.headers['content-type'] || '';
+    const boundaryMatch = contentType.match(/boundary=(.+)/);
+    if (!boundaryMatch) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing boundary' }));
+      return;
+    }
+    const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+    if (contentLength > VP_MAX_BYTES + 4096) {
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `File too large (max ${VP_MAX_BYTES} bytes)` }));
+      return;
+    }
+    const boundary = boundaryMatch[1];
+    const chunks = [];
+    let totalSize = 0;
+    let aborted = false;
+    req.on('data', chunk => {
+      totalSize += chunk.length;
+      if (totalSize > VP_MAX_BYTES + 4096) {
+        aborted = true;
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `File too large (max ${VP_MAX_BYTES} bytes)` }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (aborted) return;
+      try {
+        const buf = Buffer.concat(chunks);
+        const headerEnd = buf.indexOf('\r\n\r\n');
+        if (headerEnd === -1) throw new Error('Malformed multipart');
+        const headerStr = buf.slice(0, headerEnd).toString();
+        const nameMatch = headerStr.match(/filename="([^"]+)"/);
+        const originalName = nameMatch ? nameMatch[1].replace(/[\x00-\x1f/\\]/g, '_') : 'upload';
+        const bodyStart = headerEnd + 4;
+        const closingBoundary = Buffer.from('\r\n--' + boundary);
+        const bodyEnd = buf.indexOf(closingBoundary, bodyStart);
+        const fileData = bodyEnd !== -1 ? buf.slice(bodyStart, bodyEnd) : buf.slice(bodyStart);
+        const result = vpSaveAudio(LOG_DIR, originalName, fileData, { isLoopback: true });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ...result }));
+      } catch (err) {
+        const status = err?.code === 'TOO_LARGE' ? 413 : err?.code === 'BAD_FORMAT' ? 415 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err?.message || 'Upload failed' }));
+      }
+    });
+    return;
+  }
+
+  if (url.startsWith('/api/voice-pack/delete/') && method === 'DELETE') {
+    if (!isLocal) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Delete allowed from loopback only' }));
+      return;
+    }
+    const id = url.slice('/api/voice-pack/delete/'.length);
+    if (!vpIsValidId(id)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid id' }));
+      return;
+    }
+    const ok = vpDeleteUserAudio(LOG_DIR, id);
+    res.writeHead(ok ? 200 : 404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok }));
+    return;
+  }
+
+  // Serve audio — supports HTTP Range so iOS Safari / mobile players can seek mp3
+  // (Safari refuses to start playback when the server returns 200 without Accept-Ranges).
+  // Path forms:
+  //   /api/voice-pack/audio/default/<eventKey>   — bundled default pack
+  //   /api/voice-pack/audio/<uuid>               — user-uploaded file
+  if (url.startsWith('/api/voice-pack/audio/') && method === 'GET') {
+    const tail = url.slice('/api/voice-pack/audio/'.length);
+    let resolved = null;
+    let isDefault = false;
+    if (tail.startsWith('default/')) {
+      const eventKey = tail.slice('default/'.length);
+      resolved = vpGetDefaultPackPath(eventKey);
+      isDefault = true;
+    } else {
+      resolved = vpGetUserAudioPath(LOG_DIR, tail);
+    }
+    if (!resolved) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not found' }));
+      return;
+    }
+    // Cache strategy:
+    //   - default-pack: short max-age + must-revalidate, no `immutable` — the on-disk
+    //     file *can* change when a placeholder is replaced by a real recording at the
+    //     same path. `must-revalidate` keeps the file out of the stale bucket once
+    //     max-age expires. Paired with the ETag below, this lets browsers
+    //     conditional-request and pick up regenerated audio after a `gen-default-voicepack`
+    //     run — without an ETag they'd silently serve cached stale content.
+    //   - user audio: content-addressed by UUID (delete + re-upload always mints a
+    //     new id), so safe to mark immutable for a full day. Loopback-only writes,
+    //     so the LAN audience cannot mutate.
+    const cacheControl = isDefault
+      ? 'public, max-age=300, must-revalidate'
+      : 'private, max-age=86400, immutable';
+    try {
+      // Symlink hardening: refuse to serve symlinks even though the routing layer
+      // already enforces the id whitelist. A local attacker who can write to
+      // LOG_DIR/voice-packs/ could otherwise drop `<uuid>.mp3 → /etc/passwd` and
+      // have it streamed over LAN. Same family as the file-access-policy realpath
+      // check used elsewhere in server.js for /api/read-file.
+      const ls = lstatSync(resolved.path);
+      if (ls.isSymbolicLink()) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not found' }));
+        return;
+      }
+      const stat = statSync(resolved.path);
+      const fileSize = stat.size;
+      // ETag = "<size>-<mtime ms>" — cheap, stable across restarts, changes whenever
+      // the file is rewritten. Honors If-None-Match → 304 so a regenerated default
+      // pack actually reaches the browser instead of being silently served stale.
+      const etag = `"${fileSize.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
+      if (req.headers['if-none-match'] === etag) {
+        res.writeHead(304, { ETag: etag, 'Cache-Control': cacheControl });
+        res.end();
+        return;
+      }
+      const mime = vpMime(resolved.format);
+      const range = req.headers.range;
+      if (range) {
+        const m = range.match(/bytes=(\d+)-(\d*)/);
+        if (m) {
+          const start = parseInt(m[1], 10);
+          const end = m[2] ? parseInt(m[2], 10) : fileSize - 1;
+          if (Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end < fileSize && start <= end) {
+            res.writeHead(206, {
+              'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+              'Accept-Ranges': 'bytes',
+              'Content-Length': end - start + 1,
+              'Content-Type': mime,
+              'Cache-Control': cacheControl,
+              ETag: etag,
+            });
+            createReadStream(resolved.path, { start, end }).pipe(res);
+            return;
+          }
+        }
+        res.writeHead(416, { 'Content-Range': `bytes */${fileSize}` });
+        res.end();
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Length': fileSize,
+        'Content-Type': mime,
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': cacheControl,
+        ETag: etag,
+      });
+      createReadStream(resolved.path).pipe(res);
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Read failed', detail: err?.message }));
+    }
+    return;
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Turn-end notification — POSTed by lib/turn-end-bridge.js when Claude Code's
+  // Stop hook fires (CLI/PTY mode) AND directly by lib/sdk-manager.js's
+  // onTurnEnd callback (SDK mode — Stop hooks don't exist there, so cli.js
+  // wires the SDK 'result' event to broadcastTurnEnd() instead). Broadcasts a
+  // `turn_end` SSE so all connected tabs play voice-pack turnEnd at the real
+  // end of a user-prompt turn.
+  //
+  // Auth: loopback IP + X-CCViewer-Internal header matching INTERNAL_TOKEN.
+  // Defense-in-depth against a same-host malicious page POSTing fake turn_end
+  // events (round-3 P1). Internal-only POST → in-process SDK callback skips
+  // this endpoint and calls `_broadcastTurnEnd` directly below.
+  if (url === '/api/turn-end-notify' && method === 'POST') {
+    if (!isLocal) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Loopback only' }));
+      return;
+    }
+    if (req.headers['x-ccviewer-internal'] !== INTERNAL_TOKEN) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid bridge token' }));
+      return;
+    }
+    let body = '';
+    let truncated = false;
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > 16384) { truncated = true; req.destroy(); }
+    });
+    req.on('end', () => {
+      if (truncated) {
+        console.warn('[turn-end-notify] body exceeded 16KB cap — request destroyed');
+        return; // socket already closed by destroy()
+      }
+      let payload = {};
+      try { payload = JSON.parse(body); } catch { /* tolerate empty / malformed */ }
+      _broadcastTurnEnd(payload.sessionId || null, payload.ts || Date.now());
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
     });
     return;
   }
@@ -898,7 +1174,7 @@ async function handleRequest(req, res) {
         if (proxyPort) {
           const { spawnClaude } = await import('./pty-manager.js');
           const mergedArgs = [..._workspaceClaudeArgs, ...(Array.isArray(launchExtraArgs) ? launchExtraArgs : [])];
-          await spawnClaude(parseInt(proxyPort), wsPath, mergedArgs, _workspaceClaudePath, _workspaceIsNpmVersion, actualPort, serverProtocol);
+          await spawnClaude(parseInt(proxyPort), wsPath, mergedArgs, _workspaceClaudePath, _workspaceIsNpmVersion, actualPort, serverProtocol, INTERNAL_TOKEN);
         }
 
         _workspaceLaunched = true;
@@ -4524,6 +4800,33 @@ export function resetAccessToken() {
   writeFileSync(TOKEN_PATH, JSON.stringify({ token: newToken, createdAt: Date.now() }, null, 2), { mode: 0o600 });
   ACCESS_TOKEN = newToken;
   return newToken;
+}
+
+export function getInternalToken() {
+  return INTERNAL_TOKEN;
+}
+
+// In-process broadcast helper for the `turn_end` SSE event. Two callers:
+//   1. /api/turn-end-notify POST handler (PTY/CLI mode via Stop hook bridge)
+//   2. cli.js runSdkMode → sdkManager.initSdkSession({ onTurnEnd }) (SDK mode —
+//      ensureHooks() isn't called so Stop hook isn't installed; emit the event
+//      directly when SDK's 'result' message fires).
+// Same SSE payload shape regardless of source so the frontend listener doesn't
+// care which path produced it.
+function _broadcastTurnEnd(sessionId, ts) {
+  try {
+    if (clients.length > 0 && sendEventToClients) {
+      sendEventToClients(clients, 'turn_end', {
+        sessionId: sessionId || null,
+        ts: ts || Date.now(),
+      });
+    }
+  } catch (err) {
+    console.warn('[turn-end] broadcast failed:', err.message);
+  }
+}
+export function broadcastTurnEnd(sessionId = null, ts = Date.now()) {
+  _broadcastTurnEnd(sessionId, ts);
 }
 
 // 流式状态 SSE 推送定时器：检测 streamingState 变化并广播给所有客户端
