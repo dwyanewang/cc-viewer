@@ -10,7 +10,7 @@ import { SettingsContext } from './contexts/SettingsContext';
 import { formatTokenCount, filterRelevantRequests, isRelevantRequest, appendCacheLossMap, extractCachedContent } from './utils/helpers';
 import { isMainAgent, isPostClearCheckpoint } from './utils/contentFilter';
 import { apiUrl } from './utils/apiUrl';
-import { playEvent as playVoiceEvent } from './utils/voicePackPlayer';
+import { playEvent as playVoiceEvent, unlockAudio } from './utils/voicePackPlayer';
 import { DEFAULT_BINDINGS as VP_DEFAULT_BINDINGS } from '../lib/voice-pack-events';
 import { mergeVoicePackInto } from '../lib/approval-modal-prefs';
 import { saveEntries, loadEntries, clearEntries, getCacheMeta, saveSessionEntries, loadSessionEntries, saveSessionIndex } from './utils/entryCache';
@@ -143,15 +143,16 @@ class AppBase extends React.Component {
       approvalOwnPending: { ask: 0, ptyPlan: 0 },
       // ownTabId: numeric tab id pushed by main once on view init (electron only). null in pure web mode.
       ownTabId: null,
-      // approvalPrefs: user toggles persisted to /api/preferences (defaults sized for least surprise).
-      // voicePack — opt-in; default OFF so the existing chime / silent behaviour is preserved on first run.
-      // events.turnEnd defaults to null (disabled) — DEFAULT_BINDINGS is the single source of truth.
+      // approvalPrefs: user toggles persisted to /api/preferences.
+      // soundEnabled = 合并后的"审批提示音"主开关（默认 ON），voicePack.enabled 始终 == soundEnabled。
+      // hydrate 时如检测到老版本独立两字段不一致，会强制对齐并一次性写回 server。
+      // events.turnEnd 仍默认 null（disabled，避免每轮都响） — DEFAULT_BINDINGS 是单一来源。
       approvalPrefs: {
         modalEnabled: true,
-        soundEnabled: false,
+        soundEnabled: true,
         notifyOnlyWhenHidden: true,
         voicePack: {
-          enabled: false,
+          enabled: true,
           volume: 0.3,
           events: { ...VP_DEFAULT_BINDINGS },
         },
@@ -216,6 +217,9 @@ class AppBase extends React.Component {
       preferences: ctx.preferences,
       onUpdatePreferences: ctx.updatePreferences,
       onUpdateClaudeSettings: ctx.updateClaudeSettings,
+      // 把 lang 塞进 settings spread,让 App / Mobile 入口都自动拿到,
+      // 避免 ChatMessage 切语言时只在桌面端刷新而漏移动端。
+      lang: this.state.lang,
     };
   }
 
@@ -380,25 +384,42 @@ class AppBase extends React.Component {
       }
       // Approval modal preferences (defaults already in initial state — only override when persisted).
       if (data.approvalModal && typeof data.approvalModal === 'object') {
-        this.setState(prev => {
-          // Single source of truth for voicePack deep-merge — same helper as server.js
-          // POST handler and handleVoicePackChange below( dedup).
-          const mergedVP = mergeVoicePackInto(prev.approvalPrefs.voicePack, data.approvalModal.voicePack);
-          const next = {
-            modalEnabled: data.approvalModal.modalEnabled !== undefined ? !!data.approvalModal.modalEnabled : prev.approvalPrefs.modalEnabled,
-            soundEnabled: data.approvalModal.soundEnabled !== undefined ? !!data.approvalModal.soundEnabled : prev.approvalPrefs.soundEnabled,
-            notifyOnlyWhenHidden: data.approvalModal.notifyOnlyWhenHidden !== undefined ? !!data.approvalModal.notifyOnlyWhenHidden : prev.approvalPrefs.notifyOnlyWhenHidden,
-            voicePack: mergedVP,
-          };
-          // 同步给 electron main 进程,让 maybeNotify 用最新的 notifyOnlyWhenHidden 决策。
-          // 非 electron 环境下 tabBridge 不存在,可选链跳过。
-          // voicePack 字段不发给 main —— 播放发生在 renderer，main 只需要知道通知策略。
-          try {
-            const { voicePack: _omit, ...forIpc } = next;
-            window.tabBridge?.setApprovalPref?.(forIpc);
-          } catch (e) { console.warn('[approvalPref IPC] hydrate sync failed:', e); }
-          return { approvalPrefs: next };
-        });
+        // setState updater 不做 side effect，先在外层算 next + mismatch，再 setState + POST + IPC。
+        // hydrate 走在 fetch().then 链路里，不会与并发 setState 冲突，直接读 this.state 是安全的。
+        const prevPrefs = this.state.approvalPrefs;
+        const mergedVP = mergeVoicePackInto(prevPrefs.voicePack, data.approvalModal.voicePack);
+        const next = {
+          modalEnabled: data.approvalModal.modalEnabled !== undefined ? !!data.approvalModal.modalEnabled : prevPrefs.modalEnabled,
+          soundEnabled: data.approvalModal.soundEnabled !== undefined ? !!data.approvalModal.soundEnabled : prevPrefs.soundEnabled,
+          notifyOnlyWhenHidden: data.approvalModal.notifyOnlyWhenHidden !== undefined ? !!data.approvalModal.notifyOnlyWhenHidden : prevPrefs.notifyOnlyWhenHidden,
+          voicePack: mergedVP,
+        };
+        // 合并开关迁移：只要 server 端 next.soundEnabled !== next.voicePack.enabled 就强制对齐。
+        // 覆盖三种老用户：
+        //   (a) sound + voicePack 都存且不一致 — 经典 mismatch
+        //   (b) 仅 sound 存（用户在旧 AppHeader 关过审批提示音、从未点开 VoicePackSettings）
+        //       → next.soundEnabled=false, next.voicePack.enabled 走新默认 true → 不一致
+        //   (c) 仅 voicePack.enabled 存（早期 adopter）→ next.soundEnabled 走新默认 true, voicePack.enabled=false → 不一致
+        // 一致情况（含全缺：两者都走默认 true）不触发，无回写。
+        const mismatch = !!next.voicePack.enabled !== !!next.soundEnabled;
+        if (mismatch) {
+          // 以 soundEnabled 为准强制对齐 voicePack.enabled（用户已确认的迁移规则）。
+          next.voicePack = { ...next.voicePack, enabled: next.soundEnabled };
+        }
+        this.setState({ approvalPrefs: next });
+        // SettingsContext.updatePreferences 是顶层浅 merge：必须传完整 next（含完整 voicePack 子树），
+        // 否则会把 events / volume 整片砍掉，AskTimeoutCountdown / ChatView SDK 直接读 events[*] 变 undefined。
+        // 仅 mismatch 时写回 server，幂等；对齐后的用户后续 hydrate 不再触发。
+        if (mismatch) {
+          this.context?.updatePreferences?.({ approvalModal: next });
+        }
+        // 同步给 electron main 进程,让 maybeNotify 用最新的 notifyOnlyWhenHidden 决策。
+        // 非 electron 环境下 tabBridge 不存在,可选链跳过。
+        // voicePack 字段不发给 main —— 播放发生在 renderer，main 只需要知道通知策略。
+        try {
+          const { voicePack: _omit, ...forIpc } = next;
+          window.tabBridge?.setApprovalPref?.(forIpc);
+        } catch (e) { console.warn('[approvalPref IPC] hydrate sync failed:', e); }
       }
       // hydrate：prefs 没保存过 themeColor 时回退到当前 state（首次安装是 'light'）。
       // 不写回 prefs（这一路是从 prefs 读出来的），但写 localStorage 让 inline boot script 抢占。
@@ -856,6 +877,19 @@ class AppBase extends React.Component {
         this._chunkedTotal = 0;
         const isIncremental = this._isIncremental;
         this._isIncremental = false;
+        // 解锁信号：增量模式下出现至少一条**带 body.messages 的 mainAgent** 条目，说明
+        // mainAgent 真有新一轮请求落盘。仅看 delta.length>0 会被 SSE 重连时 backlog
+        // replay 的旧 entry（synthetic、post-stop hook 等）误触发；mainAgent + body.messages
+        // 才是"用户实际发了内容"的最强信号。覆盖 TerminalPanel /clear 后用户没走 ChatView
+        // 输入框（pty 直接键入 / 外部 hook / Agent 自驱）时血条卡 0% 的场景。
+        if (isIncremental && this.state.contextBarLocked) {
+          const hasMainAgentTurn = delta.some(e => {
+            if (!e || !e.mainAgent) return false;
+            const msgs = e.body?.messages;
+            return Array.isArray(msgs) && msgs.length > 0;
+          });
+          if (hasMainAgentTurn) this.setState({ contextBarLocked: false });
+        }
 
         // 增量模式：Map 去重合并（delta 条目覆盖同 key 的缓存条目）
         let rawEntries;
@@ -1022,7 +1056,11 @@ class AppBase extends React.Component {
         this._resetSSETimeout();
         try {
           const data = JSON.parse(event.data);
-          this.setState({ contextWindow: data, contextBarOptimistic: false });
+          // 收到新的 context_window 测量 → 同步解锁血条。
+          // 兜底场景：onUserMessageSent / load_end fallback 都没触发解锁时
+          //（WS 抖动、非增量 load、纯外部输入），SSE 推送的真实测量值就是
+          //「会话已推进」的最强信号，避免 lock 永久卡 0%。
+          this.setState({ contextWindow: data, contextBarOptimistic: false, contextBarLocked: false });
           if (this._clearOptimisticTimer) { clearTimeout(this._clearOptimisticTimer); this._clearOptimisticTimer = null; }
         } catch { }
       });
@@ -1055,8 +1093,7 @@ class AppBase extends React.Component {
       // turn_end SSE — broadcast by /api/turn-end-notify whenever Claude Code's Stop hook
       // fires (real end of a user-prompt turn). This is the **authoritative** turnEnd
       // signal — far more accurate than isStreaming falling-edge, which resets per-API-call
-      // and would mis-fire during slow tool execution. focusGate keeps it quiet while the
-      // user is looking at the window; 30s cooldown lives in voicePackPlayer.
+      // and would mis-fire during slow tool execution. 30s cooldown lives in voicePackPlayer.
       this.eventSource.addEventListener('turn_end', (event) => {
         // Guard against a teardown race: SSE chunks in flight when _reconnectSSE
         // closes the current EventSource can still fire here before the listener
@@ -1069,7 +1106,6 @@ class AppBase extends React.Component {
           try { serverTs = (JSON.parse(event?.data || '{}'))?.ts || null; } catch { /* fine */ }
           try {
             playVoiceEvent('turnEnd', vp, {
-              focusGate: true,
               // Prefer the server-supplied ts so a re-broadcast (server bug, two
               // SSE delivery paths) is deduped by the player. Falls back to a
               // unique key if absent — relies on COOLDOWN_MS.turnEnd to suppress.
@@ -1085,7 +1121,12 @@ class AppBase extends React.Component {
           if (data.active) {
             // 立即显示 loading
             clearTimeout(this._streamingOffTimer);
-            this.setState({ isStreaming: true });
+            // agent 开始响应 = 新一轮已落实 → 顺手解锁血条。
+            // 覆盖 onUserMessageSent 没触发的极端情况（WS 抖动 / 外部输入 /
+            // pty 直接键入），避免 lock 永久卡 0%。
+            const patch = { isStreaming: true };
+            if (this.state.contextBarLocked) patch.contextBarLocked = false;
+            this.setState(patch);
           } else {
             // 延迟隐藏，避免工具调用间隙导致 spinner 频繁闪烁
             clearTimeout(this._streamingOffTimer);
@@ -1486,6 +1527,11 @@ class AppBase extends React.Component {
   handleWorkspaceLaunch = ({ projectName }) => {
     this._isLocalLog = false;
     this._localLogFile = null;
+    // 切 project：清掉旧 project 残留的 /clear optimistic 30s timer，避免延迟到新 project 触发。
+    if (this._clearOptimisticTimer) {
+      clearTimeout(this._clearOptimisticTimer);
+      this._clearOptimisticTimer = null;
+    }
     this.setState({
       workspaceMode: false,
       projectName,
@@ -1493,6 +1539,7 @@ class AppBase extends React.Component {
       cliMode: true,
       terminalVisible: false,
       contextBarLocked: false,
+      contextBarOptimistic: false,
     });
   };
 
@@ -1639,9 +1686,29 @@ class AppBase extends React.Component {
     const nextVP = mergeVoicePackInto(this.state.approvalPrefs?.voicePack, patch);
     const nextPrefs = { ...this.state.approvalPrefs, voicePack: nextVP };
     this.setState({ approvalPrefs: nextPrefs });
-    // Persist only the voicePack subtree — server.js will deep-merge it into approvalModal,
-    // leaving modalEnabled / soundEnabled / notifyOnlyWhenHidden untouched.
-    this.context.updatePreferences({ approvalModal: { voicePack: nextVP } });
+    // SettingsContext.updatePreferences 是顶层浅 merge — 必须带完整 approvalModal，否则会把
+    // modalEnabled / soundEnabled / notifyOnlyWhenHidden 抹成 undefined（直到下次 GET 才回来）。
+    this.context.updatePreferences({ approvalModal: nextPrefs });
+  };
+
+  // 合并开关「审批提示音」的统一入口：原子地双写 soundEnabled + voicePack.enabled。
+  // updatePreferences patch 带完整 next（含 voicePack.events / volume），因为 SettingsContext 是
+  // 顶层浅 merge — 若只传 voicePack:{enabled} 会擦掉 events，AskTimeoutCountdown 与 ChatView SDK
+  // 直接读 ctx.approvalModal.voicePack.events 立即变 undefined 致静音。
+  // unlockAudio 在用户手势内立即调用，绕过移动浏览器的 autoplay policy（onChange 是 trusted gesture）。
+  handleApprovalSoundToggle = (checked) => {
+    if (checked) {
+      try { unlockAudio(); } catch (e) { /* 内部已 try/catch，理论上 unreachable */ }
+    }
+    const prev = this.state.approvalPrefs;
+    const nextVP = { ...prev.voicePack, enabled: checked };
+    const next = { ...prev, soundEnabled: checked, voicePack: nextVP };
+    this.setState({ approvalPrefs: next });
+    try {
+      const { voicePack: _omit, ...forIpc } = next;
+      window.tabBridge?.setApprovalPref?.(forIpc);
+    } catch (e) { console.warn('[approvalPref IPC] sound toggle sync failed:', e); }
+    this.context.updatePreferences({ approvalModal: next });
   };
 
   /**
@@ -1784,7 +1851,7 @@ class AppBase extends React.Component {
     }
 
     const totalSize = indices.reduce((sum, i) => sum + logs[i].size, 0);
-    if (totalSize > 500 * 1024 * 1024) {
+    if (totalSize > 400 * 1024 * 1024) {
       message.warning(t('ui.mergeTooLarge'));
       return;
     }
@@ -1807,6 +1874,43 @@ class AppBase extends React.Component {
         }
       })
       .catch(() => message.error('Merge failed'));
+  };
+
+  handleArchiveLogs = () => {
+    const { selectedLogs, localLogs, currentProject } = this.state;
+    if (selectedLogs.size === 0) return;
+    const logs = localLogs[currentProject];
+    if (!logs) return;
+    const latestFile = logs[0]?.file;
+    const candidates = [...selectedLogs].filter(f => f.endsWith('.jsonl') && f !== latestFile);
+    if (candidates.length === 0) {
+      message.warning(t('ui.mergeLatestNotAllowed'));
+      return;
+    }
+
+    Modal.confirm({
+      title: t('ui.archiveLogs'),
+      content: t('ui.archiveLogsConfirm', { count: candidates.length }),
+      okText: t('ui.archiveLogs'),
+      cancelText: t('ui.cancel'),
+      onOk: () => {
+        fetch(apiUrl('/api/archive-logs'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ files: candidates }),
+        })
+          .then(res => res.json())
+          .then(data => {
+            const archived = data.archived?.length || 0;
+            const failed = (data.failed?.length || 0) + (data.skipped?.length || 0);
+            if (archived > 0) message.success(t('ui.archiveSuccess', { count: archived }));
+            if (failed > 0) message.error(t('ui.archiveFailed', { count: failed }));
+            this.setState({ selectedLogs: new Set() });
+            this.handleImportLocalLogs();
+          })
+          .catch(() => message.error(t('ui.archiveFailed', { count: candidates.length })));
+      },
+    });
   };
 
   handleDeleteLogs = () => {

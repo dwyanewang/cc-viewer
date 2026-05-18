@@ -1400,7 +1400,7 @@ class AppHeader extends React.Component {
                   <span className={styles.settingsLabel}>{t('ui.approval.settings.soundEnabled')}</span>
                   <Switch
                     checked={!!this.props.approvalPrefs.soundEnabled}
-                    onChange={(checked) => this.props.onApprovalPrefsChange({ soundEnabled: checked })}
+                    onChange={(checked) => this.props.onApprovalSoundToggle && this.props.onApprovalSoundToggle(checked)}
                   />
                 </div>
                 {/* notifyOnlyWhenHidden 依赖 electron main 进程的 OS Notification + 窗口聚焦判断,
@@ -1414,10 +1414,11 @@ class AppHeader extends React.Component {
                     />
                   </div>
                 )}
-                {this.props.onVoicePackChange && (
+                {this.props.approvalPrefs.soundEnabled && this.props.onVoicePackChange && (
                   <VoicePackSettings
                     prefs={this.props.approvalPrefs.voicePack}
                     onChange={this.props.onVoicePackChange}
+                    embedded
                   />
                 )}
               </>

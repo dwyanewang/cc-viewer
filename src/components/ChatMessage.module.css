@@ -51,6 +51,24 @@
   justify-content: flex-end;
 }
 
+/* 方向性气泡：朝向头像那个角微尖（3px），其他角保持 10px 圆角。
+   .bubble 基类是 8px 全圆，这里按行方向覆盖让 user / assistant 视觉上指向各自头像。 */
+.messageRow .bubble {
+  border-radius: 3px 10px 10px 10px;
+}
+.messageRowEnd .bubble {
+  border-radius: 10px 3px 10px 10px;
+}
+
+/* 内部气泡 .chat-boxer（global class，在 global.css）沿用同样的方向性收角逻辑，
+   但尺寸更小（2px 尖 / 6px 圆）配合 chat-boxer 的 6px 默认 radius。 */
+.messageRow :global(.chat-boxer) {
+  border-radius: 2px 6px 6px 6px;
+}
+.messageRowEnd :global(.chat-boxer) {
+  border-radius: 6px 2px 6px 6px;
+}
+
 /* === Content column === */
 
 .contentCol {
@@ -130,6 +148,17 @@
   color: #fff;
 }
 
+[data-theme="light"] .bubbleUser {
+  background: var(--bubble-user-bg-light);
+  border-color: var(--bubble-user-bg-light);
+}
+[data-theme="light"] .bubbleUser:hover {
+  border-color: var(--bubble-user-hover-border-light);
+}
+[data-theme="light"] .bubbleUser.bubbleHighlight {
+  box-shadow: var(--bubble-user-highlight-shadow-light);
+}
+
 .bubbleAssistant {
   composes: bubble;
   background: var(--bg-container);
@@ -144,6 +173,10 @@
 .bubbleAssistant:hover {
   background: var(--bg-container);
   border: 1px solid var(--border-secondary);
+}
+
+[data-theme="light"] .bubbleAssistant {
+  box-shadow: var(--bubble-assistant-shadow-light);
 }
 
 .bubbleHighlight {
@@ -552,6 +585,17 @@
   white-space: pre-wrap;
   word-break: break-all;
   margin: 0;
+}
+
+/* light theme 下 Compact summary 被包在深色 .bubbleUser 里,文字色需反转 */
+[data-theme="light"] .bubbleUser .compactPre {
+  color: #fff;
+}
+
+/* slash 命令本地化标签的 span,留作未来视觉钩子(下划线/虚线/cursor 提示等),
+   当前与普通 user bubble 文本无视觉差异。 */
+.slashCommandLabel {
+  cursor: help;
 }
 
 /* === View request button === */

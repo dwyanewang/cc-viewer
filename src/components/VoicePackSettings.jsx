@@ -29,9 +29,11 @@ const _tr = (key, params, fallback) => {
  * and after every upload/delete, so other tabs that change the list stay in sync
  * the next time this panel re-mounts. The list is keyed by audio id (uuid).
  */
-export default function VoicePackSettings({ prefs, onChange }) {
+export default function VoicePackSettings({ prefs, onChange, embedded = false }) {
   const safePrefs = prefs || {};
-  const enabled = safePrefs.enabled === true;
+  // embedded 模式下父级（合并后的"审批提示音"开关）已经 gate 了组件是否渲染，
+  // 内部强制视为 enabled=true 避免 state 短暂不一致时（如 hydrate 迁移瞬间）出现空区域。
+  const enabled = embedded ? true : safePrefs.enabled === true;
   const volume = typeof safePrefs.volume === 'number' ? safePrefs.volume : 0.3;
   const events = safePrefs.events || {};
 
@@ -181,10 +183,12 @@ export default function VoicePackSettings({ prefs, onChange }) {
 
   return (
     <div className={styles.container}>
-      <div className={styles.headerRow}>
-        <span className={styles.headerLabel}>{_tr('ui.voicePack.title', null, 'Voice pack')}</span>
-        <Switch checked={enabled} onChange={handleEnabledChange} />
-      </div>
+      {!embedded && (
+        <div className={styles.headerRow}>
+          <span className={styles.headerLabel}>{_tr('ui.voicePack.title', null, 'Voice pack')}</span>
+          <Switch checked={enabled} onChange={handleEnabledChange} />
+        </div>
+      )}
 
       {enabled && (
         <>
@@ -211,8 +215,8 @@ export default function VoicePackSettings({ prefs, onChange }) {
               const isCustomBound = selectValue !== 'default' && selectValue !== 'disabled';
               const eventHint = _tr(`ui.voicePack.eventHint.${eventKey}`, null, '');
               const labelText = _tr(`ui.voicePack.event.${eventKey}`, null, eventKey);
-              // Move per-event explanatory text (e.g. turnEnd's focus-gate + 30s cooldown
-              // wording) into a hover tooltip — inline `· hint` text was overflowing the
+              // Move per-event explanatory text (e.g. turnEnd's 30s cooldown wording)
+              // into a hover tooltip — inline `· hint` text was overflowing the
               // settings panel width.
               const labelEl = eventHint ? (
                 <Tooltip title={eventHint} placement="topLeft">

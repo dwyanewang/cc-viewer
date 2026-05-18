@@ -197,7 +197,7 @@ More features waiting for you to discover... for example: the system supports Ag
 
 ***
 
-**Voice pack** — bind custom audio to Claude lifecycle events. Open *Settings → Voice pack* to pick a sound for plan approvals, askUserQuestion popups, 60-min timeout warnings (5-min and 60-s tiers are separate bindings — set both for full coverage), and turn-end notifications. In CLI/PTY mode turnEnd fires via Claude Code's Stop hook (the hook auto-installs into `~/.claude/settings.json`); in SDK mode it fires from the SDK `result` event directly. Either way, it lands at the real end of a user-prompt turn — not after each individual API call.
+**Voice pack** — bind custom audio to Claude lifecycle events. Open *Settings → Sound on approval* (toggle on to reveal the binding panel) to pick a sound for plan approvals, askUserQuestion popups, 60-min timeout warnings (5-min and 60-s tiers are separate bindings — set both for full coverage), and turn-end notifications. In CLI/PTY mode turnEnd fires via Claude Code's Stop hook (the hook auto-installs into `~/.claude/settings.json`); in SDK mode it fires from the SDK `result` event directly. Either way, it lands at the real end of a user-prompt turn — not after each individual API call.
 
 **Uninstalling cc-viewer hooks** — cc-viewer writes three entries into `~/.claude/settings.json` (`PreToolUse` × 2, `Stop` × 1), each tagged with the marker comment `# cc-viewer-managed`. If you uninstall cc-viewer (`npm uninstall -g cc-viewer`), strip the stale entries by hand or with:
 

@@ -1,5 +1,60 @@
 # Changelog
 
+## Unreleased
+
+## 1.6.270 (2026-05-16)
+
+- fix(voice-pack): turnEnd 剔除「仅窗口失焦时响」门控，任务结束就响（保留 30s 节流 + dedupeKey）；17 语言 hint 文案同步精简
+- fix(ui): ApprovalModal 最小化按钮挪到 modal 右上角；底部只保留「⌘/Ctrl+ESC 取消」提示
+- fix(ui): ApprovalModal header 项目名 chip 去掉；ask 卡片「无超时」文案删除
+- chore(voice-pack): 剔除「超时预警 5min/60s」语音事件，老用户 preferences 经白名单自动 strip
+- fix(ask): GUI AskUserQuestion 实质无超时（与 TUI 对齐），ask 卡片不再自动消失
+- fix(ask): _askHookEverActive 区分新老 Claude Code 版本，老版本走 PTY 兜底，新版本无限等
+- feat(ask): ask-store 持久化 pending ask 到 ~/.claude/cc-viewer/ask-store.json，server 重启可恢复
+- feat(ask): ask-bridge 短轮询协议 POST 立即返 askId + GET 25s wait + 404 自动重 POST 重建 entry
+- feat(ask): /api/pending-asks 端点供前端 server 重启后拉取恢复 UI
+- fix(ask): setEntry/markAnswered/markCancelled status guard 实现 first-write-wins
+- fix(ask): consumeIfFinal 单 lock 替代 consume+setEntry 双 lock 避免 race
+- fix(ask): pruneStale 用 max(createdAt, answeredAt) 不再误删刚 answered 的老 entry
+- fix(ask): ask-cancel handler 补 disk-only 分支让 server 重启后的 ask 也能被取消
+- fix(ask): ws ask-hook-answer/ask-cancel 晚到方收到 `ask-hook-already-answered` ack 关 modal
+- fix(ask): ask-bridge GET 5xx 独立 3 次短重试避免 server 真坏时阻塞主进程 5min
+- fix(ask): ask-bridge re-POST id 与原 askId 不一致时直接 fallback terminal
+- fix(ask): ask-store pruneStale 周期 1h 触发，长跑进程不再累积 disk-only 残留
+- fix(ask): AskQuestionForm cancel 按钮始终可点，ws/hook 抖动时也能逃生
+- feat(ask): ASK_TIMEOUT_MS 抽公共常量，server / sdk-manager 同源 24h
+- fix(ask): ask-store 落盘失败首次 console.warn，便于磁盘满场景排错
+- fix(ask): 注入 hook (ask/perm/turn-end) 加 24h timeout 防 Claude Code 10min 强制中断
+- fix(ask): 老 settings.json 自动重写，merge 保留第三方追加字段；env CCV_HOOK_TIMEOUT_S 可调
+- test: 补 ask-store / ask-bridge / pending-asks / ensure-hooks / voice-pack-events / ask-no-timeout invariants 单测
+- feat(chat): 用户气泡里的内置 slash 命令(/clear /compact /theme /model 等 33 个)按当前语言展示本地化标签,带参形态拼回原始参数;Tooltip 只显裸命令避免 /login 等敏感参数泄漏;Unicode 换行 / bidi-control 注入过滤;切语言即时刷新(ChatMessage SCU 接 lang)
+- feat(theme): 雪山白主题用户气泡走 #222 深底白字,hover / highlight / Compact summary 子区同步覆写;新增 4 个 light theme bubble token
+- feat(ultraplan): UltraPlan 模态与终端面板的「+」按钮统一改为 pill「+ 自定义专家」(33 + 1 个 i18n key × 18 语言,light theme 提色 override)
+- fix(ui): Compact summary 折叠头改 `t('ui.compactSummary')` 替代英文字面值;紧凑模式 chip grid / mcpServerName padding-left 14→2 对齐左缘;navSidebar padding-top 4
+
+## 1.6.269 (2026-05-16)
+
+- fix(file-browser): 指向目录的 symlink 不再被误标为 file，可正常展开（Dirent.isDirectory 不解引用 link → 对 symlink 走 statSync follow，断链兜底 file）
+- fix(terminal): 嵌入终端 zsh 现在能正确 source 用户 `~/.zshrc`（wrapper `.zshenv` 里 `${ZDOTDIR:-…}` 永远命中 wrapper dir 导致 `.zshrc` 的 `[[ != ]]` 恒假；改为显式比较 wrapper dir，并补一条 spawn zsh 的端到端回归测试）
+- fix(context-bar): /clear 血条 lock 增加两条解锁兜底（SSE `context_window` 新测量推送 / `streaming.active=true`），覆盖 WS 抖动、非增量 load、pty 直接键入等 `onUserMessageSent` 漏触发场景
+
+## 1.6.268 (2026-05-15)
+
+- feat(approval-sound): 「审批提示音」与「语音包」合并为单一开关，OFF 时音量/事件 binding/上传隐藏，默认开启；旧版若两开关不一致，hydrate 时以「审批提示音」为准强制对齐
+- revert(context-bar): 撤销 1.6.267 的 /clear lock sessionStorage 持久化（保留 load_end 增量解锁兜底），lock 状态回到纯 in-memory，刷新页面即丢失
+
+## 1.6.267 (2026-05-15)
+
+- feat(log-mgmt): 日志管理工具新增「压缩归档」批操作，单个 .jsonl 压成同名 .jsonl.zip；查看/下载/合并/删除/统计透明支持 .jsonl.zip（首次访问解压到 tmpdir 缓存，sidecar mtime+size 命中跳过解压；UTF-8 GP flag / Zip Slip 防护 / Windows rename 重试 / 启动清理 >7 天未访问缓存；validateZipEntries 上限对齐 400MB 防自家归档读不回；archiveJsonl unlink 失败回滚 zip）
+- fix(context-bar): 修复血条 /clear lock 状态在 mainAgent 已经追加多条新请求后仍卡 0%（SSE load_end 增量模式 + delta 含 mainAgent 带 messages 条目才解锁，避免 backlog replay 误触发）
+- fix(memory): 持久记忆面板「刷新」按钮在 MEMORY.md 不存在时不再灰禁，允许用户主动重查捕捉「从无到有」过程
+- chore(log-mgmt): 日志合并大小上限前后端统一 400MB（原前端 500MB / 后端 300MB 不一致；错误文案随常量参数化）
+- feat(file-explorer): 文件浏览器支持拖到容器空白处 = 移动到项目根目录（之前从二级目录拖回根没有交互入口）；蓝色 dashed 容器高亮区分 external import 的绿色语义；TreeNode dragOver/drop 全分支 stopPropagation 防冒泡误触发；已在根 no-op 静默
+- fix(log-mgmt): 选中含归档（.jsonl.zip）文件时「合并日志」按钮 disabled + 非 primary 样式；mergeLogFiles 后端拒绝 .jsonl.zip 兜底；归档文件「已归档」tag 与 preview 文本并排显示（之前 preview 不空时漏显）
+- feat(context-bar): `/clear` 后血条 lock 状态同步到 sessionStorage（按 projectName 拆 key），刷新页面后保持 0% 锁定到用户发出非 /clear 消息
+- feat(electron-diag): 主进程 + 三层 webContents（tabBar / workspace / tab）错误日志落盘 `~/.claude/cc-viewer/electron-diag.log`（JSON Lines / 2MB rename rotate / token + 用户路径 redact / 单条 16KB cap / 0600 权限 / 循环引用守卫）；startMgmtServer 失败弹 dialog + exit 避免白屏
+- chore(jsonl-archive): cleanupExtractCache 改用 mtimeMs（noatime 兼容）；migrateStatsCacheKey 同步更新 size+mtime 避免 stats 全量重解析；renameWithRetry 阻塞 200ms→50ms 降低 event-loop 影响
+
 ## 1.6.266 (2026-05-15)
 
 - fix(subagent): SubAgent / Teammate 末轮工具结果跨请求补偿渲染（全局 tool_use_id → result 索引,并行 sub-agent 交错场景下结果可正常显示）

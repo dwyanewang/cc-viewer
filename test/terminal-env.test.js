@@ -1,8 +1,9 @@
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import {
   KEEP_CLAUDE_NO_FLICKER_ENV,
   prepareEmbeddedShellSpawn,
@@ -71,6 +72,26 @@ describe('terminal-env: CLAUDE_CODE_NO_FLICKER handling', () => {
     const wrapper = readFileSync(join(rcDir, 'bashrc'), 'utf8');
     assert.match(wrapper, /CCV_ORIGINAL_BASHRC/);
     assert.match(wrapper, /unset CLAUDE_CODE_NO_FLICKER/);
+  });
+
+  it("spawns zsh that actually sources the user's ~/.zshrc (regression)", { skip: !existsSync('/bin/zsh') }, () => {
+    const rcDir = makeTmpDir();
+    const homeDir = makeTmpDir();
+    // Synthetic user rc files so we can detect whether the wrapper sourced them.
+    writeFileSync(join(homeDir, '.zshenv'), 'export CCV_TEST_ZSHENV_LOADED=1\n');
+    writeFileSync(join(homeDir, '.zshrc'), 'export CCV_TEST_ZSHRC_LOADED=1\nccv_test_fn() { echo from-user-zshrc; }\n');
+
+    const env = {};
+    const result = prepareEmbeddedShellSpawn('/bin/zsh', env, { rcDir, homeDir, sourceEnv: {} });
+
+    const probe = spawnSync('/bin/zsh', ['-i', '-c', 'echo "ENV=${CCV_TEST_ZSHENV_LOADED:-0} RC=${CCV_TEST_ZSHRC_LOADED:-0} FN=$(typeset -f ccv_test_fn >/dev/null && echo yes || echo no)"'], {
+      env: { ...result.env, HOME: homeDir, PATH: process.env.PATH },
+      encoding: 'utf8',
+    });
+    assert.equal(probe.status, 0, `zsh exited ${probe.status}: ${probe.stderr}`);
+    // Wrapper bug previously made the [[ != ]] check in .zshrc compare wrapper==wrapper,
+    // silently skipping `source $HOME/.zshrc` — so RC and FN would stay at the defaults.
+    assert.match(probe.stdout, /ENV=1 RC=1 FN=yes/, `user zshrc not sourced: ${probe.stdout}`);
   });
 
   it('leaves shell startup unchanged when NO_FLICKER keep opt-in is set', () => {

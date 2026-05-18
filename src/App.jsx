@@ -1,6 +1,6 @@
 import React from 'react';
 import { ConfigProvider, Layout, theme, Modal, Button, Checkbox, Spin, Alert, message, Tooltip } from 'antd';
-import { UploadOutlined, DeleteOutlined, ReloadOutlined } from '@ant-design/icons';
+import { UploadOutlined, DeleteOutlined, ReloadOutlined, FileZipOutlined } from '@ant-design/icons';
 import AppBase, { styles } from './AppBase';
 import { isMobile, isElectron, setViewMode } from './env';
 import { uploadFileAndGetPath } from './components/TerminalPanel';
@@ -389,6 +389,7 @@ class App extends AppBase {
               approvalPrefs={this.state.approvalPrefs}
               onApprovalPrefsChange={this.handleApprovalPrefsChange}
               onVoicePackChange={this.handleVoicePackChange}
+              onApprovalSoundToggle={this.handleApprovalSoundToggle}
               approvalGlobal={this.state.approvalGlobal}
               approvalDismissedIds={this.state.approvalDismissedIds}
               approvalOwnPending={this.state.approvalOwnPending}
@@ -584,12 +585,21 @@ class App extends AppBase {
             </Button>
             <Button
               size="small"
-              type={this.state.selectedLogs.size > 1 ? 'primary' : 'default'}
-              disabled={this.state.selectedLogs.size < 2}
+              type={this.state.selectedLogs.size > 1 && ![...this.state.selectedLogs].some(f => f.endsWith('.jsonl.zip')) ? 'primary' : 'default'}
+              disabled={this.state.selectedLogs.size < 2 || [...this.state.selectedLogs].some(f => f.endsWith('.jsonl.zip'))}
               onClick={this.handleMergeLogs}
               className={styles.btnMarginLeft}
             >
               {t('ui.mergeLogs')}
+            </Button>
+            <Button
+              size="small"
+              icon={<FileZipOutlined />}
+              disabled={![...this.state.selectedLogs].some(f => f.endsWith('.jsonl'))}
+              onClick={this.handleArchiveLogs}
+              className={styles.btnMarginLeft}
+            >
+              {t('ui.archiveLogs')}
             </Button>
             <Button
               size="small"

@@ -4532,6 +4532,106 @@ const i18nData = {
     "tr": "Seçili {count} günlük dosyasını silmek istediğinizden emin misiniz? Bu işlem geri alınamaz.",
     "uk": "Ви впевнені, що хочете видалити {count} вибраних файлів журналу? Цю дію не можна скасувати."
   },
+  "ui.archiveLogs": {
+    "zh": "压缩归档",
+    "en": "Archive",
+    "zh-TW": "壓縮歸檔",
+    "ko": "압축 보관",
+    "ja": "圧縮アーカイブ",
+    "de": "Archivieren",
+    "es": "Archivar",
+    "fr": "Archiver",
+    "it": "Archivia",
+    "da": "Arkivér",
+    "pl": "Archiwizuj",
+    "ru": "Архивировать",
+    "ar": "أرشفة",
+    "no": "Arkiver",
+    "pt-BR": "Arquivar",
+    "th": "บีบอัดเก็บถาวร",
+    "tr": "Arşivle",
+    "uk": "Архівувати"
+  },
+  "ui.archiveLogsConfirm": {
+    "zh": "确定要把选中的 {count} 个日志文件压缩归档吗？原 .jsonl 文件将被删除。",
+    "en": "Archive {count} selected log file(s)? Original .jsonl files will be deleted.",
+    "zh-TW": "確定要把選中的 {count} 個日誌檔案壓縮歸檔嗎？原 .jsonl 檔案將被刪除。",
+    "ko": "선택한 {count}개의 로그 파일을 압축 보관하시겠습니까? 원본 .jsonl 파일은 삭제됩니다.",
+    "ja": "選択した {count} 件のログファイルを圧縮アーカイブしますか？元の .jsonl ファイルは削除されます。",
+    "de": "{count} ausgewählte Logdatei(en) archivieren? Die ursprünglichen .jsonl-Dateien werden gelöscht.",
+    "es": "¿Archivar {count} archivo(s) de registro seleccionado(s)? Los archivos .jsonl originales se eliminarán.",
+    "fr": "Archiver {count} fichier(s) journal sélectionné(s) ? Les fichiers .jsonl originaux seront supprimés.",
+    "it": "Archiviare {count} file di log selezionati? I file .jsonl originali verranno eliminati.",
+    "da": "Arkivér {count} valgte logfil(er)? De originale .jsonl-filer vil blive slettet.",
+    "pl": "Zarchiwizować {count} wybranych plików logów? Oryginalne pliki .jsonl zostaną usunięte.",
+    "ru": "Архивировать {count} выбранных файла(ов) журнала? Исходные файлы .jsonl будут удалены.",
+    "ar": "أرشفة {count} ملف(ات) سجل محدد؟ سيتم حذف ملفات .jsonl الأصلية.",
+    "no": "Arkiver {count} valgte loggfil(er)? De originale .jsonl-filene blir slettet.",
+    "pt-BR": "Arquivar {count} arquivo(s) de log selecionado(s)? Os arquivos .jsonl originais serão excluídos.",
+    "th": "บีบอัดเก็บถาวร {count} ไฟล์บันทึกที่เลือก? ไฟล์ .jsonl ต้นฉบับจะถูกลบ",
+    "tr": "Seçili {count} günlük dosyasını arşivlensin mi? Orijinal .jsonl dosyaları silinecek.",
+    "uk": "Архівувати {count} вибраних файлів журналу? Оригінальні файли .jsonl буде видалено."
+  },
+  "ui.archiveSuccess": {
+    "zh": "已归档 {count} 个文件",
+    "en": "{count} log(s) archived",
+    "zh-TW": "已歸檔 {count} 個檔案",
+    "ko": "{count}개 보관 완료",
+    "ja": "{count} 件アーカイブしました",
+    "de": "{count} Datei(en) archiviert",
+    "es": "{count} archivo(s) archivado(s)",
+    "fr": "{count} fichier(s) archivé(s)",
+    "it": "{count} file archiviati",
+    "da": "{count} fil(er) arkiveret",
+    "pl": "Zarchiwizowano {count} plików",
+    "ru": "Архивировано {count} файлов",
+    "ar": "تمت أرشفة {count} ملف",
+    "no": "{count} fil(er) arkivert",
+    "pt-BR": "{count} arquivo(s) arquivado(s)",
+    "th": "เก็บถาวรแล้ว {count} ไฟล์",
+    "tr": "{count} dosya arşivlendi",
+    "uk": "Архівовано {count} файлів"
+  },
+  "ui.archiveFailed": {
+    "zh": "{count} 个文件归档失败",
+    "en": "{count} file(s) failed to archive",
+    "zh-TW": "{count} 個檔案歸檔失敗",
+    "ko": "{count}개 보관 실패",
+    "ja": "{count} 件のアーカイブに失敗しました",
+    "de": "{count} Datei(en) konnten nicht archiviert werden",
+    "es": "Falló el archivado de {count} archivo(s)",
+    "fr": "Échec de l'archivage de {count} fichier(s)",
+    "it": "Archiviazione di {count} file fallita",
+    "da": "{count} fil(er) kunne ikke arkiveres",
+    "pl": "Nie udało się zarchiwizować {count} plików",
+    "ru": "Не удалось архивировать {count} файлов",
+    "ar": "فشلت أرشفة {count} ملف",
+    "no": "{count} fil(er) kunne ikke arkiveres",
+    "pt-BR": "Falha ao arquivar {count} arquivo(s)",
+    "th": "เก็บถาวร {count} ไฟล์ล้มเหลว",
+    "tr": "{count} dosya arşivlenemedi",
+    "uk": "Не вдалося архівувати {count} файлів"
+  },
+  "ui.logArchived": {
+    "zh": "已归档",
+    "en": "Archived",
+    "zh-TW": "已歸檔",
+    "ko": "보관됨",
+    "ja": "アーカイブ済み",
+    "de": "Archiviert",
+    "es": "Archivado",
+    "fr": "Archivé",
+    "it": "Archiviato",
+    "da": "Arkiveret",
+    "pl": "Zarchiwizowano",
+    "ru": "Архивировано",
+    "ar": "مؤرشف",
+    "no": "Arkivert",
+    "pt-BR": "Arquivado",
+    "th": "เก็บถาวรแล้ว",
+    "tr": "Arşivlendi",
+    "uk": "Архівовано"
+  },
   "ui.openLog": {
     "zh": "打开",
     "en": "Open",
@@ -4713,24 +4813,24 @@ const i18nData = {
     "uk": "Виберіть послідовні файли логів"
   },
   "ui.mergeTooLarge": {
-    "zh": "选中的日志文件总大小超过 500MB",
-    "en": "Selected log files exceed 500MB",
-    "zh-TW": "選中的日誌檔案總大小超過 500MB",
-    "ko": "선택한 로그 파일의 총 크기가 500MB를 초과합니다",
-    "ja": "選択したログファイルの合計サイズが 500MB を超えています",
-    "de": "Ausgewählte Log-Dateien überschreiten 500MB",
-    "es": "Los archivos de log seleccionados superan los 500MB",
-    "fr": "Les fichiers de log sélectionnés dépassent 500 Mo",
-    "it": "I file di log selezionati superano i 500MB",
-    "da": "Valgte logfiler overstiger 500MB",
-    "pl": "Wybrane pliki logów przekraczają 500MB",
-    "ru": "Выбранные файлы логов превышают 500МБ",
-    "ar": "ملفات السجلات المحددة تتجاوز 500 ميجابايت",
-    "no": "Valgte loggfiler overstiger 500MB",
-    "pt-BR": "Arquivos de log selecionados excedem 500MB",
-    "th": "ไฟล์บันทึกที่เลือกมีขนาดรวมเกิน 500MB",
-    "tr": "Seçilen log dosyaları 500MB'ı aşıyor",
-    "uk": "Вибрані файли логів перевищують 500МБ"
+    "zh": "选中的日志文件总大小超过 400MB",
+    "en": "Selected log files exceed 400MB",
+    "zh-TW": "選中的日誌檔案總大小超過 400MB",
+    "ko": "선택한 로그 파일의 총 크기가 400MB를 초과합니다",
+    "ja": "選択したログファイルの合計サイズが 400MB を超えています",
+    "de": "Ausgewählte Log-Dateien überschreiten 400MB",
+    "es": "Los archivos de log seleccionados superan los 400MB",
+    "fr": "Les fichiers de log sélectionnés dépassent 400 Mo",
+    "it": "I file di log selezionati superano i 400MB",
+    "da": "Valgte logfiler overstiger 400MB",
+    "pl": "Wybrane pliki logów przekraczają 400MB",
+    "ru": "Выбранные файлы логов превышают 400МБ",
+    "ar": "ملفات السجلات المحددة تتجاوز 400 ميجابايت",
+    "no": "Valgte loggfiler overstiger 400MB",
+    "pt-BR": "Arquivos de log selecionados excedem 400MB",
+    "th": "ไฟล์บันทึกที่เลือกมีขนาดรวมเกิน 400MB",
+    "tr": "Seçilen log dosyaları 400MB'ı aşıyor",
+    "uk": "Вибрані файли логів перевищують 400МБ"
   },
   "ui.mergeSuccess": {
     "zh": "日志合并成功",
@@ -5692,14 +5792,6 @@ const i18nData = {
     "ar": "تصغير", "no": "Minimer", "pt-BR": "Minimizar",
     "th": "ย่อ", "tr": "Küçült", "uk": "Згорнути"
   },
-  "ui.approval.modal.dismissHint": {
-    "zh": "ESC 或点击外部最小化（待审批保留）", "en": "ESC or click outside to minimise (pending stays)", "zh-TW": "ESC 或點擊外部最小化（保留待審批）",
-    "ko": "ESC 또는 외부 클릭으로 최소화 (보류 유지)", "ja": "ESC または外側をクリックして最小化", "de": "ESC oder außen klicken zum Minimieren",
-    "es": "ESC o clic fuera para minimizar", "fr": "ESC ou cliquer dehors pour minimiser", "it": "ESC o clic fuori per minimizzare",
-    "da": "ESC eller klik udenfor for at minimere", "pl": "ESC lub kliknij na zewnątrz aby zminimalizować", "ru": "ESC или клик снаружи — свернуть",
-    "ar": "ESC أو انقر خارجًا للتصغير", "no": "ESC eller klikk utenfor for å minimere", "pt-BR": "ESC ou clique fora para minimizar",
-    "th": "ESC หรือคลิกนอกเพื่อย่อ", "tr": "ESC veya dışarı tıklayarak küçült", "uk": "ESC або клік зовні — згорнути"
-  },
   "ui.approval.modal.cancelHint": {
     "zh": "⌘/Ctrl+ESC 取消", "en": "⌘/Ctrl+ESC to cancel", "zh-TW": "⌘/Ctrl+ESC 取消",
     "ko": "⌘/Ctrl+ESC로 취소", "ja": "⌘/Ctrl+ESC でキャンセル", "de": "⌘/Strg+ESC zum Abbrechen",
@@ -5707,6 +5799,14 @@ const i18nData = {
     "da": "⌘/Ctrl+ESC for at annullere", "pl": "⌘/Ctrl+ESC aby anulować", "ru": "⌘/Ctrl+ESC — отмена",
     "ar": "⌘/Ctrl+ESC للإلغاء", "no": "⌘/Ctrl+ESC for å avbryte", "pt-BR": "⌘/Ctrl+ESC para cancelar",
     "th": "⌘/Ctrl+ESC เพื่อยกเลิก", "tr": "⌘/Ctrl+ESC ile iptal", "uk": "⌘/Ctrl+ESC — скасувати"
+  },
+  "ui.approval.modal.hintPrefix": {
+    "zh": "操作提示:", "en": "Hint:", "zh-TW": "操作提示:",
+    "ko": "안내:", "ja": "ヒント:", "de": "Hinweis:",
+    "es": "Pista:", "fr": "Astuce :", "it": "Suggerimento:",
+    "da": "Tip:", "pl": "Wskazówka:", "ru": "Подсказка:",
+    "ar": "تلميح:", "no": "Tips:", "pt-BR": "Dica:",
+    "th": "คำแนะนำ:", "tr": "İpucu:", "uk": "Підказка:"
   },
   "ui.approval.bell.reopen": {
     "zh": "重新打开审批弹层", "en": "Reopen approval modal", "zh-TW": "重新開啟審批彈層",
@@ -5788,22 +5888,6 @@ const i18nData = {
     "ar": "سؤال المستخدم", "no": "Spør bruker", "pt-BR": "Pergunta ao usuário",
     "th": "ถามผู้ใช้", "tr": "Kullanıcıya sor", "uk": "Запит до користувача"
   },
-  "ui.voicePack.event.timeoutWarning5min": {
-    "zh": "超时预警 (剩 5 分钟)", "en": "Timeout warning (5 min left)", "zh-TW": "逾時預警 (剩 5 分鐘)",
-    "ko": "시간 초과 경고 (5분 남음)", "ja": "タイムアウト警告 (残り5分)", "de": "Timeout-Warnung (5 Min)",
-    "es": "Aviso de tiempo (5 min)", "fr": "Alerte délai (5 min)", "it": "Avviso timeout (5 min)",
-    "da": "Timeout-advarsel (5 min)", "pl": "Ostrzeżenie limitu (5 min)", "ru": "Предупреждение (5 мин)",
-    "ar": "تحذير المهلة (٥ دقائق)", "no": "Tidsadvarsel (5 min)", "pt-BR": "Aviso de tempo (5 min)",
-    "th": "เตือนหมดเวลา (5 นาที)", "tr": "Zaman uyarısı (5 dk)", "uk": "Попередження (5 хв)"
-  },
-  "ui.voicePack.event.timeoutWarning60s": {
-    "zh": "超时预警 (剩 60 秒)", "en": "Timeout warning (60 s left)", "zh-TW": "逾時預警 (剩 60 秒)",
-    "ko": "시간 초과 경고 (60초 남음)", "ja": "タイムアウト警告 (残り60秒)", "de": "Timeout-Warnung (60 s)",
-    "es": "Aviso de tiempo (60 s)", "fr": "Alerte délai (60 s)", "it": "Avviso timeout (60 s)",
-    "da": "Timeout-advarsel (60 s)", "pl": "Ostrzeżenie limitu (60 s)", "ru": "Предупреждение (60 с)",
-    "ar": "تحذير المهلة (٦٠ ثانية)", "no": "Tidsadvarsel (60 s)", "pt-BR": "Aviso de tempo (60 s)",
-    "th": "เตือนหมดเวลา (60 วินาที)", "tr": "Zaman uyarısı (60 sn)", "uk": "Попередження (60 с)"
-  },
   "ui.voicePack.event.turnEnd": {
     "zh": "回合结束 / 任务完成", "en": "Turn end / task done", "zh-TW": "回合結束 / 任務完成",
     "ko": "턴 종료 / 작업 완료", "ja": "ターン終了 / タスク完了", "de": "Antwort fertig",
@@ -5829,24 +5913,24 @@ const i18nData = {
     "th": "ตัวอย่าง", "tr": "yer tutucu", "uk": "заповнювач"
   },
   "ui.voicePack.eventHint.turnEnd": {
-    "zh": "仅窗口失焦时响，30 秒内最多一次",
-    "en": "Plays only when window unfocused, max once per 30s",
-    "zh-TW": "僅視窗失焦時播放，30 秒內最多一次",
-    "ko": "창이 비활성일 때만 재생, 30초당 최대 1회",
-    "ja": "ウィンドウが非アクティブのみ、30秒ごとに最大1回",
-    "de": "Nur bei unfokussiertem Fenster, max. 1×/30s",
-    "es": "Solo si la ventana no tiene foco, máx 1 por 30 s",
-    "fr": "Uniquement fenêtre non focalisée, max 1 par 30 s",
-    "it": "Solo a finestra non attiva, max 1 ogni 30s",
-    "da": "Kun ved ufokuseret vindue, maks. 1 pr. 30s",
-    "pl": "Tylko gdy okno nieaktywne, maks 1 / 30 s",
-    "ru": "Только при неактивном окне, ≤1 за 30с",
-    "ar": "فقط عند فقدان تركيز النافذة، مرة كل 30 ثانية",
-    "no": "Kun når vinduet er ufokusert, maks 1 per 30s",
-    "pt-BR": "Só com janela desfocada, máx 1 a cada 30s",
-    "th": "เฉพาะตอนหน้าต่างไม่โฟกัส, สูงสุด 1 ครั้งต่อ 30 วิ",
-    "tr": "Yalnızca pencere odakta değilken, 30s'de en fazla 1",
-    "uk": "Лише коли вікно не у фокусі, ≤1 раз/30с"
+    "zh": "30 秒内最多一次",
+    "en": "At most once per 30s",
+    "zh-TW": "30 秒內最多一次",
+    "ko": "30초당 최대 1회",
+    "ja": "30秒ごとに最大1回",
+    "de": "Max. 1×/30s",
+    "es": "Máx 1 cada 30 s",
+    "fr": "Max 1 toutes les 30 s",
+    "it": "Max 1 ogni 30s",
+    "da": "Maks. 1 pr. 30s",
+    "pl": "Maks 1 / 30 s",
+    "ru": "≤1 раз/30с",
+    "ar": "مرة واحدة كل 30 ثانية كحد أقصى",
+    "no": "Maks 1 per 30s",
+    "pt-BR": "Máx 1 a cada 30s",
+    "th": "สูงสุด 1 ครั้งต่อ 30 วินาที",
+    "tr": "30s'de en fazla 1",
+    "uk": "≤1 раз/30с"
   },
   "ui.voicePack.binding.disabled": {
     "zh": "禁用", "en": "Disabled", "zh-TW": "停用",
@@ -8610,13 +8694,15 @@ const i18nData = {
     "tr": "Ek ekle",
     "uk": "Додати вкладення"
   },
-  "ui.ultraplan.customAdd": {
-    "zh": "自定义 UltraPlan", "en": "Custom UltraPlan", "zh-TW": "自訂 UltraPlan",
-    "ko": "커스텀 UltraPlan", "ja": "カスタム UltraPlan", "de": "Benutzerdefinierter UltraPlan",
-    "es": "UltraPlan personalizado", "fr": "UltraPlan personnalisé", "it": "UltraPlan personalizzato",
-    "da": "Tilpasset UltraPlan", "pl": "Niestandardowy UltraPlan", "ru": "Пользовательский UltraPlan",
-    "ar": "UltraPlan مخصص", "no": "Tilpasset UltraPlan", "pt-BR": "UltraPlan personalizado",
-    "th": "UltraPlan กำหนดเอง", "tr": "Özel UltraPlan", "uk": "Користувацький UltraPlan"
+  "ui.ultraplan.customExpert": {
+    // ja 与 customCreateTitle.ja「新しいカスタムエキスパート」用词统一为「エキスパート」;
+    // ru 用「Пользовательский」与同类「自定义/用户定义」译义对齐。
+    "zh": "自定义专家", "en": "Custom Expert", "zh-TW": "自訂專家",
+    "ko": "커스텀 전문가", "ja": "カスタムエキスパート", "de": "Eigener Experte",
+    "es": "Experto personalizado", "fr": "Expert personnalisé", "it": "Esperto personalizzato",
+    "da": "Tilpasset ekspert", "pl": "Własny ekspert", "ru": "Пользовательский эксперт",
+    "ar": "خبير مخصص", "no": "Tilpasset ekspert", "pt-BR": "Especialista personalizado",
+    "th": "ผู้เชี่ยวชาญกำหนดเอง", "tr": "Özel uzman", "uk": "Власний експерт"
   },
   "ui.ultraplan.customCreateTitle": {
     "zh": "新建自定义专家", "en": "New Custom Expert", "zh-TW": "新建自訂專家",
@@ -9000,6 +9086,288 @@ const i18nData = {
     "th": "ปิด",
     "tr": "Kapat",
     "uk": "Закрити"
+  },
+  // === Slash command 展示标签 ===
+  // 与 src/utils/slashCommandLabels.js COMMAND_KEYS 一一对应,改动时同步两边。
+  // 翻译歧义点:
+  //  - /memory 指会话级记忆/用户笔记管理,不是系统 RAM
+  //  - /compact 是动词「压缩(上下文)」,不是形容词「紧凑」
+  //  - /mcp 是 Model Context Protocol 缩写,各语言保留缩写
+  //  - /ide 是缩写「集成开发环境」,各语言保留缩写
+  //  - /agents 指 subagent/teammate 管理,不是泛指「代理」
+  "ui.slashCommand.clear": {
+    "zh": "清空上下文", "en": "Clear context", "zh-TW": "清空上下文",
+    "ko": "컨텍스트 지우기", "ja": "コンテキストをクリア", "de": "Kontext leeren",
+    "es": "Limpiar contexto", "fr": "Effacer le contexte", "it": "Pulisci contesto",
+    "da": "Ryd kontekst", "pl": "Wyczyść kontekst", "ru": "Очистить контекст",
+    "ar": "مسح السياق", "no": "Tøm kontekst", "pt-BR": "Limpar contexto",
+    "th": "ล้างบริบท", "tr": "Bağlamı temizle", "uk": "Очистити контекст"
+  },
+  "ui.slashCommand.compact": {
+    "zh": "压缩对话", "en": "Compact context", "zh-TW": "壓縮對話",
+    "ko": "컨텍스트 압축", "ja": "コンテキスト圧縮", "de": "Kontext komprimieren",
+    "es": "Compactar contexto", "fr": "Compacter le contexte", "it": "Compatta contesto",
+    "da": "Komprimer kontekst", "pl": "Skompaktuj kontekst", "ru": "Сжать контекст",
+    "ar": "ضغط السياق", "no": "Komprimer kontekst", "pt-BR": "Compactar contexto",
+    "th": "ย่อบริบท", "tr": "Bağlamı sıkıştır", "uk": "Стиснути контекст"
+  },
+  // /compact 自动注入的「This session is being continued…」长文本折叠头标题
+  // (与 slashCommand.compact 同概念但用于 Collapse label,故另起一个 key)。
+  "ui.compactSummary": {
+    "zh": "压缩摘要", "en": "Compact Summary", "zh-TW": "壓縮摘要",
+    "ko": "압축 요약", "ja": "コンパクト要約", "de": "Kompaktzusammenfassung",
+    "es": "Resumen compacto", "fr": "Résumé compact", "it": "Riepilogo compatto",
+    "da": "Kompakt resumé", "pl": "Skompaktowane podsumowanie", "ru": "Сжатое резюме",
+    "ar": "ملخص مضغوط", "no": "Kompakt sammendrag", "pt-BR": "Resumo compactado",
+    "th": "สรุปแบบย่อ", "tr": "Sıkıştırılmış özet", "uk": "Стиснений підсумок"
+  },
+  "ui.slashCommand.theme": {
+    "zh": "主题切换", "en": "Toggle theme", "zh-TW": "主題切換",
+    "ko": "테마 전환", "ja": "テーマ切替", "de": "Theme wechseln",
+    "es": "Cambiar tema", "fr": "Changer de thème", "it": "Cambia tema",
+    "da": "Skift tema", "pl": "Zmień motyw", "ru": "Сменить тему",
+    "ar": "تبديل السمة", "no": "Bytt tema", "pt-BR": "Alternar tema",
+    "th": "สลับธีม", "tr": "Temayı değiştir", "uk": "Змінити тему"
+  },
+  "ui.slashCommand.cost": {
+    "zh": "查看花费", "en": "View cost", "zh-TW": "檢視花費",
+    "ko": "비용 보기", "ja": "コストを表示", "de": "Kosten anzeigen",
+    "es": "Ver coste", "fr": "Voir le coût", "it": "Mostra costo",
+    "da": "Vis omkostning", "pl": "Pokaż koszt", "ru": "Показать стоимость",
+    "ar": "عرض التكلفة", "no": "Vis kostnad", "pt-BR": "Ver custo",
+    "th": "ดูค่าใช้จ่าย", "tr": "Maliyeti gör", "uk": "Показати вартість"
+  },
+  "ui.slashCommand.model": {
+    "zh": "切换模型", "en": "Switch model", "zh-TW": "切換模型",
+    "ko": "모델 전환", "ja": "モデル切替", "de": "Modell wechseln",
+    "es": "Cambiar modelo", "fr": "Changer de modèle", "it": "Cambia modello",
+    "da": "Skift model", "pl": "Zmień model", "ru": "Сменить модель",
+    "ar": "تغيير النموذج", "no": "Bytt modell", "pt-BR": "Trocar modelo",
+    "th": "เปลี่ยนโมเดล", "tr": "Modeli değiştir", "uk": "Змінити модель"
+  },
+  "ui.slashCommand.login": {
+    "zh": "登录", "en": "Log in", "zh-TW": "登入",
+    "ko": "로그인", "ja": "ログイン", "de": "Anmelden",
+    "es": "Iniciar sesión", "fr": "Connexion", "it": "Accedi",
+    "da": "Log ind", "pl": "Zaloguj", "ru": "Войти",
+    "ar": "تسجيل الدخول", "no": "Logg inn", "pt-BR": "Entrar",
+    "th": "เข้าสู่ระบบ", "tr": "Giriş yap", "uk": "Увійти"
+  },
+  "ui.slashCommand.logout": {
+    "zh": "退出登录", "en": "Log out", "zh-TW": "登出",
+    "ko": "로그아웃", "ja": "ログアウト", "de": "Abmelden",
+    "es": "Cerrar sesión", "fr": "Déconnexion", "it": "Esci",
+    "da": "Log ud", "pl": "Wyloguj", "ru": "Выйти",
+    "ar": "تسجيل الخروج", "no": "Logg ut", "pt-BR": "Sair",
+    "th": "ออกจากระบบ", "tr": "Çıkış yap", "uk": "Вийти"
+  },
+  "ui.slashCommand.status": {
+    "zh": "状态", "en": "Status", "zh-TW": "狀態",
+    "ko": "상태", "ja": "ステータス", "de": "Status",
+    "es": "Estado", "fr": "Statut", "it": "Stato",
+    "da": "Status", "pl": "Status", "ru": "Статус",
+    "ar": "الحالة", "no": "Status", "pt-BR": "Status",
+    "th": "สถานะ", "tr": "Durum", "uk": "Статус"
+  },
+  "ui.slashCommand.help": {
+    "zh": "帮助", "en": "Help", "zh-TW": "說明",
+    "ko": "도움말", "ja": "ヘルプ", "de": "Hilfe",
+    "es": "Ayuda", "fr": "Aide", "it": "Aiuto",
+    "da": "Hjælp", "pl": "Pomoc", "ru": "Помощь",
+    "ar": "مساعدة", "no": "Hjelp", "pt-BR": "Ajuda",
+    "th": "ช่วยเหลือ", "tr": "Yardım", "uk": "Допомога"
+  },
+  "ui.slashCommand.init": {
+    "zh": "初始化项目", "en": "Init project", "zh-TW": "初始化專案",
+    "ko": "프로젝트 초기화", "ja": "プロジェクト初期化", "de": "Projekt initialisieren",
+    "es": "Iniciar proyecto", "fr": "Initialiser projet", "it": "Inizializza progetto",
+    "da": "Initialiser projekt", "pl": "Inicjuj projekt", "ru": "Инициализировать проект",
+    "ar": "تهيئة المشروع", "no": "Initier prosjekt", "pt-BR": "Iniciar projeto",
+    "th": "เริ่มโปรเจกต์", "tr": "Projeyi başlat", "uk": "Ініціалізувати проєкт"
+  },
+  "ui.slashCommand.agents": {
+    "zh": "子代理管理", "en": "Manage agents", "zh-TW": "子代理管理",
+    "ko": "에이전트 관리", "ja": "エージェント管理", "de": "Agenten verwalten",
+    "es": "Gestionar agentes", "fr": "Gérer les agents", "it": "Gestisci agenti",
+    "da": "Administrer agenter", "pl": "Zarządzaj agentami", "ru": "Управление агентами",
+    "ar": "إدارة الوكلاء", "no": "Administrer agenter", "pt-BR": "Gerenciar agentes",
+    "th": "จัดการเอเจนต์", "tr": "Ajanları yönet", "uk": "Керування агентами"
+  },
+  "ui.slashCommand.config": {
+    "zh": "设置", "en": "Settings", "zh-TW": "設定",
+    "ko": "설정", "ja": "設定", "de": "Einstellungen",
+    "es": "Configuración", "fr": "Configuration", "it": "Impostazioni",
+    "da": "Indstillinger", "pl": "Ustawienia", "ru": "Настройки",
+    "ar": "الإعدادات", "no": "Innstillinger", "pt-BR": "Configurações",
+    "th": "ตั้งค่า", "tr": "Ayarlar", "uk": "Налаштування"
+  },
+  "ui.slashCommand.memory": {
+    "zh": "记忆管理", "en": "Manage memory", "zh-TW": "記憶管理",
+    "ko": "메모리 관리", "ja": "メモリ管理", "de": "Speicher verwalten",
+    "es": "Gestionar memoria", "fr": "Gérer la mémoire", "it": "Gestisci memoria",
+    "da": "Administrer hukommelse", "pl": "Zarządzaj pamięcią", "ru": "Управление памятью",
+    "ar": "إدارة الذاكرة", "no": "Administrer minne", "pt-BR": "Gerenciar memória",
+    "th": "จัดการความจำ", "tr": "Belleği yönet", "uk": "Керування пам'яттю"
+  },
+  "ui.slashCommand.permissions": {
+    "zh": "权限管理", "en": "Permissions", "zh-TW": "權限管理",
+    "ko": "권한 관리", "ja": "権限管理", "de": "Berechtigungen",
+    "es": "Permisos", "fr": "Permissions", "it": "Permessi",
+    "da": "Tilladelser", "pl": "Uprawnienia", "ru": "Разрешения",
+    "ar": "الأذونات", "no": "Tillatelser", "pt-BR": "Permissões",
+    "th": "สิทธิ์", "tr": "İzinler", "uk": "Дозволи"
+  },
+  "ui.slashCommand.releaseNotes": {
+    "zh": "发布说明", "en": "Release notes", "zh-TW": "發行說明",
+    "ko": "릴리스 노트", "ja": "リリースノート", "de": "Versionshinweise",
+    "es": "Notas de versión", "fr": "Notes de version", "it": "Note di rilascio",
+    "da": "Udgivelsesnoter", "pl": "Informacje o wydaniu", "ru": "Заметки о выпуске",
+    "ar": "ملاحظات الإصدار", "no": "Versjonsmerknader", "pt-BR": "Notas de versão",
+    "th": "บันทึกการเผยแพร่", "tr": "Sürüm notları", "uk": "Примітки до випуску"
+  },
+  "ui.slashCommand.upgrade": {
+    "zh": "升级", "en": "Upgrade", "zh-TW": "升級",
+    "ko": "업그레이드", "ja": "アップグレード", "de": "Upgrade",
+    "es": "Actualizar", "fr": "Mettre à jour", "it": "Aggiorna",
+    "da": "Opgrader", "pl": "Aktualizuj", "ru": "Обновить",
+    "ar": "ترقية", "no": "Oppgrader", "pt-BR": "Atualizar",
+    "th": "อัปเกรด", "tr": "Yükselt", "uk": "Оновити"
+  },
+  "ui.slashCommand.bug": {
+    "zh": "反馈问题", "en": "Report bug", "zh-TW": "回報問題",
+    "ko": "버그 신고", "ja": "バグ報告", "de": "Fehler melden",
+    "es": "Reportar error", "fr": "Signaler un bug", "it": "Segnala bug",
+    "da": "Rapportér fejl", "pl": "Zgłoś błąd", "ru": "Сообщить об ошибке",
+    "ar": "الإبلاغ عن خلل", "no": "Rapporter feil", "pt-BR": "Relatar bug",
+    "th": "รายงานข้อผิดพลาด", "tr": "Hata bildir", "uk": "Повідомити про помилку"
+  },
+  "ui.slashCommand.doctor": {
+    "zh": "自检", "en": "Diagnose", "zh-TW": "自我檢查",
+    "ko": "진단", "ja": "診断", "de": "Diagnose",
+    "es": "Diagnosticar", "fr": "Diagnostiquer", "it": "Diagnostica",
+    "da": "Diagnose", "pl": "Diagnoza", "ru": "Диагностика",
+    "ar": "تشخيص", "no": "Diagnose", "pt-BR": "Diagnóstico",
+    "th": "ตรวจสอบ", "tr": "Tanı", "uk": "Діагностика"
+  },
+  "ui.slashCommand.mcp": {
+    "zh": "MCP 服务器", "en": "MCP servers", "zh-TW": "MCP 伺服器",
+    "ko": "MCP 서버", "ja": "MCP サーバー", "de": "MCP-Server",
+    "es": "Servidores MCP", "fr": "Serveurs MCP", "it": "Server MCP",
+    "da": "MCP-servere", "pl": "Serwery MCP", "ru": "MCP-серверы",
+    "ar": "خوادم MCP", "no": "MCP-servere", "pt-BR": "Servidores MCP",
+    "th": "เซิร์ฟเวอร์ MCP", "tr": "MCP sunucuları", "uk": "MCP-сервери"
+  },
+  "ui.slashCommand.vim": {
+    "zh": "Vim 模式", "en": "Vim mode", "zh-TW": "Vim 模式",
+    "ko": "Vim 모드", "ja": "Vim モード", "de": "Vim-Modus",
+    "es": "Modo Vim", "fr": "Mode Vim", "it": "Modalità Vim",
+    "da": "Vim-tilstand", "pl": "Tryb Vim", "ru": "Режим Vim",
+    "ar": "وضع Vim", "no": "Vim-modus", "pt-BR": "Modo Vim",
+    "th": "โหมด Vim", "tr": "Vim modu", "uk": "Режим Vim"
+  },
+  "ui.slashCommand.export": {
+    "zh": "导出对话", "en": "Export chat", "zh-TW": "匯出對話",
+    "ko": "대화 내보내기", "ja": "会話をエクスポート", "de": "Chat exportieren",
+    "es": "Exportar chat", "fr": "Exporter la conversation", "it": "Esporta chat",
+    "da": "Eksportér chat", "pl": "Eksportuj rozmowę", "ru": "Экспорт чата",
+    "ar": "تصدير المحادثة", "no": "Eksporter chat", "pt-BR": "Exportar conversa",
+    "th": "ส่งออกแชต", "tr": "Sohbeti dışa aktar", "uk": "Експорт чату"
+  },
+  "ui.slashCommand.prComments": {
+    "zh": "PR 评论", "en": "PR comments", "zh-TW": "PR 評論",
+    "ko": "PR 댓글", "ja": "PR コメント", "de": "PR-Kommentare",
+    "es": "Comentarios de PR", "fr": "Commentaires PR", "it": "Commenti PR",
+    "da": "PR-kommentarer", "pl": "Komentarze PR", "ru": "Комментарии PR",
+    "ar": "تعليقات PR", "no": "PR-kommentarer", "pt-BR": "Comentários do PR",
+    "th": "ความคิดเห็น PR", "tr": "PR yorumları", "uk": "Коментарі PR"
+  },
+  "ui.slashCommand.review": {
+    "zh": "代码评审", "en": "Code review", "zh-TW": "程式碼審查",
+    "ko": "코드 리뷰", "ja": "コードレビュー", "de": "Code-Review",
+    "es": "Revisión de código", "fr": "Revue de code", "it": "Revisione codice",
+    "da": "Kodegennemgang", "pl": "Przegląd kodu", "ru": "Ревью кода",
+    "ar": "مراجعة الكود", "no": "Kodegjennomgang", "pt-BR": "Revisão de código",
+    "th": "ตรวจสอบโค้ด", "tr": "Kod incelemesi", "uk": "Огляд коду"
+  },
+  "ui.slashCommand.securityReview": {
+    "zh": "安全评审", "en": "Security review", "zh-TW": "安全審查",
+    "ko": "보안 검토", "ja": "セキュリティレビュー", "de": "Sicherheitsprüfung",
+    "es": "Revisión de seguridad", "fr": "Revue de sécurité", "it": "Revisione sicurezza",
+    "da": "Sikkerhedsgennemgang", "pl": "Przegląd bezpieczeństwa", "ru": "Аудит безопасности",
+    "ar": "مراجعة الأمان", "no": "Sikkerhetsgjennomgang", "pt-BR": "Revisão de segurança",
+    "th": "ตรวจสอบความปลอดภัย", "tr": "Güvenlik incelemesi", "uk": "Аудит безпеки"
+  },
+  "ui.slashCommand.ide": {
+    "zh": "IDE 集成", "en": "IDE integration", "zh-TW": "IDE 整合",
+    "ko": "IDE 통합", "ja": "IDE 連携", "de": "IDE-Integration",
+    "es": "Integración IDE", "fr": "Intégration IDE", "it": "Integrazione IDE",
+    "da": "IDE-integration", "pl": "Integracja IDE", "ru": "Интеграция IDE",
+    "ar": "تكامل IDE", "no": "IDE-integrasjon", "pt-BR": "Integração IDE",
+    "th": "เชื่อมต่อ IDE", "tr": "IDE entegrasyonu", "uk": "Інтеграція IDE"
+  },
+  "ui.slashCommand.resume": {
+    "zh": "恢复会话", "en": "Resume session", "zh-TW": "恢復會話",
+    "ko": "세션 재개", "ja": "セッション再開", "de": "Sitzung fortsetzen",
+    "es": "Reanudar sesión", "fr": "Reprendre la session", "it": "Riprendi sessione",
+    "da": "Genoptag session", "pl": "Wznów sesję", "ru": "Возобновить сессию",
+    "ar": "استئناف الجلسة", "no": "Gjenoppta økt", "pt-BR": "Retomar sessão",
+    "th": "เริ่มเซสชันต่อ", "tr": "Oturumu sürdür", "uk": "Відновити сеанс"
+  },
+  "ui.slashCommand.terminalSetup": {
+    "zh": "终端配置", "en": "Terminal setup", "zh-TW": "終端機設定",
+    "ko": "터미널 설정", "ja": "ターミナル設定", "de": "Terminal-Setup",
+    "es": "Configurar terminal", "fr": "Configurer terminal", "it": "Configura terminale",
+    "da": "Terminal-opsætning", "pl": "Konfiguracja terminala", "ru": "Настройка терминала",
+    "ar": "إعداد الطرفية", "no": "Terminaloppsett", "pt-BR": "Configurar terminal",
+    "th": "ตั้งค่าเทอร์มินัล", "tr": "Terminal kurulumu", "uk": "Налаштування терміналу"
+  },
+  "ui.slashCommand.migrateInstaller": {
+    "zh": "迁移安装器", "en": "Migrate installer", "zh-TW": "遷移安裝程式",
+    "ko": "설치 마이그레이션", "ja": "インストーラー移行", "de": "Installer migrieren",
+    "es": "Migrar instalador", "fr": "Migrer l'installeur", "it": "Migra installer",
+    "da": "Migrer installer", "pl": "Migracja instalatora", "ru": "Миграция установщика",
+    "ar": "ترحيل المثبت", "no": "Migrer installer", "pt-BR": "Migrar instalador",
+    "th": "ย้ายตัวติดตั้ง", "tr": "Yükleyiciyi taşı", "uk": "Міграція встановлювача"
+  },
+  "ui.slashCommand.usage": {
+    "zh": "用量统计", "en": "Usage stats", "zh-TW": "用量統計",
+    "ko": "사용량 통계", "ja": "使用量統計", "de": "Nutzungsstatistik",
+    "es": "Estadísticas de uso", "fr": "Statistiques d'utilisation", "it": "Statistiche d'uso",
+    "da": "Forbrugsstatistik", "pl": "Statystyki użycia", "ru": "Статистика использования",
+    "ar": "إحصائيات الاستخدام", "no": "Bruksstatistikk", "pt-BR": "Estatísticas de uso",
+    "th": "สถิติการใช้งาน", "tr": "Kullanım istatistikleri", "uk": "Статистика використання"
+  },
+  "ui.slashCommand.context": {
+    "zh": "上下文用量", "en": "Context usage", "zh-TW": "上下文用量",
+    "ko": "컨텍스트 사용량", "ja": "コンテキスト使用量", "de": "Kontextnutzung",
+    "es": "Uso del contexto", "fr": "Utilisation du contexte", "it": "Uso contesto",
+    "da": "Kontekstforbrug", "pl": "Użycie kontekstu", "ru": "Использование контекста",
+    "ar": "استخدام السياق", "no": "Kontekstbruk", "pt-BR": "Uso de contexto",
+    "th": "การใช้บริบท", "tr": "Bağlam kullanımı", "uk": "Використання контексту"
+  },
+  "ui.slashCommand.effort": {
+    "zh": "思考强度", "en": "Thinking effort", "zh-TW": "思考強度",
+    "ko": "사고 강도", "ja": "思考強度", "de": "Denkintensität",
+    "es": "Esfuerzo de razonamiento", "fr": "Effort de réflexion", "it": "Intensità ragionamento",
+    "da": "Tankeindsats", "pl": "Wysiłek rozumowania", "ru": "Уровень мышления",
+    "ar": "مستوى التفكير", "no": "Tenkeintensitet", "pt-BR": "Esforço de raciocínio",
+    "th": "ระดับการคิด", "tr": "Düşünme yoğunluğu", "uk": "Зусилля мислення"
+  },
+  "ui.slashCommand.hooks": {
+    "zh": "Hook 管理", "en": "Manage hooks", "zh-TW": "Hook 管理",
+    "ko": "Hook 관리", "ja": "Hook 管理", "de": "Hooks verwalten",
+    "es": "Gestionar hooks", "fr": "Gérer les hooks", "it": "Gestisci hooks",
+    "da": "Administrer hooks", "pl": "Zarządzaj hookami", "ru": "Управление хуками",
+    "ar": "إدارة الـ Hooks", "no": "Administrer hooks", "pt-BR": "Gerenciar hooks",
+    "th": "จัดการ hooks", "tr": "Hook'ları yönet", "uk": "Керування Hooks"
+  },
+  "ui.slashCommand.plugins": {
+    "zh": "插件管理", "en": "Manage plugins", "zh-TW": "外掛管理",
+    "ko": "플러그인 관리", "ja": "プラグイン管理", "de": "Plugins verwalten",
+    "es": "Gestionar plugins", "fr": "Gérer les plugins", "it": "Gestisci plugin",
+    "da": "Administrer plugins", "pl": "Zarządzaj wtyczkami", "ru": "Управление плагинами",
+    "ar": "إدارة المكونات الإضافية", "no": "Administrer plugins", "pt-BR": "Gerenciar plugins",
+    "th": "จัดการปลั๊กอิน", "tr": "Eklentileri yönet", "uk": "Керування плагінами"
   }
 };
 
