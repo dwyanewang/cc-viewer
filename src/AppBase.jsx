@@ -8,15 +8,16 @@ import LogTable from './components/LogTable';
 import { t, getLang, setLang } from './i18n';
 import { SettingsContext } from './contexts/SettingsContext';
 import { formatTokenCount, filterRelevantRequests, isRelevantRequest, appendCacheLossMap, extractCachedContent } from './utils/helpers';
+import { getProjectAlias, subscribeToAlias } from './utils/projectAlias';
 import { isMainAgent, isPostClearCheckpoint } from './utils/contentFilter';
 import { apiUrl } from './utils/apiUrl';
-import { playEvent as playVoiceEvent, unlockAudio } from './utils/voicePackPlayer';
-import { DEFAULT_BINDINGS as VP_DEFAULT_BINDINGS } from '../lib/voice-pack-events';
-import { mergeVoicePackInto } from '../lib/approval-modal-prefs';
+import { playEvent as playVoiceEvent, unlockAudio, setTurnEndCooldownMs } from './utils/voicePackPlayer';
+import { getDefaultBindingsForLocale as vpDefaultBindingsForLocale } from '../server/lib/voice-pack-events';
+import { mergeVoicePackInto } from '../server/lib/approval-modal-prefs';
 import { saveEntries, loadEntries, clearEntries, getCacheMeta, saveSessionEntries, loadSessionEntries, saveSessionIndex } from './utils/entryCache';
 import { buildSessionIndex, splitHotCold, mergeSessionIndices, HOT_SESSION_COUNT, assignMessageTimestamps, applyInPlaceLastMsgReplace } from './utils/sessionManager';
 import { mergeMainAgentSessions as _mergeMainAgentSessions } from './utils/sessionMerge';
-import { reconstructEntries, createIncrementalReconstructor } from '../lib/delta-reconstructor.js';
+import { reconstructEntries, createIncrementalReconstructor } from '../server/lib/delta-reconstructor.js';
 import { createEntrySlimmer, createIncrementalSlimmer, restoreSlimmedEntry, internEntryBigFields } from './utils/entry-slim.js';
 import { reinitializeMermaid } from './hooks/useMermaidRender';
 import styles from './App.module.css';
@@ -91,6 +92,10 @@ class AppBase extends React.Component {
       lang: getLang(),
       userProfile: null,    // { name, avatar }
       projectName: '',      // 当前监控的项目名称
+      // claude 自己存的项目偏好 model（~/.claude.json projects[cwd].lastModelUsage 推断），
+      // 用作 AppHeader 血条 calibration 'auto' 启动期的回落 hint（避 haiku init ping 误判 200K）。
+      // 初值 null = 还没拿到；/api/claude-settings 与 workspace_started SSE 都会塞值。
+      claudeProjectModel: null,
       resumeModalVisible: false,
       resumeFileName: '',
       resumeRememberChoice: false,
@@ -146,7 +151,12 @@ class AppBase extends React.Component {
       // approvalPrefs: user toggles persisted to /api/preferences.
       // soundEnabled = 合并后的"审批提示音"主开关（默认 ON），voicePack.enabled 始终 == soundEnabled。
       // hydrate 时如检测到老版本独立两字段不一致，会强制对齐并一次性写回 server。
-      // events.turnEnd 仍默认 null（disabled，避免每轮都响） — DEFAULT_BINDINGS 是单一来源。
+      // events.turnEnd 仍默认 null（disabled，避免每轮都响）。
+      // Locale-aware initial seed: zh / zh-TW 新用户首次拿 sanguo，其它走 default (butler)。
+      // getLang() 在 i18n.js 模块加载时已调过 setLang(detectLanguage())（i18n.js:9465），
+      // AppBase constructor 进入这里时 currentLang 已就绪 — 单测见 voice-pack-events.test.js。
+      // 注意：这是 React state 初始 seed，不是 dynamic 重计算。运行时切语言不会重 seed
+      // binding（避免静默改变用户持久化选择 — "no silent migration" P0 规则）。
       approvalPrefs: {
         modalEnabled: true,
         soundEnabled: true,
@@ -154,7 +164,7 @@ class AppBase extends React.Component {
         voicePack: {
           enabled: true,
           volume: 0.3,
-          events: { ...VP_DEFAULT_BINDINGS },
+          events: { ...vpDefaultBindingsForLocale(getLang()) },
         },
       },
     };
@@ -186,6 +196,42 @@ class AppBase extends React.Component {
 
   /** 批量剪枝 entries：清空旧 MainAgent 的 body.messages，保留最后一条完整。
    *  v3: intern body.tools / body.system 让所有 entry 共享 pool 引用 */
+  // Centralised document.title writer. All paths that used to do
+  //   document.title = projectName
+  //   document.title = `${projectName} - CC Viewer`
+  // route through here so a user-configured per-project alias (utils/projectAlias)
+  // can override consistently. Without this, the SSE workspace_started handler
+  // would clobber alias on every switch.
+  // Empty / missing projectName falls back to the literal app name to keep the
+  // browser tab from showing a stale name across reloads.
+  _applyDocTitle = (projectName) => {
+    try {
+      if (typeof document === 'undefined') return;
+      const alias = getProjectAlias(projectName);
+      if (alias) {
+        document.title = alias;
+      } else if (projectName) {
+        document.title = projectName;
+      } else {
+        document.title = 'CC Viewer';
+      }
+    } catch { /* ignore — title is cosmetic, never block */ }
+  };
+
+  // Subscribe the current projectName to alias mutations (same-tab pubsub +
+  // cross-tab storage event). Re-called whenever projectName changes so we
+  // don't end up listening to an old project's key.
+  _resubscribeAlias = (projectName) => {
+    if (typeof this._aliasOff === 'function') {
+      try { this._aliasOff(); } catch {}
+      this._aliasOff = null;
+    }
+    if (!projectName) return;
+    this._aliasOff = subscribeToAlias(projectName, () => {
+      this._applyDocTitle(projectName);
+    });
+  };
+
   _batchSlim(entries) {
     for (let i = 0; i < entries.length; i++) entries[i] = internEntryBigFields(entries[i]);
     const slimmer = createEntrySlimmer(isMainAgent);
@@ -327,6 +373,9 @@ class AppBase extends React.Component {
       if (!data) return;
       if (data.showThinkingSummaries) this.setState({ showThinkingSummaries: true });
       if (data.claudeAvailable === false) this.setState({ claudeMissing: true });
+      if (typeof data.claudeProjectModel === 'string' && data.claudeProjectModel) {
+        this.setState({ claudeProjectModel: data.claudeProjectModel });
+      }
     });
 
     // ─── Approval modal: subscribe to electron main → tabBridge ──────────────────
@@ -487,7 +536,8 @@ class AppBase extends React.Component {
       .then(data => {
         const projectName = data.projectName || '';
         this.setState({ projectName });
-        if (projectName) document.title = projectName;
+        this._applyDocTitle(projectName);
+        this._resubscribeAlias(projectName);
         // 移动端：从缓存恢复数据，在 SSE 数据到达前立即渲染
         if (isMobile && projectName && !logfile && this.state.requests.length === 0) {
           loadEntries(projectName).then(cached => {
@@ -567,7 +617,7 @@ class AppBase extends React.Component {
     // Voice-pack turnEnd is now driven by the `turn_end` SSE event (broadcast when
     // Claude Code's Stop hook fires), not by isStreaming falling-edge. The streaming
     // signal resets per-API-call so it mis-fired between slow tool calls. See the
-    // SSE listener registered in componentDidMount and lib/turn-end-bridge.js.
+    // SSE listener registered in componentDidMount and server/lib/turn-end-bridge.js.
   }
 
   componentWillUnmount() {
@@ -589,6 +639,7 @@ class AppBase extends React.Component {
     if (this._streamingOffTimer) clearTimeout(this._streamingOffTimer);
     if (this._streamingRaf) { cancelAnimationFrame(this._streamingRaf); this._streamingRaf = null; }
     if (this._clearOptimisticTimer) clearTimeout(this._clearOptimisticTimer);
+    if (typeof this._aliasOff === 'function') { try { this._aliasOff(); } catch {} this._aliasOff = null; }
     this._pendingStreamingLatest = null;
   }
 
@@ -1018,7 +1069,14 @@ class AppBase extends React.Component {
             this._loadingCountTimer = null;
           }
           this._rebuildRequestIndex([]);
-          if (data.projectName) document.title = `${data.projectName} - CC Viewer`;
+          // SSE workspace switch — rebind alias subscription to the new
+          // project before writing the title so the title reflects the new
+          // alias if one exists. _applyDocTitle handles the "no alias"
+          // fallback (used to be `${projectName} - CC Viewer` here; that
+          // suffix is dropped — pure projectName for consistency with the
+          // initial mount path).
+          this._resubscribeAlias(data.projectName || '');
+          this._applyDocTitle(data.projectName || '');
           // Reset isStreaming alongside streamingLatest — workspace switches happen
           // between user prompts and shouldn't leave streaming flags stuck. (turnEnd
           // false-fire on this transition is no longer a concern since we hook
@@ -1033,6 +1091,9 @@ class AppBase extends React.Component {
             selectedIndex: null,
             streamingLatest: null,
             isStreaming: false,
+            // workspace 切换 = cwd 切换 → claude 的 lastModelUsage 也要重查；
+            // 后端在 workspace_started 一并塞了新 cwd 对应的 hint，没有就清空。
+            claudeProjectModel: (typeof data.claudeProjectModel === 'string' && data.claudeProjectModel) ? data.claudeProjectModel : null,
           });
           if (isMobile) clearEntries();
         } catch {}
@@ -1090,6 +1151,15 @@ class AppBase extends React.Component {
         } catch { }
       });
       this.eventSource.addEventListener('ping', () => { this._resetSSETimeout(); });
+      // server_config: server 启动时一次性推 turnEnd debounce ms（CCV_TURN_END_DEBOUNCE_MS
+      // 可能改过默认值），前端拿这个值同步 voicePackPlayer 的 turnEnd cooldown，避免硬常数漂移。
+      this.eventSource.addEventListener('server_config', (event) => {
+        this._resetSSETimeout();
+        try {
+          const cfg = JSON.parse(event?.data || '{}');
+          if (typeof cfg.turnEndDebounceMs === 'number') setTurnEndCooldownMs(cfg.turnEndDebounceMs);
+        } catch { /* tolerate parse error */ }
+      });
       // turn_end SSE — broadcast by /api/turn-end-notify whenever Claude Code's Stop hook
       // fires (real end of a user-prompt turn). This is the **authoritative** turnEnd
       // signal — far more accurate than isStreaming falling-edge, which resets per-API-call

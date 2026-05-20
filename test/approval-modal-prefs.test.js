@@ -1,5 +1,5 @@
 /**
- * Unit tests for lib/approval-modal-prefs.js — `mergeApprovalModalPrefs` +
+ * Unit tests for server/lib/approval-modal-prefs.js — `mergeApprovalModalPrefs` +
  * `mergeVoicePackInto`.
  *
  * Hot-path coverage: `/api/preferences` POST runs `mergeApprovalModalPrefs` on
@@ -10,8 +10,8 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mergeApprovalModalPrefs, mergeVoicePackInto } from '../lib/approval-modal-prefs.js';
-import { EVENT_KEYS } from '../lib/voice-pack-events.js';
+import { mergeApprovalModalPrefs, mergeVoicePackInto } from '../server/lib/approval-modal-prefs.js';
+import { EVENT_KEYS } from '../server/lib/voice-pack-events.js';
 
 describe('mergeVoicePackInto', () => {
   it('filters incoming events through EVENT_KEYS whitelist (defense-in-depth)', () => {
@@ -64,6 +64,18 @@ describe('mergeVoicePackInto', () => {
     mergeVoicePackInto(base, inc);
     assert.deepEqual(base, baseCopy);
     assert.deepEqual(inc, incCopy);
+  });
+
+  it("passes 'sanguo' bundled-pack value through verbatim (no value-domain filtering at merge)", () => {
+    // Merge layer is key-shape-only; value validation is reconcile's job.
+    // This test pins that contract so a future "let's add value whitelist
+    // here too" refactor either updates the test or recognises it duplicates
+    // reconcile work.
+    const base = { enabled: true, events: { askQuestion: 'default', planApproval: 'default', turnEnd: null } };
+    const r = mergeVoicePackInto(base, { events: { askQuestion: 'sanguo', planApproval: 'sanguo' } });
+    assert.equal(r.events.askQuestion, 'sanguo', 'sanguo must merge verbatim — reconcile validates downstream');
+    assert.equal(r.events.planApproval, 'sanguo');
+    assert.equal(r.events.turnEnd, null, 'unrelated keys preserved');
   });
 });
 

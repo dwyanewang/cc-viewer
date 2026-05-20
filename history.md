@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+## 1.6.273 (2026-05-20)
+
+- fix(ask-store): 跨进程锁 stale 检测加 PID 校验 —— lock body 写入 `{pid, ts}`，stale 判定优先 `process.kill(pid, 0)` 识别 owner 存活，body 不可读时退回原 mtime 5s 阈值兜底；解决 Electron 多 Tab + 持锁 fn 跑 >5s 场景的误偷锁
+- chore(robustness): `server/server.js` 信号 handler 加 `globalThis._ccvServerSignalsRegistered` 防御性单次注册守卫；`server/interceptor.js` 注释点明三个 handler 已被外层 `_ccViewerInterceptorInstalled` 覆盖
+- chore(docs): `server/lib/cli-inject.js` 头部集中文档化 EOL 策略（INJECT_BLOCK 内部 `\n` 故意不参数化，与 buildInjectBlockRegex 的 LEGACY 匹配解耦）；`CONTRIBUTING.md` 双语补 `server/_paths.js` 物理位置敏感警告
+- test: `cli-inject.test.js` 新增多次重复注入字节级稳定 / updated 路径再 inject = exists / inject→remove→inject round-trip 三个幂等回归用例；`ask-store.test.js` 新增 PID-based stale steal + mtime fallback 两个并发安全用例
+
+- feat(calibration): 血条 'auto' 模式启动期回落到 `~/.claude.json projects[cwd].lastModelUsage` 推断的偏好 model —— 解决 ccv 启动后 claude 先发 haiku init ping 让血条错显 200K 的回归；新增 `server/lib/context-watcher.js::readClaudeProjectModel(cwd, filePath?)` 纯函数（haiku 过滤 + [1m] 优先 + costUSD 排序）；`/api/claude-settings` + `workspace_started` SSE 同时携带 `claudeProjectModel`；`src/utils/helpers.js::resolveCalibrationTokens` 加第 3 参数 `projectModelHint`，auto 决策优先级 = 真实非 haiku mainAgent > projectModelHint > 1M 冷启动；AppBase 在 settings ready 和 workspace 切换时各 setState 一次同步给 AppHeader；helpers.test.js +6 case / context-watcher.test.js +9 case
+- chore(jsconfig): include 扩 `server/**`/`test/**`/`electron/**`/`scripts/**`/根 bin shim（cli.js/findcc.js/server.js/interceptor.js），消除 TS 找不到 declaration 的 ~30 条噪声
+
+- feat(ultraplan): modal 左上角自定义 drag handle —— 拖拽**整个 modal**（width/height 同时改），textarea 通过 `flex: 1 1 auto` 自然跟随；localStorage 跨会话记忆（`cc-viewer-ultraplan-modal-width/height`），clamp [400, 90vw] × [240, 90vh]；拖拽期 rAF 节流写 DOM style 0 setState、pointerup 才提交；AbortController 一刀清 pointermove/up/cancel listener + setPointerCapture 双保险；handle 视觉 14×14 品牌色 + 容器底色 1.5px 描边「凿空」+ hover scale 1.15（iPad `.pad-mode` 18×18 / hitbox 28×28）；gate `!isMobile || isPad` —— 真手机回原生 `resize: vertical`；几何计算抽 `src/utils/resizeCalc.js` 纯函数 + `test/resize-calc.test.js` 9 case；`ui.ultraplan.resizeHandle` aria-label 18 语
+
+- refactor: 服务端代码统一收纳到 `server/`（含 `lib/`），根目录留 `cli.js`（bin 入口）/ `findcc.js`（fork 适配点，含 INJECT_IMPORT / LEGACY_INJECT_IMPORTS / PACKAGES 等核心配置）+ `server.js` / `interceptor.js` 一行 re-export shim
+- fix(cli): 修复 `cli.js` 13 处 dynamic `import()` 指向 stale 根路径导致 `ccv` / `ccv run` / `ccv -SDK` / workspace 选择器全部 `ERR_MODULE_NOT_FOUND`
+- fix(inject): `INJECT_IMPORT` 改走 bare specifier `import 'cc-viewer/interceptor.js'`（经 package.json exports 解析），与物理路径解耦；新增 `LEGACY_INJECT_IMPORTS` + `injectCliJs` 老 marker 升级路径，老用户升级不需手动 `ccv uninstall`
+- fix(hooks): `ensureHooks()` 增加 stale-path 主动 purge —— 升级后老用户 `~/.claude/settings.json` 含 `cc-viewer/lib/<bridge>.js`（缺 `server/`）的 cc-viewer-managed 条目会被直接清除并重建，不再依赖字段级 merge
+- fix(pty): `node-pty` spawn-helper chmod 改走 `createRequire().resolve()`，解决 pnpm/yarn workspace hoist 布局下静默 ENOENT；catch 改为 `console.warn` 不再吞错
+- chore: 抽 `server/_paths.js` 集中 9 个路径常量（`SERVER_DIR / PACKAGE_ROOT / NODE_MODULES / SERVER_LIB / DIST_DIR / PUBLIC_DIR / CONCEPTS_DIR / PLUGINS_DIR / PACKAGE_JSON`）；首批迁 `server.js` / `updater.js` / `voice-pack-manager.js` / `ensure-hooks.js` / `plugin-loader.js`；`findcc.js` 自算 NODE_MODULES 消反向依赖
+- chore: `mkdir plugins/` 保留 plugin-loader 扩展位；`test:coverage` glob 升级 `server/**/*.js`；`package.json` `exports` 删重复 `"./server.js"` 键
+- test: 新增 `test/cli-import-paths.test.js` 拦截 cli.js / electron 入口的 dynamic import 路径解析回归；`test/ensure-hooks.test.js` 新增 stale-path purge 覆盖
+- fix(uninstall): `ccv --uninstall` 增加 `~/.claude/settings.json` 中 cc-viewer-managed hooks 清理（按 `# cc-viewer-managed` marker 整条删除，Pre/Stop 双 section）—— 此前 `npm uninstall -g cc-viewer` 后 hook 残留导致 claude 每次启动 ENOENT
+- fix(hooks): `_purgeStaleManagedHooks` 改 existsSync 通用化（marker + 路径不存在 = stale），不再硬编码 bridge 名 regex；未来 server 重组无需再更新清理逻辑
+- fix(hooks): `ensure-hooks.js` 改用 `renameSyncWithRetry`，Windows 上 EBUSY 不再静默丢更新
+- chore: 抽 `server/lib/cli-inject.js` 容纳 cli.js 注入/卸载纯函数（便于单元测试）；新增 `test/cli-inject.test.js` 端到端覆盖 injected/exists/updated 三返回值 + CRLF 保留 + LEGACY 升级路径
+- test: 新增 `test/root-shim.test.js`（静态分析根 shim re-export 完整性） + `test/client-safe-imports.test.js`（src→server/** 跨层 import 白名单 + 4 个 CLIENT-SAFE 模块零 node deps）
+- test: `cli-import-paths.test.js` 扩 `pathToFileURL(join(rootDir, ...))` 形式 + 新增 LEGACY_INJECT_IMPORTS 每条都解析到真实文件的覆盖
+- chore: 删 `server.js` / `voice-pack-manager.js` / `plugin-loader.js` 残留 dead `__dirname`；`server.js` shim 加注释；`_paths.js` 加 ⚠ 物理位置警告 + 每常量 JSDoc；`LEGACY_INJECT_IMPORTS` 加 prune 策略注释
+- chore: `CLAUDE.md` rule 5 精修措辞；`CONTRIBUTING.md` 双语补 `findcc.js` 为核心文件
+
+## 1.6.272 (2026-05-18)
+
+- feat(header): per-project 别名支持 — 「当前项目」标题 hover 时浮出铅笔图标,弹 Modal 设置别名,浏览器 `<title>` 用别名、UI 头部追加 `(别名)`;存 localStorage(key 含 projectName basename,同名不同路径项目会共享别名);跨/同 tab 自动同步;键盘 Tab 可达;BiDi/控制字符 strip 防 paste 攻击;Electron 多 tab strip 与主窗口 setTitle 暂不在覆盖范围
+- chore(header): 浏览器 tab 标题去掉 ` - CC Viewer` 后缀,workspace 切换后只显示 projectName 或 alias(原 SSE workspace_started 写的是 `${projectName} - CC Viewer`)
+
+## 1.6.271 (2026-05-18)
+
+- feat(voice-pack): 新增 sanguo（三国）内置语音包，与 default（butler）并列；zh / zh-TW 新用户首次默认 sanguo，其它 locale 仍 default；Settings 可自由切换；老用户 binding='default' 语义不变
+- feat(voice-pack): default 内置音从 sine-wave 占位 WAV 替换为 butler 真人 MP3（"The plan awaits your approval, sir." 等）；老用户 binding='default' 的事件提示音内容会变
+- chore(voice-pack): 降级到 < 本版本前请先在 Settings 把 binding='sanguo' 改回 default 或 disabled，否则老 server 的 reconcile 白名单会清空该绑定
+- fix(turn-end): Stop hook 不再被 streaming race-guard 吞掉；server 加 10s trailing debounce（`CCV_TURN_END_DEBOUNCE_MS` 可覆盖，clamp [100,60000]），rising-edge cancel 兜底
+- fix(turn-end): 三处 PTY 自重试补传 `CCVIEWER_INTERNAL_TOKEN`，turn-end POST 不再 403
+- fix(voice-pack): 前端 turnEnd cooldown 30s → 10s，通过 SSE `server_config` 自动同步 server 端实际 debounce；i18n 18 语言 hint 同步改 10s；`setTurnEndCooldownMs` 同步 clamp [100,60000]
+- fix(server): `/api/turn-end-notify` malformed JSON 改 400；`startViewer` 入口 await in-flight `_stoppingPromise`；`server_config` SSE write 失败改 warn 不再静默
+- perf(sdk): `setSdkStreamingState` 增加 transition gate，非 edge 且非 active 时不再推 SSE
+- fix(sdk): cli.js onTurnEnd 显式 `typeof` 检查，export 缺失时打 warn 不再被可选链静默吞
+
 ## 1.6.270 (2026-05-16)
 
 - fix(voice-pack): turnEnd 剔除「仅窗口失焦时响」门控，任务结束就响（保留 30s 节流 + dedupeKey）；17 语言 hint 文案同步精简
