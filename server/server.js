@@ -298,7 +298,29 @@ const MAX_PORT = parseInt(process.env.CCV_MAX_PORT) || 7099;
 const HOST = '0.0.0.0';
 
 // 局域网访问 token（本地 127.0.0.1 免验证）
-const ACCESS_TOKEN = randomBytes(16).toString('hex');
+const TOKEN_PATH = join(getClaudeConfigDir(), 'cc-viewer', 'access-token.json');
+
+function _ensureTokenDir() {
+  const dir = dirname(TOKEN_PATH);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+}
+
+function _loadOrCreateToken() {
+  _ensureTokenDir();
+  if (existsSync(TOKEN_PATH)) {
+    try {
+      const data = JSON.parse(readFileSync(TOKEN_PATH, 'utf-8'));
+      if (data.token && /^[0-9a-f]{32}$/i.test(data.token)) return { token: data.token, persistent: true };
+    } catch { /* fallback to generate */ }
+  }
+  const token = randomBytes(16).toString('hex');
+  writeFileSync(TOKEN_PATH, JSON.stringify({ token, createdAt: Date.now() }, null, 2), { mode: 0o600 });
+  return { token, persistent: false };
+}
+
+const _tokenInit = _loadOrCreateToken();
+let ACCESS_TOKEN = _tokenInit.token;
+const IS_TOKEN_PERSISTENT = _tokenInit.persistent;
 // Internal token used ONLY for bridge → server calls (env-leaked to the spawned
 // claude process via pty-manager). Separate from ACCESS_TOKEN so the LAN URL
 // token can't double as a bridge auth bypass for same-host CSRF (round-3 P1).
@@ -423,11 +445,17 @@ async function handleRequest(req, res) {
   // 要求用户每次手动设 CCV_ALLOWED_HOSTS 不可接受。token 仍是必需(server.js:300-310 ACCESS_TOKEN gate),
   // DNS rebinding 攻击者需精确知道用户 LAN IP 才能利用,门槛降低但不增新攻击面;Vite/Cursor 同行也默认放开 LAN。
   // CCV_ALLOWED_HOSTS 显式设(包括 '*' 关闭防护)时完全沿用用户值,与 1.6.227 行为一致,向后兼容。
+  // CCV_EXTRA_ALLOWED_HOSTS 用于在默认/CCV_ALLOWED_HOSTS 基础上追加额外 host(如内网穿透外网地址),不影响原有列表。
   // 静态资源和 OPTIONS 预检不挡。
   if (!isStaticAsset && method !== 'OPTIONS') {
+    const defaultHosts = ['localhost', '127.0.0.1', '::1', '[::1]', ...getAllLocalIps()];
     const allowedHosts = process.env.CCV_ALLOWED_HOSTS
       ? process.env.CCV_ALLOWED_HOSTS.split(',').map(s => s.trim()).filter(Boolean)
-      : ['localhost', '127.0.0.1', '::1', '[::1]', ...getAllLocalIps()];
+      : [...defaultHosts];
+    if (process.env.CCV_EXTRA_ALLOWED_HOSTS && !allowedHosts.includes('*')) {
+      const extras = process.env.CCV_EXTRA_ALLOWED_HOSTS.split(',').map(s => s.trim()).filter(Boolean);
+      allowedHosts.push(...extras);
+    }
     if (!allowedHosts.includes('*')) {
       const hostHeader = (req.headers.host || '').toLowerCase();
       // 端口剥离:RFC 3986 要求 IPv6 Host 必须带 brackets `[::1]:port`,bare `::1` 末尾 `\d` 会被错剥成 `:`。
