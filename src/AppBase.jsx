@@ -1,10 +1,11 @@
 import React from 'react';
 import { ConfigProvider, theme, Modal, Spin, Button, message } from 'antd';
+import { uploadFileAndGetPath } from './components/terminal/TerminalPanel';
 import { DeleteOutlined, ReloadOutlined } from '@ant-design/icons';
 import { isMobile, isPad } from './env';
-import WorkspaceList from './components/WorkspaceList';
-import OpenFolderIcon from './components/OpenFolderIcon';
-import LogTable from './components/LogTable';
+import WorkspaceList from './components/dashboard/WorkspaceList';
+import OpenFolderIcon from './components/common/OpenFolderIcon';
+import LogTable from './components/viewers/LogTable';
 import { t, getLang, setLang } from './i18n';
 import { SettingsContext } from './contexts/SettingsContext';
 import { formatTokenCount, filterRelevantRequests, isRelevantRequest, appendCacheLossMap, extractCachedContent } from './utils/helpers';
@@ -14,7 +15,7 @@ import { apiUrl } from './utils/apiUrl';
 import { playEvent as playVoiceEvent, unlockAudio, setTurnEndCooldownMs } from './utils/voicePackPlayer';
 import { getDefaultBindingsForLocale as vpDefaultBindingsForLocale } from '../server/lib/voice-pack-events';
 import { mergeVoicePackInto } from '../server/lib/approval-modal-prefs';
-import { saveEntries, loadEntries, clearEntries, getCacheMeta, saveSessionEntries, loadSessionEntries, saveSessionIndex } from './utils/entryCache';
+import { saveEntries, loadEntries, clearEntries, getCacheMeta, saveSessionEntries, loadSessionEntries } from './utils/entryCache';
 import { buildSessionIndex, splitHotCold, mergeSessionIndices, HOT_SESSION_COUNT, assignMessageTimestamps, applyInPlaceLastMsgReplace } from './utils/sessionManager';
 import { mergeMainAgentSessions as _mergeMainAgentSessions } from './utils/sessionMerge';
 import { reconstructEntries, createIncrementalReconstructor } from '../server/lib/delta-reconstructor.js';
@@ -101,12 +102,7 @@ class AppBase extends React.Component {
       resumeRememberChoice: false,
       resumeAutoChoice: null, // null | "continue" | "new"
       autoApproveSeconds: 0, // 自动审批倒计时秒数，0=关闭
-      collapseToolResults: true,
-      expandThinking: false,
-      expandDiff: false,
       logDir: '',
-      showFullToolContent: false,
-      showThinkingSummaries: false,
       themeColor: 'light',
       claudeMissing: false,
       updateModalVisible: false,
@@ -269,6 +265,21 @@ class AppBase extends React.Component {
     };
   }
 
+  // 这 5 个偏好的唯一真相源是 SettingsContext(preferences/claudeSettings);
+  // App/Mobile render 时直接派生往下传 prop,不再镜像进本地 state。
+  // context 未就绪(fetch 前)时用与原初始 state 一致的默认值兜底。
+  _prefValues() {
+    const prefs = (this.context && this.context.preferences) || {};
+    const cs = (this.context && this.context.claudeSettings) || {};
+    return {
+      collapseToolResults: prefs.collapseToolResults ?? true,
+      expandThinking: !!prefs.expandThinking,
+      expandDiff: !!prefs.expandDiff,
+      showFullToolContent: !!prefs.showFullToolContent,
+      showThinkingSummaries: !!cs.showThinkingSummaries,
+    };
+  }
+
   /**
    * 单次遍历完成 timestamp 赋值 + session 构建 + 过滤 + index 重建。
    * 合并 assignMessageTimestamps + buildSessionsFromEntries + filterRelevantRequests + _rebuildRequestIndex，
@@ -371,7 +382,8 @@ class AppBase extends React.Component {
     // 这里仅订阅其 Promise,把字段同步到本地 state(沿用现有 13+ 个 setState 消费链路)。
     this.context._claudeSettingsReady.then(data => {
       if (!data) return;
-      if (data.showThinkingSummaries) this.setState({ showThinkingSummaries: true });
+      // showThinkingSummaries 不再镜像进 state —— render 经 _prefValues() 直接读
+      // context.claudeSettings,fetch 回包触发 Provider 重渲染即生效。勿在此重加 setState。
       if (data.claudeAvailable === false) this.setState({ claudeMissing: true });
       if (typeof data.claudeProjectModel === 'string' && data.claudeProjectModel) {
         this.setState({ claudeProjectModel: data.claudeProjectModel });
@@ -413,18 +425,8 @@ class AppBase extends React.Component {
     this.context._prefsReady.then(data => {
       if (!data) return;
       if (data.lang) this.setState({ lang: data.lang });
-      if (data.collapseToolResults !== undefined) {
-        this.setState({ collapseToolResults: !!data.collapseToolResults });
-      }
-      if (data.expandThinking !== undefined) {
-        this.setState({ expandThinking: !!data.expandThinking });
-      }
-      if (data.expandDiff !== undefined) {
-        this.setState({ expandDiff: !!data.expandDiff });
-      }
-      if (data.showFullToolContent !== undefined) {
-        this.setState({ showFullToolContent: !!data.showFullToolContent });
-      }
+      // collapseToolResults / expandThinking / expandDiff / showFullToolContent
+      // 不再镜像进 state —— render 经 _prefValues() 直接读 context.preferences。
       if (data.resumeAutoChoice) {
         this.setState({ resumeAutoChoice: data.resumeAutoChoice });
       }
@@ -606,20 +608,6 @@ class AppBase extends React.Component {
     }
   }
 
-  componentDidUpdate(prevProps, prevState) {
-    // context.claudeSettings 后续变化(如 ChatMessage 触发的 showThinkingSummaries 启用)
-    // 同步到本地 state,让 props.showThinkingSummaries 下游消费方立即响应。
-    // contextType 不提供 prevContext,只能比对 context value 与本地 state。
-    const cs = this.context && this.context.claudeSettings;
-    if (cs && !!cs.showThinkingSummaries !== !!this.state.showThinkingSummaries) {
-      this.setState({ showThinkingSummaries: !!cs.showThinkingSummaries });
-    }
-    // Voice-pack turnEnd is now driven by the `turn_end` SSE event (broadcast when
-    // Claude Code's Stop hook fires), not by isStreaming falling-edge. The streaming
-    // signal resets per-API-call so it mis-fired between slow tool calls. See the
-    // SSE listener registered in componentDidMount and server/lib/turn-end-bridge.js.
-  }
-
   componentWillUnmount() {
     if (Array.isArray(this._tabBridgeDisposers)) {
       for (const off of this._tabBridgeDisposers) {
@@ -763,7 +751,6 @@ class AppBase extends React.Component {
             for (const [sid, coldEntries] of coldGroups) {
               saveSessionEntries(pn, sid, coldEntries);
             }
-            saveSessionIndex(pn, fullIndex);
             saveEntries(pn, merged);
           }
           this.setState({
@@ -983,7 +970,6 @@ class AppBase extends React.Component {
               for (const [sid, coldEntries] of coldGroups) {
                 saveSessionEntries(pn, sid, coldEntries);
               }
-              saveSessionIndex(pn, fullIndex);
               // 主缓存保存全量 entries（而非 hotEntries），确保下次缓存恢复时有完整数据
               saveEntries(pn, entries);
             }
@@ -1514,7 +1500,6 @@ class AppBase extends React.Component {
           for (const [sid, coldEntries] of coldGroups) {
             saveSessionEntries(pn, sid, coldEntries);
           }
-          saveSessionIndex(pn, fullIndex);
           saveEntries(pn, merged);
         }
 
@@ -1548,7 +1533,6 @@ class AppBase extends React.Component {
       for (const [sid, coldEntries] of coldGroups) {
         saveSessionEntries(projectName, sid, coldEntries);
       }
-      saveSessionIndex(projectName, fullIndex);
       // 不调 saveEntries：state.requests 可能已是 hotEntries，写入会覆盖全量缓存。
       // 冷数据已通过 saveSessionEntries 持久化，全量缓存由 load_end 维护。
     }
@@ -1656,18 +1640,12 @@ class AppBase extends React.Component {
   };
 
   handleCollapseToolResultsChange = (checked) => {
-    this.setState({ collapseToolResults: checked });
+    // 单一真相源 = context;updatePreferences 内乐观 setState 即驱动重渲染。
     this.context.updatePreferences({ collapseToolResults: checked });
   };
 
   handleExpandThinkingChange = (checked) => {
-    this.setState({ expandThinking: checked });
     this.context.updatePreferences({ expandThinking: checked });
-  };
-
-  handleExpandDiffChange = (checked) => {
-    this.setState({ expandDiff: checked });
-    this.context.updatePreferences({ expandDiff: checked });
   };
 
   handleAutoApproveChange = (seconds) => {
@@ -1818,7 +1796,6 @@ class AppBase extends React.Component {
   };
 
   handleShowFullToolContentChange = (checked) => {
-    this.setState({ showFullToolContent: checked });
     this.context.updatePreferences({ showFullToolContent: checked });
   };
 
@@ -2091,6 +2068,62 @@ class AppBase extends React.Component {
         fileLoadingCount: 0,
       });
     });
+  };
+
+  // ─── 拖拽上传（App / Mobile 共享）─────────────────────────
+  // 文件拖入窗口 → 上传 → 落入 pendingUploadPaths。子类用 _captureDropContext()/
+  // _dispatchUploadedFiles() 两个 prototype 钩子定制分发（Mobile 按终端可见性分流）。
+  _isInternalDrag = (e) => e.dataTransfer.types.includes('text/x-preset-reorder');
+
+  _onDragOver = (e) => {
+    e.preventDefault();
+    if (this._isInternalDrag(e)) return;
+    // FileExplorer 区域不显示全屏 overlay，由 FileExplorer 自己处理外部拖入反馈
+    const overFileExplorer = e.target.closest && e.target.closest('[data-file-explorer]');
+    if (overFileExplorer) {
+      if (this.state.isDragging) this.setState({ isDragging: false });
+      return;
+    }
+    if (!this.state.isDragging) this.setState({ isDragging: true });
+  };
+
+  _onDragLeave = (e) => {
+    const layout = this._layoutRef.current;
+    if (layout && !layout.contains(e.relatedTarget)) {
+      this.setState({ isDragging: false });
+    }
+  };
+
+  _onDrop = (e) => {
+    e.preventDefault();
+    if (this._isInternalDrag(e)) return;
+    this.setState({ isDragging: false });
+    const files = Array.from(e.dataTransfer.files);
+    if (!files.length) return;
+    // drop 时刻同步捕获分发上下文（Mobile 需要 mobileTerminalVisible 的当时值，非上传完成后的值）
+    const ctx = this._captureDropContext();
+    Promise.all(
+      files.map(file =>
+        uploadFileAndGetPath(file).then(path => ({ name: file.name, path }))
+          .catch(err => { message.error(`${file.name}: ${err.message}`); return null; })
+      )
+    ).then(results => this._dispatchUploadedFiles(results, ctx));
+  };
+
+  // 子类可 override（prototype 方法）。默认＝桌面行为：全落入 pendingUploadPaths。
+  _captureDropContext() { return undefined; }
+
+  _dispatchUploadedFiles(results) {
+    const paths = results.filter(Boolean).map(r => `"${r.path}"`);
+    if (paths.length > 0) {
+      this.setState(prev => ({
+        pendingUploadPaths: [...(prev.pendingUploadPaths || []), ...paths],
+      }));
+    }
+  }
+
+  handleUploadPathsConsumed = () => {
+    this.setState({ pendingUploadPaths: [] });
   };
 
   // ─── 共享渲染辅助 ─────────────────────────────────────

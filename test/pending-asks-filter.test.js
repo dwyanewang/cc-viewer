@@ -39,7 +39,8 @@ describe('/api/pending-asks 端点 filter 不变量', () => {
   after(() => { try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {} });
 
   describe('源码层 invariant（防回滚）', () => {
-    const src = readFileSync(resolve(repoRoot, 'server/server.js'), 'utf-8');
+    // /api/pending-asks handler 已迁出到 server/routes/ask-perm.js
+    const src = readFileSync(resolve(repoRoot, 'server/routes/ask-perm.js'), 'utf-8');
 
     it('server.js 必须有 /api/pending-asks GET handler', () => {
       assert.match(src, /\/api\/pending-asks/, 'GET /api/pending-asks 端点必须存在');

@@ -5,22 +5,22 @@ import AppBase, { styles, OPTIMISTIC_CLEAR_PERCENT } from './AppBase';
 import { isIOS, isPad, setViewMode } from './env';
 import { isMainAgent, isSystemText, classifyUserContent } from './utils/contentFilter';
 import { getModelMaxTokens, getEffectiveModel, AUTO_COMPACT_USABLE_RATIO } from './utils/helpers';
-import ChatView from './components/ChatView';
-import TerminalPanel, { uploadFileAndGetPath } from './components/TerminalPanel';
-import { TerminalWsProvider } from './components/TerminalWsContext';
-import ToolApprovalPanel from './components/ToolApprovalPanel';
-import ApprovalModal from './components/ApprovalModal';
-import MobileGitDiff from './components/MobileGitDiff';
-import MobileFileExplorer from './components/MobileFileExplorer';
-import MobileStats from './components/MobileStats';
-import VoicePackSettings from './components/VoicePackSettings';
-import CachePopoverContent from './components/CachePopoverContent';
-import MemoryDetailModal from './components/MemoryDetailModal';
-import SkillsManagerModal from './components/SkillsManagerModal';
-import PluginModal from './components/PluginModal';
-import ProcessModal from './components/ProcessModal';
-import ProxyModal from './components/ProxyModal';
-import OpenFolderIcon from './components/OpenFolderIcon';
+import ChatView from './components/chat/ChatView';
+import TerminalPanel from './components/terminal/TerminalPanel';
+import { TerminalWsProvider } from './components/terminal/TerminalWsContext';
+import ToolApprovalPanel from './components/approval/ToolApprovalPanel';
+import ApprovalModal from './components/approval/ApprovalModal';
+import MobileGitDiff from './components/mobile/MobileGitDiff';
+import MobileFileExplorer from './components/mobile/MobileFileExplorer';
+import MobileStats from './components/mobile/MobileStats';
+import VoicePackSettings from './components/settings/VoicePackSettings';
+import CachePopoverContent from './components/dashboard/CachePopoverContent';
+import MemoryDetailModal from './components/common/MemoryDetailModal';
+import SkillsManagerModal from './components/settings/SkillsManagerModal';
+import PluginModal from './components/settings/PluginModal';
+import ProcessModal from './components/settings/ProcessModal';
+import ProxyModal from './components/settings/ProxyModal';
+import OpenFolderIcon from './components/common/OpenFolderIcon';
 import appConfig from './config.json';
 import { t, getLang, setLang, LANG_OPTIONS } from './i18n';
 import { useProjectAlias } from './hooks/useProjectAlias';
@@ -536,57 +536,24 @@ class Mobile extends AppBase {
     this.context.updatePreferences({ autoApproveSeconds: seconds });
   };
 
-  // ─── 拖拽上传（iPad / Mobile） ────────────────────────────
-  _isInternalDrag = (e) => e.dataTransfer.types.includes('text/x-preset-reorder');
+  // 拖拽上传逻辑已上提到 AppBase；Mobile 仅 override 两个分发钩子：终端可见时落入
+  // terminalPendingImages（图片队列），否则落入 pendingUploadPaths。toTerminal 在 drop
+  // 时刻捕获（经基类 _onDrop 的 _captureDropContext），保证上传期间切换终端不改变目标。
+  _captureDropContext() { return { toTerminal: this.state.mobileTerminalVisible }; }
 
-  _onDragOver = (e) => {
-    e.preventDefault();
-    if (this._isInternalDrag(e)) return;
-    const overFileExplorer = e.target.closest && e.target.closest('[data-file-explorer]');
-    if (overFileExplorer) {
-      if (this.state.isDragging) this.setState({ isDragging: false });
-      return;
+  _dispatchUploadedFiles(results, ctx) {
+    const uploaded = results.filter(Boolean);
+    if (!uploaded.length) return;
+    if (ctx?.toTerminal) {
+      this.setState(prev => ({
+        terminalPendingImages: [...prev.terminalPendingImages, ...uploaded.map(r => ({ path: r.path, source: 'drop' }))],
+      }));
+    } else {
+      this.setState(prev => ({
+        pendingUploadPaths: [...(prev.pendingUploadPaths || []), ...uploaded.map(r => `"${r.path}"`)],
+      }));
     }
-    if (!this.state.isDragging) this.setState({ isDragging: true });
-  };
-
-  _onDragLeave = (e) => {
-    const layout = this._layoutRef.current;
-    if (layout && !layout.contains(e.relatedTarget)) {
-      this.setState({ isDragging: false });
-    }
-  };
-
-  _onDrop = (e) => {
-    e.preventDefault();
-    if (this._isInternalDrag(e)) return;
-    this.setState({ isDragging: false });
-    const files = Array.from(e.dataTransfer.files);
-    if (!files.length) return;
-    const toTerminal = this.state.mobileTerminalVisible;
-    Promise.all(
-      files.map(file =>
-        uploadFileAndGetPath(file).then(path => ({ name: file.name, path }))
-          .catch(err => { message.error(`${file.name}: ${err.message}`); return null; })
-      )
-    ).then(results => {
-      const uploaded = results.filter(Boolean);
-      if (!uploaded.length) return;
-      if (toTerminal) {
-        this.setState(prev => ({
-          terminalPendingImages: [...prev.terminalPendingImages, ...uploaded.map(r => ({ path: r.path, source: 'drop' }))],
-        }));
-      } else {
-        this.setState(prev => ({
-          pendingUploadPaths: [...(prev.pendingUploadPaths || []), ...uploaded.map(r => `"${r.path}"`)],
-        }));
-      }
-    });
-  };
-
-  handleUploadPathsConsumed = () => {
-    this.setState({ pendingUploadPaths: [] });
-  };
+  }
 
   _handleTerminalFilePath = (path) => {
     this.setState(prev => ({
@@ -606,6 +573,7 @@ class Mobile extends AppBase {
 
   render() {
     const { filteredRequests, fileLoading, fileLoadingCount, mainAgentSessions } = this.renderPrepare();
+    const prefs = this._prefValues();
 
     // 工作区选择器模式
     if (this.state.workspaceMode) {
@@ -912,10 +880,10 @@ class Mobile extends AppBase {
                     mainAgentSessions={mainAgentSessions}
                     streamingLatest={this.state.streamingLatest}
                     userProfile={this.state.userProfile}
-                    collapseToolResults={this.state.collapseToolResults}
-                    expandThinking={this.state.expandThinking}
-                    showFullToolContent={this.state.showFullToolContent}
-                    showThinkingSummaries={this.state.showThinkingSummaries}
+                    collapseToolResults={prefs.collapseToolResults}
+                    expandThinking={prefs.expandThinking}
+                    showFullToolContent={prefs.showFullToolContent}
+                    showThinkingSummaries={prefs.showThinkingSummaries}
                     onViewRequest={null}
                     scrollToTimestamp={null}
                     onScrollTsDone={() => {}}
@@ -1199,22 +1167,22 @@ class Mobile extends AppBase {
                 <div className={styles.mobileSettingsRow}>
                   <span className={styles.mobileSettingsLabel}>{t('ui.expandThinking')}</span>
                   <Switch
-                    checked={!!this.state.expandThinking}
+                    checked={prefs.expandThinking}
                     onChange={this.handleExpandThinkingChange}
                   />
                 </div>
                 <div className={styles.mobileSettingsRow}>
                   <span className={styles.mobileSettingsLabel}>{t('ui.showFullToolContent')}</span>
                   <Switch
-                    checked={!!this.state.showFullToolContent}
+                    checked={prefs.showFullToolContent}
                     onChange={this.handleShowFullToolContentChange}
                   />
                 </div>
-                {this.state.showFullToolContent && (
+                {prefs.showFullToolContent && (
                   <div className={styles.mobileSettingsRow}>
                     <span className={styles.mobileSettingsLabel}>{t('ui.collapseToolResults')}</span>
                     <Switch
-                      checked={!!this.state.collapseToolResults}
+                      checked={prefs.collapseToolResults}
                       onChange={this.handleCollapseToolResultsChange}
                     />
                   </div>

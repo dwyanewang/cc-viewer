@@ -3,16 +3,15 @@ import { ConfigProvider, Layout, theme, Modal, Button, Checkbox, Spin, Alert, me
 import { UploadOutlined, DeleteOutlined, ReloadOutlined, FileZipOutlined } from '@ant-design/icons';
 import AppBase, { styles } from './AppBase';
 import { isMobile, isElectron, setViewMode } from './env';
-import { uploadFileAndGetPath } from './components/TerminalPanel';
-import AppHeader from './components/AppHeader';
-import RequestList from './components/RequestList';
-import DetailPanel from './components/DetailPanel';
-import ChatView from './components/ChatView';
-import ApprovalModal from './components/ApprovalModal';
-import { TerminalWsProvider } from './components/TerminalWsContext';
-import PanelResizer from './components/PanelResizer';
-import OpenFolderIcon from './components/OpenFolderIcon';
-import CountryFlag from './components/CountryFlag';
+import AppHeader from './components/dashboard/AppHeader';
+import RequestList from './components/dashboard/RequestList';
+import DetailPanel from './components/dashboard/DetailPanel';
+import ChatView from './components/chat/ChatView';
+import ApprovalModal from './components/approval/ApprovalModal';
+import { TerminalWsProvider } from './components/terminal/TerminalWsContext';
+import PanelResizer from './components/common/PanelResizer';
+import OpenFolderIcon from './components/common/OpenFolderIcon';
+import CountryFlag from './components/common/CountryFlag';
 import { t } from './i18n';
 import { filterRelevantRequests, findPrevMainAgentTimestamp } from './utils/helpers';
 import { isMainAgent } from './utils/contentFilter';
@@ -222,88 +221,15 @@ class App extends AppBase {
     input.click();
   };
 
-  _processJsonlFiles = (files) => {
-    if (!files || files.length === 0) return;
-    const totalSize = files.reduce((s, f) => s + f.size, 0);
-    if (totalSize > 500 * 1024 * 1024) {
-      message.error(t('ui.fileTooLarge'));
-      return;
-    }
-    this.setState({ fileLoading: true, fileLoadingCount: 0 });
-    let readCount = 0;
-    const allEntries = [];
-    const fileNames = [];
-    files.forEach(file => {
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        try {
-          const content = ev.target.result;
-          const entries = content.split('\n---\n').filter(line => line.trim()).map(entry => {
-            try { return JSON.parse(entry); } catch { return null; }
-          }).filter(Boolean);
-          allEntries.push(...entries);
-          fileNames.push(file.name);
-        } catch {}
-        readCount++;
-        if (readCount === files.length) {
-          this._finishLocalLoad(allEntries, fileNames);
-        }
-      };
-      reader.readAsText(file);
-    });
-  };
-
-  _isInternalDrag = (e) => e.dataTransfer.types.includes('text/x-preset-reorder');
-
-  _onDragOver = (e) => {
-    e.preventDefault();
-    if (this._isInternalDrag(e)) return;
-    // FileExplorer 区域不显示全屏 overlay，由 FileExplorer 自己处理外部拖入反馈
-    const overFileExplorer = e.target.closest && e.target.closest('[data-file-explorer]');
-    if (overFileExplorer) {
-      if (this.state.isDragging) this.setState({ isDragging: false });
-      return;
-    }
-    if (!this.state.isDragging) this.setState({ isDragging: true });
-  };
-
-  _onDragLeave = (e) => {
-    const layout = this._layoutRef.current;
-    if (layout && !layout.contains(e.relatedTarget)) {
-      this.setState({ isDragging: false });
-    }
-  };
-
-  _onDrop = (e) => {
-    e.preventDefault();
-    if (this._isInternalDrag(e)) return;
-    this.setState({ isDragging: false });
-    const files = Array.from(e.dataTransfer.files);
-    if (!files.length) return;
-    Promise.all(
-      files.map(file =>
-        uploadFileAndGetPath(file).then(path => ({ name: file.name, path }))
-          .catch(err => { message.error(`${file.name}: ${err.message}`); return null; })
-      )
-    ).then(results => {
-      const paths = results.filter(Boolean).map(r => `"${r.path}"`);
-      if (paths.length > 0) {
-        this.setState(prev => ({
-          pendingUploadPaths: [...(prev.pendingUploadPaths || []), ...paths],
-        }));
-      }
-    });
-  };
-
-  handleUploadPathsConsumed = () => {
-    this.setState({ pendingUploadPaths: [] });
-  };
+  // 拖拽上传（_isInternalDrag/_onDragOver/_onDragLeave/_onDrop/handleUploadPathsConsumed）
+  // 与默认分发逻辑已上提到 AppBase；App 用基类默认行为（全落 pendingUploadPaths），无需 override。
 
   // ─── PC 渲染 ──────────────────────────────────────────
 
   render() {
     const { filteredRequests, selectedRequest, fileLoading, fileLoadingCount, mainAgentSessions, viewMode } = this.renderPrepare();
     const { selectedIndex, leftPanelWidth, currentTab } = this.state;
+    const prefs = this._prefValues();
 
     // 工作区选择器模式
     if (this.state.workspaceMode) {
@@ -357,14 +283,6 @@ class App extends AppBase {
               isLocalLog={!!this._isLocalLog}
               localLogFile={this._localLogFile}
               projectName={this.state.projectName}
-              collapseToolResults={this.state.collapseToolResults}
-              onCollapseToolResultsChange={this.handleCollapseToolResultsChange}
-              expandThinking={this.state.expandThinking}
-              onExpandThinkingChange={this.handleExpandThinkingChange}
-              showFullToolContent={this.state.showFullToolContent}
-              onShowFullToolContentChange={this.handleShowFullToolContentChange}
-              expandDiff={this.state.expandDiff}
-              onExpandDiffChange={this.handleExpandDiffChange}
               filterIrrelevant={!this.state.showAll}
               onFilterIrrelevantChange={this.handleFilterIrrelevantChange}
               logDir={this.state.logDir}
@@ -476,7 +394,7 @@ class App extends AppBase {
                     currentTab={currentTab}
                     onTabChange={this.handleTabChange}
                     onViewInChat={this.handleViewInChat}
-                    expandDiff={this.state.expandDiff}
+                    expandDiff={prefs.expandDiff}
                     pendingCacheHighlight={this.state.pendingCacheHighlight}
                     onCacheHighlightDone={this.handleCacheHighlightDone}
                   />
@@ -485,7 +403,7 @@ class App extends AppBase {
               )
             )}
             <div className={styles.chatViewWrapper} style={{ display: viewMode === 'chat' ? 'flex' : 'none' }}>
-              <ChatView {...this._settingsProps()} getTokenStatsContent={this._getTokenStatsContent} requests={filteredRequests} mainAgentSessions={mainAgentSessions} streamingLatest={this.state.streamingLatest} userProfile={this.state.userProfile} collapseToolResults={this.state.collapseToolResults} expandThinking={this.state.expandThinking} showFullToolContent={this.state.showFullToolContent} showThinkingSummaries={this.state.showThinkingSummaries} onViewRequest={this.handleViewRequest} scrollToTimestamp={this.state.chatScrollToTs} onScrollTsDone={this.handleScrollTsDone} cliMode={this._isLocalLog ? false : this.state.cliMode} sdkMode={this._isLocalLog ? false : this.state.sdkMode} terminalVisible={this._isLocalLog ? false : (this.state.sdkMode ? false : this.state.terminalVisible)} onToggleTerminal={() => this.setState(prev => ({ terminalVisible: !prev.terminalVisible }))} pendingUploadPaths={this.state.pendingUploadPaths} onUploadPathsConsumed={this.handleUploadPathsConsumed} fileLoading={this.state.fileLoading} isStreaming={this.state.isStreaming} hasMoreHistory={this.state.hasMoreHistory} loadingMore={this.state.loadingMore} onLoadMoreHistory={() => this.loadMoreHistory()} loadingSessionId={this.state.loadingSessionId} onLoadSession={(sid) => this.loadSession(sid)} lang={this.state.lang} autoApproveSeconds={this.state.autoApproveSeconds} onAutoApproveChange={this.handleAutoApproveChange} onClearContextOptimistic={this.handleClearContextOptimistic} onUserMessageSent={this.handleUserMessageSent} onPendingAsk={this.handleApprovalAsk} onPendingPtyPlan={this.handleApprovalPtyPlan} ownTabId={this.state.ownTabId} projectName={this.state.projectName} setContextBarSlot={this.setContextBarSlot} />
+              <ChatView {...this._settingsProps()} getTokenStatsContent={this._getTokenStatsContent} requests={filteredRequests} mainAgentSessions={mainAgentSessions} streamingLatest={this.state.streamingLatest} userProfile={this.state.userProfile} collapseToolResults={prefs.collapseToolResults} expandThinking={prefs.expandThinking} showFullToolContent={prefs.showFullToolContent} showThinkingSummaries={prefs.showThinkingSummaries} onViewRequest={this.handleViewRequest} scrollToTimestamp={this.state.chatScrollToTs} onScrollTsDone={this.handleScrollTsDone} cliMode={this._isLocalLog ? false : this.state.cliMode} sdkMode={this._isLocalLog ? false : this.state.sdkMode} terminalVisible={this._isLocalLog ? false : (this.state.sdkMode ? false : this.state.terminalVisible)} onToggleTerminal={() => this.setState(prev => ({ terminalVisible: !prev.terminalVisible }))} pendingUploadPaths={this.state.pendingUploadPaths} onUploadPathsConsumed={this.handleUploadPathsConsumed} fileLoading={this.state.fileLoading} isStreaming={this.state.isStreaming} hasMoreHistory={this.state.hasMoreHistory} loadingMore={this.state.loadingMore} onLoadMoreHistory={() => this.loadMoreHistory()} loadingSessionId={this.state.loadingSessionId} onLoadSession={(sid) => this.loadSession(sid)} lang={this.state.lang} autoApproveSeconds={this.state.autoApproveSeconds} onAutoApproveChange={this.handleAutoApproveChange} onClearContextOptimistic={this.handleClearContextOptimistic} onUserMessageSent={this.handleUserMessageSent} onPendingAsk={this.handleApprovalAsk} onPendingPtyPlan={this.handleApprovalPtyPlan} ownTabId={this.state.ownTabId} projectName={this.state.projectName} setContextBarSlot={this.setContextBarSlot} />
             </div>
           </Layout.Content>
           <div className={styles.footer}>
